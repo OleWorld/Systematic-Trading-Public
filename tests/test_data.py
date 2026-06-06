@@ -6,9 +6,9 @@ Covers four layers, smallest first:
   Section 1 — `_timeframe.py` pure helpers (parsing, UTC, period alignment).
   Section 2 — `_ohlcv.py` DataFrame helpers (candle conversion, resampling).
   Section 3 — `DataHandler` deque mechanics + HTF aggregation gating.
-  Section 4 — `HistoricDataHandler` in-memory data path (no ArcticDB).
+  Section 4 — `HistoricDataHandler` DataFrame-fed bar stream.
 
-No ArcticDB, no CCXT, no network. A `_StubHandler` subclass exercises the
+No external data store, no network. A `_StubHandler` subclass exercises the
 abstract `DataHandler` directly; `HistoricDataHandler` is driven through its
 `data={symbol: df}` constructor path.
 
@@ -661,13 +661,15 @@ def test_historic_handler_drops_nan_row_from_dict_input(caplog):
 # Section 4 — HistoricDataHandler in-memory path
 # ──────────────────────────────────────────────
 
-def test_historic_handler_requires_data_or_dates():
+def test_historic_handler_requires_data():
+    # data is the sole source; empty data must raise rather than silently no-op.
     with pytest.raises(ValueError):
         HistoricDataHandler(
             events_queue=thread_queue.Queue(),
             symbol_list=['BTC_USDT'],
             base_timeframe='1h',
             timeframes={'1h': 50},
+            data={},
         )
 
 

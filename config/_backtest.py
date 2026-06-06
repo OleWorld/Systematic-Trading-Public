@@ -23,7 +23,6 @@ class BacktestConfig:
     base_timeframe: str                                         # streaming TF (e.g. '1m')
     convention: str                                             # 'crypto' (365 days/year, 24/7) or 'tradfi' (252 days/year)
     timeframes: Dict[str, int] = field(default_factory=dict)    # {tf: maxlen} e.g. {'1m': 500, '1h': 500, '4h': 200}
-    db_path: str = 'arctic_data'
 
     # --- Portfolio ---
     initial_capital: float = 100_000.0

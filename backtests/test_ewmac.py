@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 import queue
+import pandas as pd
 sys.path.insert(0, os.getcwd())
 
 from logging_setup import configure_logging
@@ -39,16 +40,27 @@ config = BacktestConfig(
     fill_on='signal_close',
 )
 
+# --- Load market data: {symbol: OHLCV DataFrame} ---
+# The user supplies their own data as a {symbol: DataFrame} dict. Here we load a
+# bundled CSV of daily bars; each frame is indexed by a tz-aware DatetimeIndex
+# with Open/High/Low/Close/Volume columns. Built in config.symbols order.
+sample_csv = os.path.join(os.path.dirname(__file__), 'sample_data', 'crypto_1d.csv')
+_raw = pd.read_csv(sample_csv)
+_raw['timestamp'] = pd.to_datetime(_raw['timestamp'], utc=True)
+_grouped = {sym: g for sym, g in _raw.groupby('symbol')}
+data = {
+    sym: _grouped[sym].set_index('timestamp')[['Open', 'High', 'Low', 'Close', 'Volume']]
+    for sym in config.symbols
+}
+
 # --- Manual module wiring ---
 events_queue = queue.Queue()
 
 data_handler = HistoricDataHandler(
     events_queue, config.symbols,
-    start_date=config.start_date,
-    end_date=config.end_date,
     base_timeframe=config.base_timeframe,
     timeframes=config.timeframes,
-    db_path=config.db_path,
+    data=data,
 )
 
 strategy = EWMACStrategy(

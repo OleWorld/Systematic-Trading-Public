@@ -97,6 +97,23 @@ risk_manager = SimpleRiskManager(
 `size_mode` and `position_size` on `BacktestConfig` are read only by
 `SimpleRiskManager`; `CarverVolTargetingRiskManager` ignores them.
 
+### Data — supply your own OHLCV
+
+You provide market data as a `{symbol: DataFrame}` dict — this is the only way data
+enters the engine. Each DataFrame is indexed by a timezone-aware `DatetimeIndex` and
+exposes `Open`/`High`/`Low`/`Close`/`Volume` columns; sourcing, cleaning, and windowing
+the data is up to you. A small bundled sample of daily bars lives at
+[backtests/sample_data/crypto_1d.csv](backtests/sample_data/crypto_1d.csv):
+
+```python
+import pandas as pd
+
+raw = pd.read_csv('backtests/sample_data/crypto_1d.csv')
+raw['timestamp'] = pd.to_datetime(raw['timestamp'], utc=True)
+data = {sym: g.set_index('timestamp')[['Open', 'High', 'Low', 'Close', 'Volume']]
+        for sym, g in raw.groupby('symbol')}
+```
+
 ### Run — wire the modules and start the loop
 
 The trader instantiates each module explicitly, passes them into
@@ -114,9 +131,8 @@ from backtester import Backtester
 
 events_queue = queue.Queue()
 data_handler = HistoricDataHandler(events_queue, config.symbols,
-                                   start_date=config.start_date, end_date=config.end_date,
                                    base_timeframe=config.base_timeframe,
-                                   timeframes=config.timeframes, db_path=config.db_path)
+                                   timeframes=config.timeframes, data=data)
 strategy     = MyStrategy(data_handler, config.symbols, fast=10, slow=30)
 portfolio    = BacktestPortfolio(events_queue, data_handler, config.symbols,
                                  initial_capital=config.initial_capital,

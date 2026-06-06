@@ -1,17 +1,10 @@
-import datetime
 import logging
 import queue as thread_queue
-from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, Iterator, List, Tuple
 
 import pandas as pd
 
 from data._base import DataHandler
-from data._timeframe import (
-    _parse_date, parse_timeframe_to_seconds,
-    TIMEFRAME_FALLBACK_ORDER,
-)
-from data._arctic import _make_symbol_key, _init_arctic_lib
-from data._ohlcv import _resample_ohlcv
 from event import BarEvent
 
 logger = logging.getLogger(__name__)
@@ -20,103 +13,32 @@ logger = logging.getLogger(__name__)
 class HistoricDataHandler(DataHandler):
     """HistoricDataHandler is designed for backtesting.
 
-    It reads from ArcticDB (or accepts pre-built DataFrames) and yields
-    bars one by one in time-sorted order across all symbols.
+    It is fed pre-built per-symbol OHLCV DataFrames (``data={symbol: df}``) and
+    yields bars one by one in time-sorted order across all symbols.
+
+    Each DataFrame must be indexed by a timezone-aware ``DatetimeIndex`` and
+    expose ``Open``/``High``/``Low``/``Close``/``Volume`` columns. Sourcing,
+    cleaning, and windowing the data is the caller's responsibility.
     """
 
     def __init__(self, events_queue: thread_queue.Queue[Any], symbol_list: List[str],
                  base_timeframe: str,
                  timeframes: Dict[str, int],
-                 start_date: Union[str, datetime.datetime, None] = None,
-                 end_date: Union[str, datetime.datetime, None] = None,
-                 db_path: str = "arctic_data",
-                 data: Optional[Dict[str, pd.DataFrame]] = None):
-        """Initialize for backtesting.
+                 data: Dict[str, pd.DataFrame]):
+        """Initialize for backtesting from in-memory DataFrames.
 
-        Two data paths: pass ``data={symbol: df}`` to feed DataFrames directly,
-        or pass ``start_date``/``end_date``/``db_path`` to load from ArcticDB
-        (with automatic fallback resampling from finer timeframes).
+        ``data`` maps each symbol to a time-indexed OHLCV DataFrame and is the
+        sole data source. Raises ``ValueError`` if it is missing or empty.
         """
         super().__init__(events_queue, symbol_list, base_timeframe, timeframes)
 
-        if data is not None:
-            self._bar_generators = self._build_stream(data)
-        else:
-            if start_date is None or end_date is None:
-                raise ValueError("start_date and end_date are required when data is not provided.")
-            self.start_date = _parse_date(start_date)
-            self.end_date = _parse_date(end_date)
+        if not data:
+            raise ValueError(
+                "data is required: pass data={symbol: DataFrame} with a "
+                "tz-aware DatetimeIndex and Open/High/Low/Close/Volume columns."
+            )
 
-            try:
-                self.store, self.lib = _init_arctic_lib(db_path)
-            except Exception as e:
-                logger.error("Error initializing ArcticDB: %s", e)
-                raise
-
-            self._bar_generators = self._build_stream(self._load_from_db())
-
-    # ── DB loading (decomposed) ─────────────────
-
-    def _load_from_db(self) -> Dict[str, pd.DataFrame]:
-        """Read per-symbol DataFrames from ArcticDB, with fallback resampling."""
-        dataframes: Dict[str, pd.DataFrame] = {}
-        target_seconds = parse_timeframe_to_seconds(self.base_timeframe)
-
-        for symbol in self.symbol_list:
-            symbol_key = _make_symbol_key(symbol, self.base_timeframe)
-            df = self._try_read_exact(symbol_key)
-
-            if df is None or df.empty:
-                df = self._try_read_with_fallback(symbol, target_seconds)
-
-            if df is None or df.empty:
-                logger.warning("No data for %s in range.", symbol)
-                continue
-
-            dataframes[symbol] = df
-
-        return dataframes
-
-    def _try_read_exact(self, symbol_key: str) -> Optional[pd.DataFrame]:
-        """Try reading the exact timeframe key from ArcticDB."""
-        if not self.lib.has_symbol(symbol_key):
-            return None
-        try:
-            return self.lib.read(
-                symbol_key,
-                date_range=(self.start_date, self.end_date)
-            ).data
-        except Exception as e:
-            logger.error("Error reading %s: %s", symbol_key, e)
-            return None
-
-    def _try_read_with_fallback(self, symbol: str,
-                                target_seconds: int) -> Optional[pd.DataFrame]:
-        """Find a more granular timeframe in DB and resample up."""
-        for fallback_tf in TIMEFRAME_FALLBACK_ORDER:
-            if parse_timeframe_to_seconds(fallback_tf) >= target_seconds:
-                continue
-
-            fallback_key = _make_symbol_key(symbol, fallback_tf)
-            if not self.lib.has_symbol(fallback_key):
-                continue
-
-            try:
-                raw_df = self.lib.read(
-                    fallback_key,
-                    date_range=(self.start_date, self.end_date)
-                ).data
-                if raw_df.empty:
-                    continue
-
-                logger.info("Resampling %s -> %s for %s",
-                            fallback_key, self.base_timeframe, symbol)
-                return _resample_ohlcv(raw_df, self.base_timeframe)
-            except Exception as e:
-                logger.error("Error reading fallback %s: %s", fallback_key, e)
-                continue
-
-        return None
+        self._bar_generators = self._build_stream(data)
 
     # ── stream construction ─────────────────────
 

@@ -8,7 +8,7 @@ visually debugging:
 
     2026-04-26 10:30:01 | 2026-04-26 10:00:00 | INFO | strategy.foo | message
 
-Pre-loop infra logs (warmup, ArcticDB init, WebSocket connect, etc.) emit
+Pre-loop infra logs (data-handler setup, module wiring, etc.) emit
 with ``bar_ts == "-"`` because no bar has entered the loop yet.
 
 Why a record factory and not a ``logging.Filter``?  A filter on the root

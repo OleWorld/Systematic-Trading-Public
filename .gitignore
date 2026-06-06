@@ -84,7 +84,7 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# ArcticDB local database
+# Local LMDB / ArcticDB stores (not used by the engine; never commit)
 arctic_data/
 *.mdb
 tmp/
