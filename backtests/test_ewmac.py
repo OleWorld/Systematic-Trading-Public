@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 import queue
+import numpy as np
 import pandas as pd
 sys.path.insert(0, os.getcwd())
 
@@ -65,7 +66,7 @@ data_handler = HistoricDataHandler(
 
 strategy = EWMACStrategy(
     data_handler, config.symbols,
-    lookback_pairs=[(16, 64), (32, 128), (64, 256)],
+    lookback_pairs=[(4, 16), (16, 64), (64, 256)],
     weights=[0.42, 0.16, 0.42],
     fdm=1.12,
     vol_lookback=25,
@@ -112,13 +113,22 @@ bt.run()
 # --- Portfolio results ---
 portfolio = bt.portfolio
 
-print(f"\n{'='*80}")
-print("  PORTFOLIO SUMMARY")
-print(f"{'='*80}")
-
 equity_df = portfolio.get_equity_curve()
 trade_df = portfolio.get_trade_log()
 order_df = portfolio.get_order_log()
+
+# Print wide record frames in full: show every column, one row per line.
+pd.set_option('display.max_columns', None)
+pd.set_option('display.expand_frame_repr', False)
+
+_fc_symbol = 'BTC_USDT:USDT'  # representative symbol for forecast diagnostics
+
+# =====================================================================
+#  1. PORTFOLIO SUMMARY
+# =====================================================================
+print(f"\n{'='*80}")
+print("  PORTFOLIO SUMMARY")
+print(f"{'='*80}")
 
 print(f"  Initial capital: ${portfolio.initial_capital:,.2f}")
 print(f"  Final cash:      ${portfolio.cash:,.2f}")
@@ -127,52 +137,71 @@ if not equity_df.empty:
     pnl = final_balance - portfolio.initial_capital
     print(f"  Final balance:   ${final_balance:,.2f}")
     print(f"  Total P&L:       ${pnl:,.2f} ({pnl/portfolio.initial_capital*100:.2f}%)")
-    print(f"  Available bal:   ${equity_df['available_balance'].iloc[-1]:,.2f}")
-    print(f"\n--- Per-bar returns (last 5 rows) ---")
-    print(equity_df[['account_balance', 'simple_return', 'log_return']].tail().to_string())
+    print(f"  Available balance:   ${equity_df['available_balance'].iloc[-1]:,.2f}")
+    print(f"  Total commission: ${portfolio.total_commission:,.2f}")
     print(f"\n--- Return summary ---")
     print(equity_df[['simple_return', 'log_return']].describe().to_string())
 
-print(f"\n  Orders placed: {len(order_df)}")
-print(f"  Trades filled: {len(trade_df)}")
-print(f"  Total commission: ${portfolio.total_commission:,.2f}")
+print(f"\n--- Positions & P&L by symbol ---")
 for sym in config.symbols:
-    print(f"  {sym} position: {portfolio.positions[sym]:.6f} | realized P&L: ${portfolio.realized_pnl[sym]:,.2f}")
-
-if not trade_df.empty:
-    print(f"\n--- Trade Log (last 10) ---")
-    print(trade_df.tail(10).to_string(index=False))
-
-# --- Forecast sanity check (post-warmup avg |f| should approach 50). ---
-import numpy as np
-strategy_records = bt.strategy.get_records('BTC_USDT:USDT')
-post_warmup_forecasts = strategy_records['forecast'].dropna()
-if len(post_warmup_forecasts) > 0:
-    print(f"\n--- Forecast diagnostics (BTC) ---")
-    print(f"  Non-NaN forecasts: {len(post_warmup_forecasts)}")
-    print(f"  Mean |forecast|:   {np.mean(np.abs(post_warmup_forecasts)):.2f}  (target ≈ 50)")
-    print(f"  Min / Max:         {post_warmup_forecasts.min():.2f} / {post_warmup_forecasts.max():.2f}")
-
-# --- Risk-manager sizing diagnostics ---
-riskmanager_records = bt.risk_manager.get_records('BTC_USDT:USDT')
-if not riskmanager_records.empty:
-    skip_counts = riskmanager_records['skip_reason'].value_counts(dropna=False).to_dict()
-    print(f"\n--- Risk-manager diagnostics (BTC) ---")
-    print(f"  Rows recorded:     {len(riskmanager_records)}")
-    print(f"  Submitted orders:  {int(riskmanager_records['submitted'].sum())}")
-    print(f"  skip_reason counts: {skip_counts}")
-    print(f"\n  Last 10 bars:")
-    print(riskmanager_records[
-        ['forecast', 'sigma', 'instrument_weight', 'strategy_weight', 'capital',
-         'target_qty', 'current_qty', 'trade_qty',
-         'submitted', 'skip_reason']
-    ].tail(10).to_string())
+    print(f"  {sym} position: {portfolio.positions[sym]:.6f} | "
+          f"realized P&L: ${portfolio.realized_pnl[sym]:,.2f} | "
+          f"unrealized P&L: ${portfolio.unrealized_pnl[sym]:,.2f}")
 
 print(f"\n--- Final allocator state ---")
 print(f"  IDM:                {bt.risk_manager.idm:.4f}")
 print(f"  Instrument weights:")
 for sym, w in bt.risk_manager.instrument_weight.items():
     print(f"    {sym:<22} {w:.4f}")
+
+# =====================================================================
+#  2. TRADES SUMMARY
+# =====================================================================
+print(f"\n{'='*80}")
+print("  TRADES SUMMARY")
+print(f"{'='*80}")
+
+print(f"  Orders placed: {len(order_df)}")
+print(f"  Trades filled: {len(trade_df)}")
+if not trade_df.empty:
+    print(f"\n--- Trade Log (last 10) ---")
+    print(trade_df.tail(10).to_string(index=False))
+
+# =====================================================================
+#  3. FORECAST SUMMARY  (one symbol — all symbols share the same format)
+# =====================================================================
+print(f"\n{'='*80}")
+print("  FORECAST SUMMARY")
+print(f"{'='*80}")
+
+# --- Forecast sanity check (post-warmup avg |f| should approach 50). ---
+strategy_records = bt.strategy.get_records(_fc_symbol)
+post_warmup_forecasts = (
+    strategy_records['forecast'].dropna()
+    if not strategy_records.empty else pd.Series(dtype=float)
+)
+if len(post_warmup_forecasts) > 0:
+    print(f"\n--- Forecast diagnostics ({_fc_symbol}) ---")
+    print(f"  Non-NaN forecasts: {len(post_warmup_forecasts)}")
+    print(f"  Mean |forecast|:   {np.mean(np.abs(post_warmup_forecasts)):.2f}  (target ≈ 50)")
+    print(f"  Min / Max:         {post_warmup_forecasts.min():.2f} / {post_warmup_forecasts.max():.2f}")
+
+# --- Risk-manager sizing diagnostics ---
+riskmanager_records = bt.risk_manager.get_records(_fc_symbol)
+if not riskmanager_records.empty:
+    skip_counts = riskmanager_records['skip_reason'].value_counts(dropna=False).to_dict()
+    print(f"\n--- Risk-manager diagnostics ({_fc_symbol}) ---")
+    print(f"  Rows recorded:     {len(riskmanager_records)}")
+    print(f"  Submitted orders:  {int(riskmanager_records['submitted'].sum())}")
+    print(f"  skip_reason counts: {skip_counts}")
+
+# --- Per-bar record tables (last 10 bars, full frame) ---
+if not strategy_records.empty:
+    print(f"\n--- Strategy records: last 10 bars ({_fc_symbol}) ---")
+    print(strategy_records.tail(10).to_string())
+if not riskmanager_records.empty:
+    print(f"\n--- Risk-manager records: last 10 bars ({_fc_symbol}) ---")
+    print(riskmanager_records.tail(10).to_string())
 
 
 # import plotly.express as px
