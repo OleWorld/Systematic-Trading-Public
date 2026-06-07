@@ -10,10 +10,12 @@ Submodules (internal):
     _ohlcv       DataFrame construction and OHLCV resampling
     _base        DataHandler ABC (rolling windows, HTF aggregation)
     _historic    HistoricDataHandler (backtesting)
+    _live        LiveDataHandler (stub)
 """
 
 from data._base import DataHandler
 from data._historic import HistoricDataHandler
+from data._live import LiveDataHandler
 from data._ohlcv import resample
 from data._timeframe import (
     get_period_start,
@@ -24,6 +26,7 @@ from data._timeframe import (
 __all__ = [
     "DataHandler",
     "HistoricDataHandler",
+    "LiveDataHandler",
     "resample",
     "get_period_start",
     "parse_timeframe_to_seconds",
