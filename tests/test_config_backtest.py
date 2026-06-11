@@ -49,3 +49,13 @@ def test_corr_step_size_zero_accepted():
     """``0`` is a valid value — disables auto-recalc."""
     cfg = BacktestConfig(**_kwargs(corr_step_size=0))
     assert cfg.corr_step_size == 0
+
+
+def test_default_corr_mode():
+    cfg = BacktestConfig(**_kwargs())
+    assert cfg.corr_mode == 'simple_return'
+
+
+def test_unknown_corr_mode_rejected():
+    with pytest.raises(ValueError, match="corr_mode"):
+        BacktestConfig(**_kwargs(corr_mode='log_return'))

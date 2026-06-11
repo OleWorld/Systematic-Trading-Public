@@ -58,8 +58,11 @@ rebalances, correlation-driven weight schemes — without per-bar wiring.
 With ``instrument_weight_mode='min_variance'`` the manager performs
 **walk-forward** weight estimation: at each recalc point it pulls
 ``corr_lookback`` bars (default ``500``) at ``corr_timeframe`` (default
-``'1d'``) for every symbol via the data handler, computes simple returns
-(``.pct_change().dropna()``), and derives ρ → weights via the existing
+``'1d'``) for every symbol via the data handler, computes per-bar price
+changes per ``corr_mode`` (``'simple_return'`` → ``.pct_change()``,
+default; ``'absolute_price_chg'`` → ``.diff()`` — for futures/spreads
+whose prices can be negative or zero, where percentage returns are
+meaningless), and derives ρ → weights via the existing
 min-variance formula. The matching IDM (``analytics.diversification_multiplier``)
 is updated from the same ρ on every successful recompute, keeping the
 two coherent. ``update_bar`` auto-recalls the method every
@@ -159,6 +162,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         corr_lookback: int = 500,
         corr_step_size: int = 30,
         corr_timeframe: str = '1d',
+        corr_mode: str = 'simple_return',
     ):
         """
         Parameters
@@ -224,6 +228,14 @@ class CarverVolTargetingRiskManager(RiskManager):
             Timeframe the data handler reads when assembling the closes
             window. Default ``'1d'``. Must be a key of
             ``data_handler.timeframes``.
+        corr_mode
+            How per-bar price changes are computed from the closes window
+            before correlating. One of ``'simple_return'`` (default,
+            ``.pct_change()``) or ``'absolute_price_chg'`` (``.diff()``).
+            Use ``'absolute_price_chg'`` for futures contracts and
+            synthetic products (e.g. time spreads) whose prices can be
+            negative or zero — simple returns are meaningless there
+            (inf at zero crossings, sign-flipped below zero).
 
         Raises
         ------
@@ -252,6 +264,11 @@ class CarverVolTargetingRiskManager(RiskManager):
                 f"data_handler.timeframes; available: "
                 f"{list(data_handler.timeframes.keys())}"
             )
+        if corr_mode not in ('simple_return', 'absolute_price_chg'):
+            raise ValueError(
+                f"Unknown corr_mode: {corr_mode!r}. "
+                "Must be 'simple_return' or 'absolute_price_chg'."
+            )
         super().__init__(portfolio, strategy)
         self.vol_estimator = vol_estimator
         self.data_handler = data_handler
@@ -261,6 +278,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         self.corr_lookback = corr_lookback
         self.corr_step_size = corr_step_size
         self.corr_timeframe = corr_timeframe
+        self.corr_mode = corr_mode
         # Default weighting scheme used by ``calculate_instrument_weight``
         # when called without an explicit ``mode``. Set before the
         # construction-time recalc below so the method can read it.
@@ -313,8 +331,9 @@ class CarverVolTargetingRiskManager(RiskManager):
               Negative raw weights are clipped to ``0`` and the
               survivors are renormalized to sum to ``1`` (Carver
               long-only convention). When ``corr_matrix`` is omitted,
-              ρ is derived inline from a trailing window of simple
-              returns pulled from ``self.data_handler`` (see below).
+              ρ is derived inline from a trailing window of per-bar
+              price changes (per ``self.corr_mode``) pulled from
+              ``self.data_handler`` (see below).
         corr_matrix
             Correlation matrix of per-symbol price returns, indexed and
             columned by the same labels as ``self.strategy.symbol_list``
@@ -322,7 +341,9 @@ class CarverVolTargetingRiskManager(RiskManager):
             for ``mode='min_variance'``: when ``None``, the method pulls
             ``self.corr_lookback`` bars at ``self.corr_timeframe`` for
             each symbol via ``self.data_handler.get_latest_bars``,
-            computes simple returns (``.pct_change().dropna()``), and
+            computes per-bar price changes per ``self.corr_mode``
+            (``'simple_return'`` → ``.pct_change().dropna()``;
+            ``'absolute_price_chg'`` → ``.diff().dropna()``), and
             calls ``analytics.correlation_matrix`` on the result. If
             fewer than ``_MIN_CORR_OBS`` (=30) valid observations
             survive — always the case at construction time in a backtest
@@ -372,9 +393,15 @@ class CarverVolTargetingRiskManager(RiskManager):
                 # instead of synthesising a 0 % return from a forward-filled
                 # stale close. Defensive — the DataHandler NaN invariant already
                 # rules out NaN closes in the bar deques.
-                returns = (
-                    pd.DataFrame(closes).pct_change(fill_method=None).dropna()
-                )
+                frame = pd.DataFrame(closes)
+                if self.corr_mode == 'simple_return':
+                    returns = frame.pct_change(fill_method=None).dropna()
+                elif self.corr_mode == 'absolute_price_chg':
+                    returns = frame.diff().dropna()
+                else:
+                    raise ValueError(
+                        f"Unexpected corr_mode: {self.corr_mode!r}"
+                    )
                 if len(returns) < _MIN_CORR_OBS:
                     logger.warning(
                         "min_variance: only %d valid return observations "

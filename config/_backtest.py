@@ -38,6 +38,7 @@ class BacktestConfig:
     corr_lookback: int = 500              # trailing window for correlation (in corr_timeframe bars)
     corr_step_size: int = 30              # auto-recalc cadence in completed bars; 0 disables
     corr_timeframe: str = '1d'            # data-handler timeframe to read closes from
+    corr_mode: str = 'simple_return'      # 'simple_return' or 'absolute_price_chg' (futures/spreads with negative/zero prices)
 
     # NOTE: size_mode and position_size are consumed only by
     # SimpleRiskManager (sign-of-forecast follower). Ignored when
@@ -119,4 +120,9 @@ class BacktestConfig:
         if self.corr_step_size < 0:
             raise ValueError(
                 f"corr_step_size must be >= 0, got {self.corr_step_size}"
+            )
+        if self.corr_mode not in ('simple_return', 'absolute_price_chg'):
+            raise ValueError(
+                f"Unknown corr_mode: {self.corr_mode!r}. "
+                "Must be 'simple_return' or 'absolute_price_chg'."
             )

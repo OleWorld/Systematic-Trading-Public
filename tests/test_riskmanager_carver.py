@@ -973,6 +973,85 @@ def test_returns_used_are_simple_pct_change():
 
 
 # ──────────────────────────────────────────────
+# corr_mode ('simple_return' / 'absolute_price_chg')
+# ──────────────────────────────────────────────
+
+def test_constructor_rejects_unknown_corr_mode():
+    with pytest.raises(ValueError, match="corr_mode"):
+        CarverVolTargetingRiskManager(
+            FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
+            FakeVolEstimator(), data_handler=FakeDataHandler(),
+            corr_mode='log_return',
+        )
+
+
+def test_corr_mode_defaults_to_simple_return():
+    rm = _build_rm(['BTC'])
+    assert rm.corr_mode == 'simple_return'
+
+
+def test_absolute_price_chg_mode_uses_diff():
+    """With ``corr_mode='absolute_price_chg'`` the inline derivation uses
+    ``.diff()`` on Close prices instead of ``.pct_change()``.
+
+    Mirror of ``test_returns_used_are_simple_pct_change``: verify the matrix
+    the solver consumed matches the ``.diff()`` matrix by replaying the IDM
+    equation.
+    """
+    from analytics import diversification_multiplier
+    symbols = ['A', 'B']
+    closes = {s: _price_series(100, seed=i) for i, s in enumerate(symbols)}
+    dh = FakeDataHandler(closes=closes)
+    rm = CarverVolTargetingRiskManager(
+        FakePortfolio(), FakeStrategy(symbol_list=symbols),
+        FakeVolEstimator(), data_handler=dh,
+        corr_lookback=100, corr_mode='absolute_price_chg',
+    )
+    rm.calculate_instrument_weight(mode='min_variance')
+
+    expected_corr = pd.DataFrame(closes).diff().dropna().corr()
+    rho = expected_corr.loc['A', 'B']
+    # 2-asset min-variance under equal-vol is 1/N regardless of ρ.
+    assert math.isclose(rm.instrument_weight['A'], 0.5, rel_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['B'], 0.5, rel_tol=1e-9)
+    expected_idm = diversification_multiplier(rm.instrument_weight, expected_corr)
+    assert math.isclose(rm.idm, expected_idm, rel_tol=1e-9)
+    # Sanity: the diff-based ρ must differ measurably from the pct_change ρ,
+    # otherwise this test could pass with either mode.
+    pct_rho = (
+        pd.DataFrame(closes).pct_change(fill_method=None).dropna().corr()
+        .loc['A', 'B']
+    )
+    assert not math.isclose(rho, pct_rho, rel_tol=1e-3)
+
+
+def test_absolute_price_chg_handles_negative_and_zero_prices():
+    """The motivating case: spread-like series crossing zero. ``pct_change``
+    would blow up (inf at the zero crossing, sign-flipped returns below it);
+    ``absolute_price_chg`` must produce finite weights summing to 1 and a
+    finite IDM."""
+    rng = np.random.default_rng(seed=42)
+    idx = pd.date_range('2024-01-01', periods=100, freq='D')
+    closes = {
+        s: pd.Series(np.linspace(-5.0, 5.0, 100) + rng.normal(0, 0.5, 100),
+                     index=idx)
+        for s in ['SPREAD_A', 'SPREAD_B']
+    }
+    dh = FakeDataHandler(closes=closes)
+    rm = CarverVolTargetingRiskManager(
+        FakePortfolio(), FakeStrategy(symbol_list=list(closes)),
+        FakeVolEstimator(), data_handler=dh,
+        corr_lookback=100, corr_mode='absolute_price_chg',
+    )
+    rm.calculate_instrument_weight(mode='min_variance')
+
+    weights = rm.instrument_weight
+    assert all(math.isfinite(w) for w in weights.values())
+    assert math.isclose(sum(weights.values()), 1.0, abs_tol=1e-9)
+    assert math.isfinite(rm.idm)
+
+
+# ──────────────────────────────────────────────
 # Auto-recalc cadence in update_bar
 # ──────────────────────────────────────────────
 

@@ -9,6 +9,7 @@ sys.path.insert(0, os.getcwd())
 from logging_setup import configure_logging
 configure_logging(level=logging.WARNING)
 
+from analytics import backtest_stats
 from config import BacktestConfig
 from data import HistoricDataHandler
 from strategy import EWMACStrategy
@@ -66,7 +67,7 @@ data_handler = HistoricDataHandler(
 
 strategy = EWMACStrategy(
     data_handler, config.symbols,
-    lookback_pairs=[(4, 16), (16, 64), (64, 256)],
+    lookback_pairs=[(4, 16), (16, 64), (32, 128)],
     weights=[0.42, 0.16, 0.42],
     fdm=1.12,
     vol_lookback=25,
@@ -95,6 +96,7 @@ risk_manager = CarverVolTargetingRiskManager(
     corr_lookback=config.corr_lookback,
     corr_step_size=config.corr_step_size,
     corr_timeframe=config.corr_timeframe,
+    corr_mode=config.corr_mode,
 )
 
 execution = BacktestExecution(
@@ -155,7 +157,22 @@ for sym, w in bt.risk_manager.instrument_weight.items():
     print(f"    {sym:<22} {w:.4f}")
 
 # =====================================================================
-#  2. TRADES SUMMARY
+#  2. BACKTEST STATISTICS
+# =====================================================================
+print(f"\n{'='*80}")
+print("  BACKTEST STATISTICS")
+print(f"{'='*80}")
+
+stats = backtest_stats(
+    equity_df, trade_df,
+    initial_capital=config.initial_capital,
+    timeframe=config.base_timeframe,
+    convention=config.convention,
+)
+print(stats.to_string())
+
+# =====================================================================
+#  3. TRADES SUMMARY
 # =====================================================================
 print(f"\n{'='*80}")
 print("  TRADES SUMMARY")
@@ -168,7 +185,7 @@ if not trade_df.empty:
     print(trade_df.tail(10).to_string(index=False))
 
 # =====================================================================
-#  3. FORECAST SUMMARY  (one symbol — all symbols share the same format)
+#  4. FORECAST SUMMARY  (one symbol — all symbols share the same format)
 # =====================================================================
 print(f"\n{'='*80}")
 print("  FORECAST SUMMARY")
