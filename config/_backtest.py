@@ -40,6 +40,8 @@ class BacktestConfig:
     corr_step_size: int = 30              # auto-recalc cadence in completed bars; 0 disables
     corr_timeframe: str = '1d'            # data-handler timeframe to read closes from
     corr_mode: str = 'absolute_price_chg' # 'absolute_price_chg' (futures-safe: negative/zero prices) or 'simple_return' (positive-price assets)
+    corr_floor: Optional[float] = 0.0    # element-wise floor on the inline-derived rho; None disables (Carver: zero out spurious negative correlations)
+    idm_cap: Optional[float] = 2.5       # cap on the auto-updated IDM; None disables (Carver's 2.5; >= 1.0 since DM >= 1 for long-only sum-to-1 weights)
 
     # NOTE: size_mode and position_size are consumed only by
     # SimpleRiskManager (sign-of-forecast follower). Ignored when
@@ -172,4 +174,15 @@ class BacktestConfig:
             raise ValueError(
                 f"Unknown corr_mode: {self.corr_mode!r}. "
                 "Must be 'simple_return' or 'absolute_price_chg'."
+            )
+        if self.corr_floor is not None and not (-1.0 <= self.corr_floor <= 1.0):
+            raise ValueError(
+                f"corr_floor must be in [-1.0, 1.0] or None to disable, "
+                f"got {self.corr_floor}"
+            )
+        if self.idm_cap is not None and not (self.idm_cap >= 1.0):
+            raise ValueError(
+                f"idm_cap must be >= 1.0 or None to disable, got "
+                f"{self.idm_cap}. (DM = 1/sqrt(w'rho w) >= 1 for sum-to-1 "
+                f"non-negative weights, so a sub-1 cap would always bind.)"
             )

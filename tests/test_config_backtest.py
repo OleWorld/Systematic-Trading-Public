@@ -162,3 +162,33 @@ def test_unknown_commission_mode_rejected():
 def test_unknown_corr_mode_rejected():
     with pytest.raises(ValueError, match="corr_mode"):
         BacktestConfig(**_kwargs(corr_mode='log_return'))
+
+
+def test_default_corr_floor_and_idm_cap():
+    """Futures-first defaults: floor rho at 0, cap IDM at Carver's 2.5."""
+    cfg = BacktestConfig(**_kwargs())
+    assert cfg.corr_floor == 0.0
+    assert cfg.idm_cap == 2.5
+
+
+def test_corr_floor_outside_range_rejected():
+    for bad in (1.5, -1.5, float('nan')):
+        with pytest.raises(ValueError, match="corr_floor"):
+            BacktestConfig(**_kwargs(corr_floor=bad))
+
+
+def test_corr_floor_none_and_bounds_accepted():
+    assert BacktestConfig(**_kwargs(corr_floor=None)).corr_floor is None
+    assert BacktestConfig(**_kwargs(corr_floor=-1.0)).corr_floor == -1.0
+    assert BacktestConfig(**_kwargs(corr_floor=1.0)).corr_floor == 1.0
+
+
+def test_idm_cap_below_one_rejected():
+    for bad in (0.99, 0.0, -2.5, float('nan')):
+        with pytest.raises(ValueError, match="idm_cap"):
+            BacktestConfig(**_kwargs(idm_cap=bad))
+
+
+def test_idm_cap_one_and_none_accepted():
+    assert BacktestConfig(**_kwargs(idm_cap=1.0)).idm_cap == 1.0
+    assert BacktestConfig(**_kwargs(idm_cap=None)).idm_cap is None
