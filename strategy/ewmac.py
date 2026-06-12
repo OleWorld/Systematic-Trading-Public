@@ -125,7 +125,7 @@ class EWMACStrategy(Strategy):
         forecast_scalar_lookback
             Window for the rolling mean of ``|vol_adj|`` that feeds the
             dynamic forecast scalar (``target / mean(|vol_adj|)``).
-            Default ``500``.
+            Default ``256``.
         
 
         The target average absolute forecast that the per-variation

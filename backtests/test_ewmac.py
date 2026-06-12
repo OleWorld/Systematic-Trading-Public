@@ -35,7 +35,7 @@ for sym in stables:
 _symbols = list(str(x) for x in _grouped.keys())
 
 # --- Config (validated parameter holder) ---
-# EWMAC defaults need ~756 daily bars of warmup (256-day slow EMA + 256-bar
+# EWMAC defaults need ~512 daily bars of warmup (256-day slow EMA + 256-bar
 # forecast-scalar SMA). The 2021-01 → 2026-04 window gives ~1939 daily bars —
 # plenty for warmup AND post-warmup signal emission.
 #
