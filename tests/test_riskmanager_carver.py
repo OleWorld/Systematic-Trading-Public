@@ -1175,30 +1175,6 @@ def test_explicit_corr_matrix_over_subset_is_accepted():
     assert math.isclose(rm.instrument_weight['ETH'], 0.5, abs_tol=1e-9)
 
 
-# ──────────────────────────────────────────────
-# corr_floor (element-wise ρ floor, Carver: zero out spurious
-# negative correlations) — constructor validation
-# ──────────────────────────────────────────────
-
-def test_constructor_corr_floor_defaults_to_zero():
-    """Futures-first default: floor the inline-derived ρ at 0 (Carver)."""
-    rm = _build_rm(['BTC'])
-    assert rm.corr_floor == 0.0
-
-
-def test_constructor_rejects_corr_floor_outside_minus_one_one():
-    for bad in (1.5, -1.5, 2.0):
-        with pytest.raises(ValueError, match="corr_floor"):
-            _build_rm(['BTC'], corr_floor=bad)
-
-
-def test_constructor_corr_floor_accepts_none_and_bounds():
-    """None disables flooring; the closed interval ends are valid."""
-    assert _build_rm(['BTC'], corr_floor=None).corr_floor is None
-    assert _build_rm(['BTC'], corr_floor=-1.0).corr_floor == -1.0
-    assert _build_rm(['BTC'], corr_floor=1.0).corr_floor == 1.0
-
-
 def test_explicit_corr_matrix_with_label_outside_symbol_list_raises():
     rm = _build_rm(['BTC', 'ETH'])
     bad = _corr_df(['BTC', 'SOL'], off_diag=0.0)
@@ -1217,6 +1193,62 @@ def test_constructor_rejects_corr_lookback_above_deque_maxlen():
     dh = FakeDataHandler(timeframes={'1d': 100})
     with pytest.raises(ValueError, match="maxlen"):
         _build_rm(['BTC'], data_handler=dh, corr_lookback=101)
+
+
+# ──────────────────────────────────────────────
+# corr_floor (element-wise ρ floor, Carver: zero out spurious
+# negative correlations) — constructor validation
+# ──────────────────────────────────────────────
+
+def test_constructor_corr_floor_defaults_to_zero():
+    """Futures-first default: floor the inline-derived ρ at 0 (Carver)."""
+    rm = _build_rm(['BTC'])
+    assert rm.corr_floor == 0.0
+
+
+def test_constructor_rejects_corr_floor_outside_minus_one_one():
+    for bad in (1.5, -1.5, 2.0, float('nan')):
+        with pytest.raises(ValueError, match="corr_floor"):
+            _build_rm(['BTC'], corr_floor=bad)
+
+
+def test_constructor_corr_floor_accepts_none_and_bounds():
+    """None disables flooring; the closed interval ends are valid."""
+    assert _build_rm(['BTC'], corr_floor=None).corr_floor is None
+    assert _build_rm(['BTC'], corr_floor=-1.0).corr_floor == -1.0
+    assert _build_rm(['BTC'], corr_floor=1.0).corr_floor == 1.0
+
+
+# ──────────────────────────────────────────────
+# idm_cap (Carver's 2.5 leverage-policy cap) — constructor validation
+# ──────────────────────────────────────────────
+
+def test_constructor_idm_cap_defaults_to_two_point_five():
+    rm = _build_rm(['BTC'])
+    assert rm.idm_cap == 2.5
+
+
+def test_constructor_rejects_idm_cap_below_one():
+    """DM = 1/sqrt(w'ρw) >= 1 for sum-to-1 non-negative weights, so a
+    sub-1 cap would always bind — a config error worth failing on.
+    NaN must also be rejected: min(idm, nan) silently never caps."""
+    for bad in (0.99, 0.5, 0.0, -1.0, float('nan')):
+        with pytest.raises(ValueError, match="idm_cap"):
+            _build_rm(['BTC'], idm_cap=bad)
+
+
+def test_constructor_idm_cap_accepts_one_and_none():
+    assert _build_rm(['BTC'], idm_cap=1.0).idm_cap == 1.0
+    assert _build_rm(['BTC'], idm_cap=None).idm_cap is None
+
+
+def test_constructor_rejects_idm_above_idm_cap():
+    """A starting idm above the cap is a contradiction → raise, never
+    silently clamp. Lifting or disabling the cap makes the same idm valid."""
+    with pytest.raises(ValueError, match="idm_cap"):
+        _build_rm(['BTC'], idm=3.0)                 # default cap 2.5
+    assert _build_rm(['BTC'], idm=3.0, idm_cap=None).idm == 3.0
+    assert _build_rm(['BTC'], idm=3.0, idm_cap=3.5).idm == 3.0
 
 
 # ──────────────────────────────────────────────

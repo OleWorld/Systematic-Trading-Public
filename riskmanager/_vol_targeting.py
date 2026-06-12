@@ -195,6 +195,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         vol_estimator: VolEstimator,
         data_handler: _DataHandlerLike,
         idm: float = 1.0,
+        idm_cap: Optional[float] = 2.5,
         annualized_target_vol: Optional[float] = None,
         vol_target_mode: str = 'dollar_volatility',
         position_buffer: float = 0.25,
@@ -229,7 +230,21 @@ class CarverVolTargetingRiskManager(RiskManager):
             Default ``1.0``. Must be ``> 0``. Auto-updated whenever a
             min-variance recompute consumes a corr matrix (passed or
             derived); the constructor default applies only until the
-            first successful recompute.
+            first successful recompute. Must not exceed ``idm_cap``
+            when the cap is enabled.
+        idm_cap
+            Upper bound applied to ``self.idm`` whenever it is
+            auto-updated from a corr-based weight recompute — both the
+            inline-derivation path and an explicitly passed
+            ``corr_matrix``. Default ``2.5`` (Carver's recommended
+            maximum): the IDM multiplies every position linearly, so
+            correlation-estimation noise must not translate into
+            unbounded leverage. ``None`` disables the cap. Must be
+            ``>= 1.0`` when not ``None`` (the DM is mathematically
+            ``>= 1`` for a fully-allocated long-only weight vector).
+            Direct assignments to ``self.idm`` by subclasses or
+            downstream code are NOT capped — the same owner-may-
+            overwrite convention as the weight dicts.
         annualized_target_vol
             Annualized volatility target (Carver's ``τ``). REQUIRED —
             no default; its units depend on ``vol_target_mode``:
@@ -322,6 +337,21 @@ class CarverVolTargetingRiskManager(RiskManager):
         """
         if idm <= 0:
             raise ValueError(f"idm must be > 0, got {idm}")
+        if idm_cap is not None:
+            # ``not (>=)`` instead of ``<`` so NaN is rejected too —
+            # min(idm, nan) would silently never cap.
+            if not (idm_cap >= 1.0):
+                raise ValueError(
+                    f"idm_cap must be >= 1.0 or None to disable, got "
+                    f"{idm_cap}. (DM = 1/sqrt(w'rho w) >= 1 for sum-to-1 "
+                    f"non-negative weights, so a sub-1 cap would always bind.)"
+                )
+            if idm > idm_cap:
+                raise ValueError(
+                    f"idm ({idm}) exceeds idm_cap ({idm_cap}); pass a "
+                    f"smaller starting idm or raise/disable the cap "
+                    f"(idm_cap=None)."
+                )
         if vol_target_mode not in ('dollar_volatility', 'percent_volatility'):
             raise ValueError(
                 f"Unknown vol_target_mode: {vol_target_mode!r}. "
@@ -394,6 +424,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         self.vol_estimator = vol_estimator
         self.data_handler = data_handler
         self.idm = idm
+        self.idm_cap = idm_cap
         # Narrowed to float by the None-rejection above.
         self.annualized_target_vol: float = annualized_target_vol
         self.vol_target_mode = vol_target_mode
