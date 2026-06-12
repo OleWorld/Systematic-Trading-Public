@@ -36,7 +36,7 @@ class BacktestConfig:
     vol_target_mode: str = 'dollar_volatility'     # 'dollar_volatility' (fixed annual $ vol budget) or 'percent_volatility' (fraction of equity)
     position_buffer: float = 0.25        # Carver §10.7 dead-band (0.0 to trade every gap)
     instrument_weight_mode: str = 'equal_weight'   # 'equal_weight', 'min_variance', or 'risk_parity'
-    corr_lookback: int = 500              # trailing window for correlation (in corr_timeframe bars)
+    corr_lookback: int = 60          # corr trailing window AND universe liveness threshold (in corr_timeframe bars; >= 31, <= deque maxlen)
     corr_step_size: int = 30              # auto-recalc cadence in completed bars; 0 disables
     corr_timeframe: str = '1d'            # data-handler timeframe to read closes from
     corr_mode: str = 'absolute_price_chg' # 'absolute_price_chg' (futures-safe: negative/zero prices) or 'simple_return' (positive-price assets)
@@ -144,9 +144,25 @@ class BacktestConfig:
                 f"Unknown instrument_weight_mode: '{self.instrument_weight_mode}'. "
                 "Must be 'equal_weight', 'min_variance', or 'risk_parity'."
             )
-        if self.corr_lookback < 2:
+        if self.corr_lookback < 31:
             raise ValueError(
-                f"corr_lookback must be >= 2, got {self.corr_lookback}"
+                f"corr_lookback must be >= 31, got {self.corr_lookback}. "
+                "corr_lookback is the universe liveness threshold and "
+                "yields corr_lookback - 1 price-change observations, "
+                "which must cover the 30-observation minimum for a "
+                "stable correlation estimate."
+            )
+        if (
+            self.corr_timeframe in self.timeframes
+            and self.corr_lookback > self.timeframes[self.corr_timeframe]
+        ):
+            raise ValueError(
+                f"corr_lookback ({self.corr_lookback}) exceeds the "
+                f"'{self.corr_timeframe}' deque maxlen "
+                f"({self.timeframes[self.corr_timeframe]}); no symbol "
+                f"could ever accumulate enough bars to pass the liveness "
+                f"gate. Increase timeframes['{self.corr_timeframe}'] or "
+                f"lower corr_lookback."
             )
         if self.corr_step_size < 0:
             raise ValueError(

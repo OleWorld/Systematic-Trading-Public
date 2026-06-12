@@ -60,11 +60,18 @@ class _StrategyLike(Protocol):
 
     ``symbol_list`` is read at risk-manager construction time to seed
     the equal-weight ``instrument_weight`` dict.
+
+    ``is_warmed_up(symbol)`` is the strategy's measured end-of-warmup
+    signal (True once the first non-NaN forecast has been cached) —
+    consumed by ``CarverVolTargetingRiskManager.get_live_symbols`` as
+    the strategy gate of the universe liveness check.
     """
 
     symbol_list: List[str]
 
     def get_forecast(self, symbol: str) -> float: ...
+
+    def is_warmed_up(self, symbol: str) -> bool: ...
 
 
 # ──────────────────────────────────────────────

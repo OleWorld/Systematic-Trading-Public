@@ -27,18 +27,33 @@ def _kwargs(**overrides):
 
 
 def test_default_corr_fields():
-    """Defaults match the documented production stack (500 / 30 / '1d')."""
+    """Defaults match the documented production stack (60 / 30 / '1d')."""
     cfg = BacktestConfig(**_kwargs())
-    assert cfg.corr_lookback == 500
+    assert cfg.corr_lookback == 60
     assert cfg.corr_step_size == 30
     assert cfg.corr_timeframe == '1d'
 
 
-def test_corr_lookback_below_two_rejected():
-    with pytest.raises(ValueError, match="corr_lookback"):
-        BacktestConfig(**_kwargs(corr_lookback=1))
-    with pytest.raises(ValueError, match="corr_lookback"):
-        BacktestConfig(**_kwargs(corr_lookback=0))
+def test_corr_lookback_below_31_rejected():
+    """corr_lookback doubles as the universe liveness threshold and must
+    yield >= 30 price-change observations (lookback - 1)."""
+    for bad in (30, 2, 1, 0):
+        with pytest.raises(ValueError, match="corr_lookback"):
+            BacktestConfig(**_kwargs(corr_lookback=bad))
+
+
+def test_corr_lookback_of_31_accepted():
+    cfg = BacktestConfig(**_kwargs(corr_lookback=31))
+    assert cfg.corr_lookback == 31
+
+
+def test_corr_lookback_above_deque_maxlen_rejected():
+    """corr_lookback > the corr_timeframe deque maxlen → no symbol could
+    ever pass the liveness gate; rejected at config construction."""
+    with pytest.raises(ValueError, match="maxlen"):
+        BacktestConfig(**_kwargs(
+            timeframes={'1d': 100}, corr_lookback=101,
+        ))
 
 
 def test_corr_step_size_negative_rejected():

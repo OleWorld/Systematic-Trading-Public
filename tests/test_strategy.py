@@ -301,3 +301,51 @@ def test_sizing_with_probability_monotonic():
     samples = [0.5, 0.55, 0.6, 0.7, 0.8, 0.9, 0.99]
     mags = [Strategy.sizing_with_probability(p) for p in samples]
     assert all(a <= b + 1e-12 for a, b in zip(mags, mags[1:]))
+
+
+# ──────────────────────────────────────────────
+# is_warmed_up — measured end-of-warmup flag
+# ──────────────────────────────────────────────
+
+def test_is_warmed_up_false_at_init():
+    s = _build(symbols=('BTC', 'ETH'))
+    assert s.is_warmed_up('BTC') is False
+    assert s.is_warmed_up('ETH') is False
+
+
+def test_is_warmed_up_false_for_unknown_symbol():
+    s = _build(symbols=('BTC',))
+    assert s.is_warmed_up('DOGE') is False
+
+
+def test_is_warmed_up_stays_false_on_nan_and_none_forecasts():
+    """NaN forecasts (warmup) and None returns must not flip the flag."""
+    s = _build(forecast_fn=lambda self, e: {'forecast': float('nan')})
+    s.update_bar(_bar())
+    assert s.is_warmed_up('BTC') is False
+
+    s2 = _build(forecast_fn=lambda self, e: None)
+    s2.update_bar(_bar())
+    assert s2.is_warmed_up('BTC') is False
+
+
+def test_is_warmed_up_flips_on_first_real_forecast_and_persists():
+    """The flag flips with the first non-NaN forecast and never resets —
+    not even if later forecasts are NaN again."""
+    script = iter([float('nan'), 42.0, float('nan')])
+    s = _build(forecast_fn=lambda self, e: {'forecast': next(script)})
+    s.update_bar(_bar(ts=datetime(2026, 1, 1)))
+    assert s.is_warmed_up('BTC') is False
+    s.update_bar(_bar(ts=datetime(2026, 1, 2)))
+    assert s.is_warmed_up('BTC') is True
+    s.update_bar(_bar(ts=datetime(2026, 1, 3)))
+    assert s.is_warmed_up('BTC') is True                        # monotone
+
+
+def test_is_warmed_up_is_per_symbol():
+    """Warming up one symbol must not mark the others."""
+    s = _build(forecast_fn=lambda self, e: {'forecast': 10.0},
+               symbols=('BTC', 'ETH'))
+    s.update_bar(_bar(symbol='BTC'))
+    assert s.is_warmed_up('BTC') is True
+    assert s.is_warmed_up('ETH') is False

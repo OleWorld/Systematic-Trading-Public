@@ -20,6 +20,17 @@ from riskmanager import CarverVolTargetingRiskManager
 from backtester import Backtester
 from plotting import plot_strategy
 
+
+# --- Load market data: {symbol: OHLCV DataFrame} ---
+# The user supplies their own data as a {symbol: DataFrame} dict. Here we load a
+# bundled CSV of daily bars; each frame is indexed by a tz-aware DatetimeIndex
+# with Open/High/Low/Close/Volume columns. Built in config.symbols order.
+sample_csv = os.path.join(os.path.dirname(__file__), 'sample_data', 'crypto_1d.csv')
+_raw = pd.read_csv(sample_csv)
+_raw['timestamp'] = pd.to_datetime(_raw['timestamp'], utc=True)
+_grouped = {sym: g for sym, g in _raw.groupby('symbol')}
+_symbols = list(str(x) for x in _grouped.keys())
+
 # --- Config (validated parameter holder) ---
 # EWMAC defaults need ~756 daily bars of warmup (256-day slow EMA + 500-bar
 # forecast-scalar SMA). The 2021-01 → 2026-04 window gives ~1939 daily bars —
@@ -31,18 +42,20 @@ from plotting import plot_strategy
 # crypto trades 24/7, so 'calendar' (365 d/y) is required for correct vol
 # annualization regardless of the futures-style sizing knobs.
 config = BacktestConfig(
-    symbols=['BTC_USDT:USDT', 'BNB_USDT:USDT', 'SOL_USDT:USDT', 'DOGE_USDT:USDT', 'ETH_USDT:USDT'],
+    symbols=_symbols,
     instrument_weight_mode='min_variance',
     corr_mode='absolute_price_chg',         # futures default: .diff() correlations
+    corr_lookback  = 60,
+    corr_timeframe = '1d',
     start_date='2021-01-01',
     end_date='2026-04-23',
     base_timeframe='1d',
     days_convention='calendar',             # data-driven: crypto is 24/7 → 365 d/y
-    timeframes={'1d': 500},
-    initial_capital=1_000_000.0,
+    timeframes={'1d': 5000},
+    initial_capital=10_000_000,
     leverage=10.0,
     vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
-    annualized_target_vol=500_000.0,        # $500k annual vol (≈ the old 0.5 × $1M start)
+    annualized_target_vol=1_000_000,        # $1M annual vol
     position_buffer=0.25,
     slippage_mode='absolute',               # futures default: $ per unit
     slippage_value=0.0,                     # default 0.0 — one fixed tick can't fit BTC & DOGE scales
@@ -51,14 +64,7 @@ config = BacktestConfig(
     fill_on='signal_close',
 )
 
-# --- Load market data: {symbol: OHLCV DataFrame} ---
-# The user supplies their own data as a {symbol: DataFrame} dict. Here we load a
-# bundled CSV of daily bars; each frame is indexed by a tz-aware DatetimeIndex
-# with Open/High/Low/Close/Volume columns. Built in config.symbols order.
-sample_csv = os.path.join(os.path.dirname(__file__), 'sample_data', 'crypto_1d.csv')
-_raw = pd.read_csv(sample_csv)
-_raw['timestamp'] = pd.to_datetime(_raw['timestamp'], utc=True)
-_grouped = {sym: g for sym, g in _raw.groupby('symbol')}
+
 data = {
     sym: _grouped[sym].set_index('timestamp')[['Open', 'High', 'Low', 'Close', 'Volume']]
     for sym in config.symbols
@@ -241,7 +247,19 @@ if not riskmanager_records.empty:
 #                                 'forecast_64_256': 2, 'forecast': 2},
 #                     title='BTC_USDT:USDT EWMAC', timeframe='1d')
 # fig.show(config=dict({'scrollZoom':True}))
-# fig = px.line(equity_df['realized_pnl'].apply(pd.Series) + equity_df['unrealized_pnl'].apply(pd.Series))
+
+
+# total = (
+#     pd.DataFrame(equity_df['realized_pnl'].tolist(),   index=equity_df.index)
+#     + pd.DataFrame(equity_df['unrealized_pnl'].tolist(), index=equity_df.index)
+# )
+# pnl_by_instrument = total.groupby(level=0).last()   # one row per timestamp
+# fig = px.line(pnl_by_instrument)
 # fig.show()
 # fig = px.line(equity_df[['account_balance', 'available_balance']])
 # fig.show()
+
+# df_weight = pd.DataFrame()
+# for x in config.symbols:
+#     df_weight[x] = bt.risk_manager.get_records(x)['instrument_weight']
+# px.line(df_weight)

@@ -100,6 +100,12 @@ class Strategy(ABC):
         # Per-symbol cached forecast in [-100, +100], default 0.0 (flat).
         # The risk manager reads this dict on every completed bar.
         self.forecasts: Dict[str, float] = {s: 0.0 for s in symbol_list}
+        # Per-symbol warmup flag: False until the first non-NaN forecast
+        # is cached for the symbol, then True forever (monotone). This is
+        # the *measured* end-of-warmup signal the risk manager's universe
+        # liveness gate consumes via ``is_warmed_up`` — no declared
+        # bar-count estimate needed.
+        self._warmed_up: Dict[str, bool] = {s: False for s in symbol_list}
         # Per-symbol list of row dicts, populated by update_bar() on each bar.
         self._records: Dict[str, List[Dict]] = defaultdict(list)
 
@@ -130,6 +136,8 @@ class Strategy(ABC):
                     clamped = max(-cap, min(cap, float(raw)))
                     self.forecasts[event.symbol] = clamped
                     extras['forecast'] = clamped
+                    # First real forecast ⇒ warmup is over for this symbol.
+                    self._warmed_up[event.symbol] = True
             base_row.update(extras)
 
         self._record_row(event.symbol, base_row)
@@ -158,6 +166,18 @@ class Strategy(ABC):
         target position. Unknown symbols silently return ``0.0``.
         """
         return self.forecasts.get(symbol, 0.0)
+
+    def is_warmed_up(self, symbol: str) -> bool:
+        """Return True once ``symbol`` has produced its first non-NaN forecast.
+
+        Measured, not estimated: the flag flips inside ``update_bar`` at
+        the exact moment the first real forecast is written to the cache,
+        and never resets (monotone). The risk manager's universe liveness
+        gate reads this to keep instrument weight away from symbols whose
+        strategy cannot trade yet (e.g. indicator chains still warming
+        up). Unknown symbols return ``False``.
+        """
+        return self._warmed_up.get(symbol, False)
 
     @staticmethod
     def sizing_with_probability(p: float, num_classes: int = 2) -> float:

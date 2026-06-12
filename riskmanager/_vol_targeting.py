@@ -67,11 +67,24 @@ dicts are populated at ``__init__`` by ``calculate_instrument_weight()``
 (or its dict overwritten directly) to refresh weights — e.g. monthly
 rebalances, correlation-driven weight schemes — without per-bar wiring.
 
-With ``instrument_weight_mode='min_variance'`` or ``'risk_parity'``
-the manager performs **walk-forward** weight estimation: at each recalc
-point it pulls ``corr_lookback`` bars (default ``500``) at
-``corr_timeframe`` (default ``'1d'``) for every symbol via the data
-handler, computes per-bar price changes per ``corr_mode``
+**Universe liveness gating**: with staggered listings, symbols do not
+share the full price history, so weights are computed over the **live
+subset** only. A symbol is *live* when (1) it has the full
+``corr_lookback`` bars at ``corr_timeframe`` (data gate — every live
+member contributes the complete correlation window, so the estimation
+window never shrinks) and (2) ``strategy.is_warmed_up(symbol)`` is True
+(strategy gate — the measured flag the ``Strategy`` base sets when the
+first non-NaN forecast is cached). Non-live symbols are absent from
+``instrument_weight`` and skip sizing with ``skip_reason='not_live'``;
+live weights sum to 1 across the live subset. The live set is monotone
+non-decreasing during a backtest. Delisting/universe-exit handling is
+future work.
+
+The manager performs **walk-forward** weight estimation in every mode:
+at each recalc point it re-assesses liveness, and — under
+``'min_variance'`` / ``'risk_parity'`` — pulls ``corr_lookback`` bars
+at ``corr_timeframe`` (default ``'1d'``) for every *live* symbol via
+the data handler, computes per-bar price changes per ``corr_mode``
 (``'absolute_price_chg'`` → ``.diff()``, default — futures-safe for
 negative/zero prices; ``'simple_return'`` → ``.pct_change()`` — for
 strictly positive-price assets), and derives ρ → weights via the
@@ -85,10 +98,15 @@ the same ρ on every successful recompute, keeping the two coherent.
 completed ``corr_timeframe`` periods (default ``30``; multi-symbol bars
 at the same timestamp and sub-period base bars are de-duplicated via
 ``data.get_period_start``); set ``corr_step_size=0`` to disable
-auto-recalc. When the deque holds fewer than 30 valid return
-observations — always the case at construction time — the manager logs
-a WARNING and falls back to equal-weight (the ρ=1 degenerate case);
-``self.idm`` is left untouched in this branch.
+auto-recalc — note that in a backtest this freezes the one-shot
+``__init__`` result (an empty universe, since no bars have streamed
+yet) unless the caller recalcs manually. An empty live set yields an
+empty ``instrument_weight`` + INFO log (expected during backtest
+warmup); a singleton live set yields ``{symbol: 1.0}`` with
+``idm = 1.0``. If data gaps leave fewer than 30 valid return
+observations despite full-lookback members, the manager logs a WARNING
+and falls back to equal-weight over the live subset (the ρ=1 degenerate
+case); ``self.idm`` is left untouched in this branch.
 
 On every completed bar the manager:
 1. Updates the vol estimator.
@@ -103,7 +121,7 @@ no further orders once the position matches the target.
 
 import datetime
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -164,6 +182,8 @@ class CarverVolTargetingRiskManager(RiskManager):
     ``current_qty``, ``trade_qty``, ``buffer_threshold``) plus
     ``submitted`` (bool) and ``skip_reason`` — ``None`` when an order
     was submitted, otherwise one of ``'warmup'``, ``'zero_vol'``,
+    ``'not_live'`` (symbol absent from ``instrument_weight`` — outside
+    the current tradable universe per the liveness gate),
     ``'zero_weight'``, ``'dead_band'``, ``'at_target'``. Read via
     ``risk_manager.get_records(symbol)``.
     """
@@ -179,7 +199,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         vol_target_mode: str = 'dollar_volatility',
         position_buffer: float = 0.25,
         instrument_weight_mode: str = 'equal_weight',
-        corr_lookback: int = 500,
+        corr_lookback: int = 60,
         corr_step_size: int = 30,
         corr_timeframe: str = '1d',
         corr_mode: str = 'absolute_price_chg',
@@ -238,14 +258,21 @@ class CarverVolTargetingRiskManager(RiskManager):
             and used by ``calculate_instrument_weight`` when it is called
             without an explicit ``mode`` (including the call from this
             constructor). One of ``'equal_weight'`` (default),
-            ``'min_variance'``, or ``'risk_parity'``. With a corr-based
-            mode, the construction-time call derives the corr matrix
-            from the data handler; cold/short deques degrade to
-            equal-weight + WARNING rather than raising.
+            ``'min_variance'``, or ``'risk_parity'``. In every mode the
+            weights cover the live subset only; at construction time in
+            a backtest the deques are empty, so the universe starts
+            empty (INFO log, no raise) and fills in at the walk-forward
+            recalcs.
         corr_lookback
             Trailing window in ``corr_timeframe`` bars used to pull
-            closes for the inline correlation derivation. Default ``500``.
-            Must be ``>= 2``.
+            closes for the inline correlation derivation, AND the
+            universe liveness threshold: a symbol must carry this many
+            bars at ``corr_timeframe`` before it can enter the tradable
+            universe (see ``get_live_symbols``). Default ``60``. Must
+            be ``>= 31`` (so the window yields at least 30 price-change
+            observations) and ``<=`` the ``corr_timeframe`` deque maxlen
+            (``data_handler.timeframes[corr_timeframe]``) — otherwise no
+            symbol could ever go live.
         corr_step_size
             Auto-recalc cadence: after every ``corr_step_size`` completed
             ``corr_timeframe`` periods, ``update_bar`` re-calls
@@ -312,8 +339,14 @@ class CarverVolTargetingRiskManager(RiskManager):
             raise ValueError(
                 f"position_buffer must be in [0, 1), got {position_buffer}"
             )
-        if corr_lookback < 2:
-            raise ValueError(f"corr_lookback must be >= 2, got {corr_lookback}")
+        if corr_lookback < _MIN_CORR_OBS + 1:
+            raise ValueError(
+                f"corr_lookback must be >= {_MIN_CORR_OBS + 1}, got "
+                f"{corr_lookback}. corr_lookback is the universe liveness "
+                f"threshold and yields corr_lookback - 1 price-change "
+                f"observations, which must cover the {_MIN_CORR_OBS}-obs "
+                f"minimum for a stable correlation estimate."
+            )
         if corr_step_size < 0:
             raise ValueError(
                 f"corr_step_size must be >= 0, got {corr_step_size}"
@@ -323,6 +356,15 @@ class CarverVolTargetingRiskManager(RiskManager):
                 f"corr_timeframe '{corr_timeframe}' not registered in "
                 f"data_handler.timeframes; available: "
                 f"{list(data_handler.timeframes.keys())}"
+            )
+        maxlen = data_handler.timeframes[corr_timeframe]
+        if corr_lookback > maxlen:
+            raise ValueError(
+                f"corr_lookback ({corr_lookback}) exceeds the "
+                f"'{corr_timeframe}' deque maxlen ({maxlen}); no symbol "
+                f"could ever accumulate enough bars to pass the liveness "
+                f"gate. Increase timeframes['{corr_timeframe}'] or lower "
+                f"corr_lookback."
             )
         if corr_mode not in ('simple_return', 'absolute_price_chg'):
             raise ValueError(
@@ -367,6 +409,31 @@ class CarverVolTargetingRiskManager(RiskManager):
         self.calculate_instrument_weight()
         self.calculate_strategy_weight()
 
+    def get_live_symbols(self) -> List[str]:
+        """Return the symbols currently in the tradable universe.
+
+        A symbol is *live* when both gates pass:
+
+        1. **Data gate** — it has the full ``corr_lookback`` bars at
+           ``corr_timeframe`` (``get_latest_bars`` returns *up to* n
+           rows, so ``len == corr_lookback`` means "at least that many
+           available"; the count includes the current forming bar).
+        2. **Strategy gate** — ``strategy.is_warmed_up(symbol)``: the
+           strategy has cached its first non-NaN forecast for the
+           symbol, so it can actually trade it.
+
+        Order follows ``strategy.symbol_list``. The result is monotone
+        non-decreasing during a backtest (deques only grow; the warmup
+        flag never resets).
+        """
+        return [
+            s for s in self.strategy.symbol_list
+            if len(self.data_handler.get_latest_bars(
+                s, self.corr_lookback, timeframe=self.corr_timeframe,
+            )) >= self.corr_lookback
+            and self.strategy.is_warmed_up(s)
+        ]
+
     def calculate_instrument_weight(
         self,
         mode: Optional[str] = None,
@@ -375,11 +442,17 @@ class CarverVolTargetingRiskManager(RiskManager):
         """Populate ``self.instrument_weight`` according to ``mode``.
 
         Thin orchestrator over the ``analytics`` portfolio optimizers:
-        this method owns the risk-manager concerns — deriving ρ from the
-        data handler, the insufficient-history fallback, the symbol-set
-        check against ``strategy.symbol_list``, and the IDM side effect —
-        and delegates the weight math itself to ``analytics.equal_weight``
-        / ``analytics.min_variance`` / ``analytics.risk_parity``.
+        this method owns the risk-manager concerns — the universe
+        liveness gate (``get_live_symbols``), deriving ρ from the data
+        handler, the degenerate-universe and data-gap fallbacks, label
+        validation against ``strategy.symbol_list``, and the IDM side
+        effect — and delegates the weight math itself to
+        ``analytics.equal_weight`` / ``analytics.min_variance`` /
+        ``analytics.risk_parity``.
+
+        Weights cover the **live subset** only (see ``get_live_symbols``)
+        and sum to 1 across it; non-live symbols are absent from the
+        dict and skip sizing with ``skip_reason='not_live'``.
 
         Parameters
         ----------
@@ -388,9 +461,8 @@ class CarverVolTargetingRiskManager(RiskManager):
             ``self.instrument_weight_mode`` (set in the constructor;
             default ``'equal_weight'``). Otherwise one of:
 
-            * ``'equal_weight'`` — ``{symbol: 1/N}`` across
-              ``self.strategy.symbol_list``. ``corr_matrix`` is ignored
-              if passed.
+            * ``'equal_weight'`` — ``{symbol: 1/N}`` across the live
+              subset. ``corr_matrix`` is ignored if passed.
             * ``'min_variance'`` — exact long-only minimum-variance
               weights (``min wᵀρw`` s.t. ``Σw = 1``, ``w ≥ 0``), solved
               numerically by ``analytics.min_variance``.
@@ -403,60 +475,77 @@ class CarverVolTargetingRiskManager(RiskManager):
             assumption here since sizing already divides by each
             instrument's σ.
         corr_matrix
-            Correlation matrix of per-symbol price changes, indexed and
-            columned by the same labels as ``self.strategy.symbol_list``
-            (set-equal; row order is taken from the matrix). Optional
-            for the corr-based modes: when ``None``, ρ is derived inline
-            from the data handler (see ``_derive_corr_matrix``); if too
-            little history has accumulated — always the case at
-            construction time in a backtest since deques are empty — a
-            WARNING is logged and the method falls back to equal-weight
-            (the ρ=1 degenerate case). Ignored for
-            ``mode='equal_weight'``.
+            Optional explicit correlation matrix — the manual/research
+            hook. When supplied (corr-based modes), the **caller owns
+            the universe**: the liveness gate is NOT applied, and the
+            matrix labels must be a non-empty subset of
+            ``self.strategy.symbol_list`` (row order is taken from the
+            matrix). When ``None``, ρ is derived inline from the data
+            handler over the live subset (see ``_derive_corr_matrix``):
+            an empty live set — always the case at construction time in
+            a backtest since deques are empty — yields an empty weight
+            dict + INFO log; a singleton live set yields
+            ``{symbol: 1.0}`` with ``idm = 1.0``; and a data-gap
+            shortfall (< 30 valid observations despite full-lookback
+            members) logs a WARNING and falls back to equal-weight over
+            the live subset (the ρ=1 degenerate case).
 
         Raises
         ------
         ValueError
             On unknown ``mode``; a ``corr_matrix`` (passed or derived)
             failing the ``analytics`` validators (index ≠ columns,
-            asymmetric, NaN/inf) or not matching
-            ``self.strategy.symbol_list`` as a set; or optimizer solver
-            failure.
+            asymmetric, NaN/inf), empty, or carrying labels outside
+            ``self.strategy.symbol_list``; or optimizer solver failure.
 
         Notes
         -----
         Mutates ``self.instrument_weight`` in place and, on successful
         corr-based computes, also updates ``self.idm`` via
         ``analytics.diversification_multiplier(...)`` so weights and IDM
-        stay coherent. The equal-weight fallback path leaves ``self.idm``
-        untouched. Safe to re-call any time (e.g. monthly rebalances,
-        regime-driven scheme switches); ``update_bar`` re-calls this
-        method every ``corr_step_size`` completed ``corr_timeframe``
-        periods when a corr-based mode is active.
+        stay coherent. The equal-weight fallback and empty-universe
+        paths leave ``self.idm`` untouched. Safe to re-call any time
+        (e.g. monthly rebalances, regime-driven scheme switches);
+        ``update_bar`` re-calls this method every ``corr_step_size``
+        completed ``corr_timeframe`` periods in every mode (the recalc
+        re-assesses liveness even under ``'equal_weight'``).
         """
         if mode is None:
             mode = self.instrument_weight_mode
         if mode == 'equal_weight':
-            self.instrument_weight = equal_weight(self.strategy.symbol_list)
+            live = self.get_live_symbols()
+            if not live:
+                self._log_empty_universe(mode)
+                self.instrument_weight = {}
+                return
+            self.instrument_weight = equal_weight(live)
         elif mode in ('min_variance', 'risk_parity'):
             if corr_matrix is None:
-                corr_matrix = self._derive_corr_matrix(mode)
-                if corr_matrix is None:
-                    # Insufficient history — equal-weight fallback (ρ=1
-                    # degenerate case); IDM intentionally left untouched.
-                    self.instrument_weight = equal_weight(
-                        self.strategy.symbol_list,
-                    )
+                live = self.get_live_symbols()
+                if not live:
+                    self._log_empty_universe(mode)
+                    self.instrument_weight = {}
                     return
-            expected = set(self.strategy.symbol_list)
-            got = set(corr_matrix.index)
-            if got != expected:
-                missing = expected - got
-                extra = got - expected
+                if len(live) == 1:
+                    # Single-instrument universe: full weight, no
+                    # diversification credit.
+                    self.instrument_weight = {live[0]: 1.0}
+                    self.idm = 1.0
+                    return
+                corr_matrix = self._derive_corr_matrix(mode, live)
+                if corr_matrix is None:
+                    # Data-gap shortfall — equal-weight fallback over the
+                    # live subset (ρ=1 degenerate case); IDM intentionally
+                    # left untouched.
+                    self.instrument_weight = equal_weight(live)
+                    return
+            if len(corr_matrix.index) == 0:
+                raise ValueError("corr_matrix must not be empty")
+            extra = set(corr_matrix.index) - set(self.strategy.symbol_list)
+            if extra:
                 raise ValueError(
-                    f"corr_matrix labels must equal strategy.symbol_list "
-                    f"as a set; missing={sorted(missing)}, "
-                    f"extra={sorted(extra)}"
+                    f"corr_matrix labels must be a subset of "
+                    f"strategy.symbol_list; extra={sorted(extra)}"
                 )
             if mode == 'min_variance':
                 self.instrument_weight = min_variance(corr_matrix)
@@ -475,27 +564,41 @@ class CarverVolTargetingRiskManager(RiskManager):
                 "(expected 'equal_weight', 'min_variance', or 'risk_parity')"
             )
 
-    def _derive_corr_matrix(self, mode: str) -> Optional[pd.DataFrame]:
+    def _log_empty_universe(self, mode: str) -> None:
+        """INFO-log the empty-live-set state (expected during warmup)."""
+        logger.info(
+            "%s: no live symbols (liveness requires %d bars at '%s' plus "
+            "a warmed-up strategy forecast); instrument_weight is empty "
+            "until the next recalc",
+            mode, self.corr_lookback, self.corr_timeframe,
+        )
+
+    def _derive_corr_matrix(
+        self, mode: str, symbols: List[str],
+    ) -> Optional[pd.DataFrame]:
         """Derive ρ from a trailing window of per-bar price changes.
 
         Pulls ``self.corr_lookback`` bars at ``self.corr_timeframe`` for
-        each symbol via ``self.data_handler.get_latest_bars``, computes
-        per-bar price changes per ``self.corr_mode``
+        each of ``symbols`` (the live subset, per ``get_live_symbols``)
+        via ``self.data_handler.get_latest_bars``, computes per-bar
+        price changes per ``self.corr_mode``
         (``'simple_return'`` → ``.pct_change().dropna()``;
         ``'absolute_price_chg'`` → ``.diff().dropna()``), and calls
         ``analytics.correlation_matrix`` on the result.
 
         Returns ``None`` — after logging a WARNING that names ``mode`` —
         when fewer than ``_MIN_CORR_OBS`` (=30) valid observations
-        survive; the caller falls back to equal-weight. Raises
-        ``ValueError`` on an unexpected ``self.corr_mode``.
+        survive (only reachable via data gaps, since every live symbol
+        carries the full lookback); the caller falls back to
+        equal-weight over the live subset. Raises ``ValueError`` on an
+        unexpected ``self.corr_mode``.
         """
         closes = {
             s: self.data_handler.get_latest_bars(
                 s, self.corr_lookback,
                 timeframe=self.corr_timeframe,
             )['Close']
-            for s in self.strategy.symbol_list
+            for s in symbols
         }
         # ``fill_method=None`` opts out of pandas's deprecated default
         # forward-fill: NaN prices stay NaN and ``.dropna()`` drops them,
@@ -537,8 +640,9 @@ class CarverVolTargetingRiskManager(RiskManager):
 
         Skips forming bars (one resize per completed bar). Delegates
         target-qty derivation (and *target-derivation* skip reasons
-        ``'warmup'`` / ``'zero_vol'`` / ``'zero_weight'``) to
-        ``_compute_target_qty``; owns *post-target* concerns
+        ``'warmup'`` / ``'zero_vol'`` / ``'not_live'`` /
+        ``'zero_weight'``) to ``_compute_target_qty``; owns *post-target*
+        concerns
         (``'at_target'`` / ``'dead_band'`` / submit). Records one
         diagnostic row per *completed* bar — including every early-exit
         branch — into ``self._records[symbol]`` via ``_record_row``,
@@ -551,15 +655,13 @@ class CarverVolTargetingRiskManager(RiskManager):
         # ``corr_timeframe`` periods (not raw bar events). Each event is
         # bucketed via ``get_period_start``; the counter only ticks when
         # the bucket changes, so multi-symbol bars at the same timestamp
-        # and sub-period base bars don't multi-increment. The actual
-        # matrix work runs every ``corr_step_size`` periods and only when
-        # a corr-based weight mode is active. Counter resets whether the
-        # recompute succeeded or fell back to equal-weight (cold-deque
-        # path) — by the next attempt the deque has accumulated more bars.
-        if (
-            self.corr_step_size > 0
-            and self.instrument_weight_mode in ('min_variance', 'risk_parity')
-        ):
+        # and sub-period base bars don't multi-increment. The recalc runs
+        # in EVERY weight mode — even 'equal_weight' needs the periodic
+        # liveness re-assessment (newly-live symbols enter the universe
+        # at the next recalc). Counter resets whether the recompute
+        # succeeded or yielded an empty/fallback universe — by the next
+        # attempt the deques have accumulated more bars.
+        if self.corr_step_size > 0:
             period_start = get_period_start(event.timestamp, self.corr_timeframe)
             if period_start != self._last_seen_period_start:
                 self._last_seen_period_start = period_start
@@ -647,7 +749,8 @@ class CarverVolTargetingRiskManager(RiskManager):
         docstring for the two forms.
 
         Owns the *target-derivation* skip ladder (``'warmup'`` /
-        ``'zero_vol'`` / ``'zero_weight'``). The returned dict is
+        ``'zero_vol'`` / ``'not_live'`` / ``'zero_weight'``). The
+        returned dict is
         spliced into the diagnostic row by ``update_bar`` via
         ``row.update(...)``; intermediates computed before an
         early-exit fires are populated, those after remain ``None``,
@@ -669,7 +772,13 @@ class CarverVolTargetingRiskManager(RiskManager):
             out['skip_reason'] = 'zero_vol'
             return out
 
-        iw = self.instrument_weight.get(symbol, 0.0)
+        if symbol not in self.instrument_weight:
+            # Not in the current tradable universe (liveness gate): no
+            # weight assigned. ``instrument_weight`` stays None in the
+            # diagnostic row — truthful, vs. recording a synthetic 0.0.
+            out['skip_reason'] = 'not_live'
+            return out
+        iw = self.instrument_weight[symbol]
         sw = self.strategy_weight.get(self.strategy.__class__.__name__, 0.0)
         out['instrument_weight'] = iw
         out['strategy_weight'] = sw
