@@ -48,7 +48,7 @@ class SimpleRiskManager(RiskManager):
     _MODES = ('fixed_notional', 'fixed_quantity', 'fixed_equity_pct')
 
     def __init__(self, portfolio: _PortfolioLike, strategy: _StrategyLike,
-                 size_mode: str = 'fixed_notional',
+                 size_mode: str = 'fixed_quantity',
                  position_size: float = 10_000.0):
         """
         Parameters
@@ -61,7 +61,8 @@ class SimpleRiskManager(RiskManager):
             Strategy instance exposing ``get_forecast(symbol)``. Read on
             every completed bar to derive the target position.
         size_mode
-            One of ``'fixed_notional'``, ``'fixed_quantity'``,
+            One of ``'fixed_quantity'`` (default — futures convention:
+            size in contracts), ``'fixed_notional'``,
             ``'fixed_equity_pct'``. Validated at construction.
         position_size
             Magnitude interpreted per ``size_mode``.

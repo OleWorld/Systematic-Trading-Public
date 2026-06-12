@@ -199,10 +199,17 @@ def plot_strategy(df: pd.DataFrame,
 def _add_markers(fig: go.Figure, df: pd.DataFrame,
                  price_col: str, symbol: str, color: str,
                  name: str, offset_pct: float) -> None:
-    """Add signal markers slightly offset from the price for visibility."""
+    """Add signal markers slightly offset from the price for visibility.
+
+    The offset is a fraction of ``|price|`` ADDED to the price (not a
+    multiplication by ``1 + offset``) so a positive offset always shifts
+    markers upward — multiplicative offsets invert direction when the
+    price is negative (e.g. WTI 2020, futures spreads). Identical to the
+    historical behavior for positive prices.
+    """
     if df.empty:
         return
-    y_vals = df[price_col] * (1 + offset_pct)
+    y_vals = df[price_col] + df[price_col].abs() * offset_pct
     fig.add_trace(go.Scatter(
         x=df.index, y=y_vals, mode='markers', name=name,
         marker=dict(symbol=symbol, size=10, color=color, line=dict(width=1, color='white')),

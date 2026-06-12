@@ -227,6 +227,14 @@ def test_no_signal_type_kwarg_passed():
 # Sizing modes
 # ──────────────────────────────────────────────
 
+def test_default_size_mode_is_fixed_quantity():
+    """Futures-first default: size in contracts, not notional dollars."""
+    pf = FakePortfolio(price=100.0, positions={'BTC': 0.0})
+    strat = FakeStrategy({'BTC': 100.0})
+    rm = SimpleRiskManager(pf, strat)
+    assert rm.size_mode == 'fixed_quantity'
+
+
 def test_size_mode_fixed_notional():
     pf = FakePortfolio(price=100.0, positions={'BTC': 0.0})
     strat = FakeStrategy({'BTC': 100.0})

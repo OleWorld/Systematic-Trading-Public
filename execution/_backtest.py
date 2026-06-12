@@ -53,13 +53,38 @@ class SlippageModel:
 @dataclass
 class CommissionModel:
     """
-    Simple proportional commission model.
-    rate: fraction of notional (e.g., 0.0004 = 4bps taker fee).
+    Configurable commission applied per fill.
+
+    Modes:
+        'per_contract' — fixed $ per contract: ``abs(quantity) * value``
+                         (default — futures brokers charge per contract,
+                         independent of price level; safe for negative/
+                         zero prices)
+        'rate'         — fraction of notional: ``abs(quantity * fill_price)
+                         * value`` (e.g., 0.0004 = 4bps taker fee — the
+                         crypto/equity convention)
     """
-    rate: float
+    mode: str = 'per_contract'
+    value: float = 0.0
+
+    def __post_init__(self):
+        if self.mode not in ('rate', 'per_contract'):
+            raise ValueError(
+                f"Unknown CommissionModel mode: '{self.mode}'. "
+                "Must be 'rate' or 'per_contract'."
+            )
 
     def calculate(self, quantity: float, fill_price: float) -> float:
-        return abs(quantity * fill_price) * self.rate
+        """Commission in $ for a fill (always non-negative)."""
+        if self.mode == 'rate':
+            return abs(quantity * fill_price) * self.value
+        elif self.mode == 'per_contract':
+            return abs(quantity) * self.value
+        else:
+            raise ValueError(
+                f"Unknown CommissionModel mode: '{self.mode}'. "
+                "Must be 'rate' or 'per_contract'."
+            )
 
 
 # ──────────────────────────────────────────────

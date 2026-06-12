@@ -5,8 +5,18 @@ in **cash-vol** form. The risk target is a dollar amount of vol per
 period; the instrument's dollar vol per period divides that target to
 give the size:
 
+    # vol_target_mode='dollar_volatility' (default — institutional futures
+    # convention: a fixed annual $ vol budget, like a drawdown limit that
+    # resets yearly instead of compounding with the account):
+    annual_cash_target = IDM × strategy_weight × instrument_weight
+                                × annualized_target_vol × (forecast / TARGET_AVG_ABS_FORECAST)
+
+    # vol_target_mode='percent_volatility' (Carver's original form — the
+    # vol budget is a fraction of *current* account equity, so position
+    # sizes compound as the account grows/shrinks):
     annual_cash_target = capital × IDM × strategy_weight × instrument_weight
                                 × annualized_target_vol × (forecast / TARGET_AVG_ABS_FORECAST)
+
     daily_cash_target  = annual_cash_target / sqrt(days_per_year)
     target_qty         = daily_cash_target / daily_price_vol
                        = annual_cash_target / annualized_price_vol
@@ -16,14 +26,16 @@ where:
     IDM                    = instrument diversification multiplier      (constructor)
     strategy_weight        = per-strategy capital weight                (self.strategy_weight)
     instrument_weight      = per-symbol capital weight                  (self.instrument_weight)
-    annualized_target_vol  = annualized vol target                      (constructor; e.g. 0.25 = 25 %)
+    annualized_target_vol  = annualized vol target                      (constructor; REQUIRED —
+                             $ amount in dollar mode, e.g. 250_000;
+                             fraction of equity in percent mode, e.g. 0.25 = 25 %)
     annualized_price_vol   = annualized stdev of price changes ($-units)  (VolEstimator)
     forecast               = strategy.get_forecast(symbol) ∈ [-FORECAST_CAP, +FORECAST_CAP]
 
 The two equalities for ``target_qty`` are algebraically equivalent: the
 ``sqrt(days_per_year)`` factors in the daily-cash and daily-price-vol
 forms cancel, so we implement the cleaner annualized form (no need to
-plumb ``days_per_year`` / convention into the risk manager). The
+plumb ``days_per_year`` / days_convention into the risk manager). The
 daily-cash intermediate is preserved here for readers — it's the natural
 mental model when running on daily bars.
 
@@ -59,10 +71,10 @@ With ``instrument_weight_mode='min_variance'`` the manager performs
 **walk-forward** weight estimation: at each recalc point it pulls
 ``corr_lookback`` bars (default ``500``) at ``corr_timeframe`` (default
 ``'1d'``) for every symbol via the data handler, computes per-bar price
-changes per ``corr_mode`` (``'simple_return'`` → ``.pct_change()``,
-default; ``'absolute_price_chg'`` → ``.diff()`` — for futures/spreads
-whose prices can be negative or zero, where percentage returns are
-meaningless), and derives ρ → weights via the existing
+changes per ``corr_mode`` (``'absolute_price_chg'`` → ``.diff()``,
+default — futures-safe for negative/zero prices; ``'simple_return'`` →
+``.pct_change()`` — for strictly positive-price assets), and derives
+ρ → weights via the existing
 min-variance formula. The matching IDM (``analytics.diversification_multiplier``)
 is updated from the same ρ on every successful recompute, keeping the
 two coherent. ``update_bar`` auto-recalls the method every
@@ -156,13 +168,14 @@ class CarverVolTargetingRiskManager(RiskManager):
         vol_estimator: VolEstimator,
         data_handler: _DataHandlerLike,
         idm: float = 1.0,
-        annualized_target_vol: float = 0.25,
+        annualized_target_vol: Optional[float] = None,
+        vol_target_mode: str = 'dollar_volatility',
         position_buffer: float = 0.25,
         instrument_weight_mode: str = 'equal_weight',
         corr_lookback: int = 500,
         corr_step_size: int = 30,
         corr_timeframe: str = '1d',
-        corr_mode: str = 'simple_return',
+        corr_mode: str = 'absolute_price_chg',
     ):
         """
         Parameters
@@ -190,9 +203,23 @@ class CarverVolTargetingRiskManager(RiskManager):
             derived); the constructor default applies only until the
             first successful recompute.
         annualized_target_vol
-            Annualized volatility target (Carver's ``τ``). Default
-            ``0.25`` (25 %, Carver's default for futures). Must be in
-            ``(0, 1)``.
+            Annualized volatility target (Carver's ``τ``). REQUIRED —
+            no default; its units depend on ``vol_target_mode``:
+            a dollar amount (must be ``> 0``, e.g. ``250_000`` = $250k
+            of annual vol) under ``'dollar_volatility'``, or a fraction
+            of current account equity (must be in ``(0, 1)``, e.g.
+            ``0.25`` = 25 %) under ``'percent_volatility'``.
+        vol_target_mode
+            How ``annualized_target_vol`` is interpreted. One of:
+
+            * ``'dollar_volatility'`` (default) — fixed annual dollar
+              vol budget; the cash target does NOT scale with account
+              equity (institutional futures convention: the risk/
+              drawdown limit is a dollar number reset periodically,
+              not a compounding fraction).
+            * ``'percent_volatility'`` — Carver's original form; the
+              cash target is ``capital × τ`` re-read from the portfolio
+              every bar, so sizes compound as the account grows/shrinks.
         position_buffer
             Carver §10.7 dead-band: skip the order if
             ``|trade_qty| <= position_buffer * |target_qty|``. Default
@@ -230,12 +257,13 @@ class CarverVolTargetingRiskManager(RiskManager):
             ``data_handler.timeframes``.
         corr_mode
             How per-bar price changes are computed from the closes window
-            before correlating. One of ``'simple_return'`` (default,
-            ``.pct_change()``) or ``'absolute_price_chg'`` (``.diff()``).
-            Use ``'absolute_price_chg'`` for futures contracts and
-            synthetic products (e.g. time spreads) whose prices can be
-            negative or zero — simple returns are meaningless there
-            (inf at zero crossings, sign-flipped below zero).
+            before correlating. One of ``'absolute_price_chg'`` (default,
+            ``.diff()`` — the futures-safe choice: works for contracts
+            and synthetic products such as time spreads whose prices can
+            be negative or zero, where simple returns are meaningless —
+            inf at zero crossings, sign-flipped below zero) or
+            ``'simple_return'`` (``.pct_change()`` — for strictly
+            positive-price assets such as crypto/equities).
 
         Raises
         ------
@@ -244,9 +272,32 @@ class CarverVolTargetingRiskManager(RiskManager):
         """
         if idm <= 0:
             raise ValueError(f"idm must be > 0, got {idm}")
-        if not (0 < annualized_target_vol < 1):
+        if vol_target_mode not in ('dollar_volatility', 'percent_volatility'):
             raise ValueError(
-                f"annualized_target_vol must be in (0, 1), got {annualized_target_vol}"
+                f"Unknown vol_target_mode: {vol_target_mode!r}. "
+                "Must be 'dollar_volatility' or 'percent_volatility'."
+            )
+        if annualized_target_vol is None:
+            raise ValueError(
+                "annualized_target_vol must be supplied explicitly (no "
+                "default): a dollar amount under 'dollar_volatility' or "
+                "a fraction in (0, 1) under 'percent_volatility'."
+            )
+        if vol_target_mode == 'percent_volatility':
+            if not (0 < annualized_target_vol < 1):
+                raise ValueError(
+                    f"annualized_target_vol must be in (0, 1) under "
+                    f"'percent_volatility', got {annualized_target_vol}"
+                )
+        elif vol_target_mode == 'dollar_volatility':
+            if annualized_target_vol <= 0:
+                raise ValueError(
+                    f"annualized_target_vol must be > 0 under "
+                    f"'dollar_volatility', got {annualized_target_vol}"
+                )
+        else:
+            raise ValueError(
+                f"Unexpected vol_target_mode: {vol_target_mode!r}"
             )
         if not (0.0 <= position_buffer < 1.0):
             raise ValueError(
@@ -273,7 +324,9 @@ class CarverVolTargetingRiskManager(RiskManager):
         self.vol_estimator = vol_estimator
         self.data_handler = data_handler
         self.idm = idm
-        self.annualized_target_vol = annualized_target_vol
+        # Narrowed to float by the None-rejection above.
+        self.annualized_target_vol: float = annualized_target_vol
+        self.vol_target_mode = vol_target_mode
         self.position_buffer = position_buffer
         self.corr_lookback = corr_lookback
         self.corr_step_size = corr_step_size
@@ -522,6 +575,7 @@ class CarverVolTargetingRiskManager(RiskManager):
             'capital': capital,
             'idm': self.idm,
             'annualized_target_vol': self.annualized_target_vol,
+            'vol_target_mode': self.vol_target_mode,
             'position_buffer': self.position_buffer,
             'annual_cash_target': None,
             'target_qty': None,
@@ -571,9 +625,12 @@ class CarverVolTargetingRiskManager(RiskManager):
     def _compute_target_qty(self, event: BarEvent) -> Dict[str, Any]:
         """Carver cash-vol target-qty pipeline.
 
-        target_qty = (capital × IDM × strategy_weight × instrument_weight
-                      × annualized_target_vol × (forecast / TARGET_AVG_ABS_FORECAST))
-                     / annualized_price_vol
+        target_qty = annual_cash_target / annualized_price_vol, where
+        annual_cash_target = IDM × strategy_weight × instrument_weight
+        × annualized_target_vol × (forecast / TARGET_AVG_ABS_FORECAST),
+        additionally scaled by ``capital`` (current account equity) under
+        ``vol_target_mode='percent_volatility'`` — see the module
+        docstring for the two forms.
 
         Owns the *target-derivation* skip ladder (``'warmup'`` /
         ``'zero_vol'`` / ``'zero_weight'``). The returned dict is
@@ -606,12 +663,28 @@ class CarverVolTargetingRiskManager(RiskManager):
             out['skip_reason'] = 'zero_weight'
             return out
 
-        capital = self.portfolio.calculate_balance()
         forecast = self.strategy.get_forecast(symbol)
-        annual_cash_target = (
-            capital * self.idm * sw * iw * self.annualized_target_vol
-            * (forecast / Strategy.TARGET_AVG_ABS_FORECAST)
-        )
+        if self.vol_target_mode == 'percent_volatility':
+            # Carver's original form: τ is a fraction of *current*
+            # account equity, so the cash target compounds with the
+            # account.
+            capital = self.portfolio.calculate_balance()
+            annual_cash_target = (
+                capital * self.idm * sw * iw * self.annualized_target_vol
+                * (forecast / Strategy.TARGET_AVG_ABS_FORECAST)
+            )
+        elif self.vol_target_mode == 'dollar_volatility':
+            # Fixed annual $ vol budget — no capital term (institutional
+            # futures convention: the risk limit is a dollar number, not
+            # a compounding fraction of equity).
+            annual_cash_target = (
+                self.idm * sw * iw * self.annualized_target_vol
+                * (forecast / Strategy.TARGET_AVG_ABS_FORECAST)
+            )
+        else:
+            raise ValueError(
+                f"Unexpected vol_target_mode: {self.vol_target_mode!r}"
+            )
         out['annual_cash_target'] = annual_cash_target
         out['target_qty'] = annual_cash_target / sigma
         return out

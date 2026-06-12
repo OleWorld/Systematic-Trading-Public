@@ -10,7 +10,7 @@ Pin:
 - Edge cases return NaN/NaT/0 cleanly (empty inputs, constant balance,
   no closing trades, all-winning trade log) — never raise.
 - Parameter validation raises (non-DataFrame, non-positive capital,
-  unknown convention).
+  unknown days_convention).
 
 Run from the repo root:  python -m pytest tests/test_analytics_stats.py -v
 """
@@ -86,7 +86,7 @@ def _trade_log(pnls, *, start='2024-01-01') -> pd.DataFrame:
 
 def _stats(balances, pnls=(), **kwargs):
     defaults = dict(initial_capital=100_000.0, timeframe='1d',
-                    convention='crypto')
+                    days_convention='calendar')
     defaults.update(kwargs)
     return backtest_stats(
         _equity_curve(balances), _trade_log(list(pnls)), **defaults,
@@ -163,13 +163,13 @@ def test_pnl_equity_and_return_lines():
     assert math.isclose(stats['Equity Peak [$]'], 106_000.0)
     assert math.isclose(stats['Net PnL [$]'], 6_000.0)
     assert math.isclose(stats['Return [%]'], 6.0)
-    # CAGR over 4 daily bars (crypto: 365 bars/year)
+    # CAGR over 4 daily bars (calendar convention: 365 bars/year)
     expected_cagr = ((106_000 / 100_000) ** (365 / 4) - 1) * 100
     assert math.isclose(stats['CAGR [%]'], expected_cagr, rel_tol=1e-12)
 
 
 def test_sharpe_and_volatility_all_four_units():
-    """With timeframe='1d' / convention='crypto', bpy == dpy == 365 so the
+    """With timeframe='1d' / days_convention='calendar', bpy == dpy == 365 so the
     daily volatility lines equal the plain per-bar stds."""
     balances = [101_000, 103_000, 102_000, 106_000]
     stats = _stats(balances)
@@ -212,14 +212,14 @@ def test_calmar_is_cagr_over_max_drawdown_pct():
 
 
 def test_daily_vol_rescaled_from_hourly_bars():
-    """timeframe='1h' / crypto: bpy = 365*24, dpy = 365 → daily $ vol =
+    """timeframe='1h' / calendar: bpy = 365*24, dpy = 365 → daily $ vol =
     per-bar std × sqrt(24)."""
     balances = [101_000, 103_000, 102_000, 106_000]
     eq = _equity_curve(balances)
     eq.index = pd.date_range('2024-01-01', periods=len(balances),
                              freq='h', tz='UTC')
     stats = backtest_stats(eq, _trade_log([]), initial_capital=100_000.0,
-                           timeframe='1h', convention='crypto')
+                           timeframe='1h', days_convention='calendar')
     bal = pd.Series([100_000.0] + [float(b) for b in balances])
     pnl = bal.diff().dropna()
     assert math.isclose(
@@ -240,7 +240,7 @@ def test_multi_symbol_curve_collapses_to_last_row_per_timestamp():
     balances = [100_000, 110_000, 90_000, 95_000, 112_000, 100_000]
     multi = backtest_stats(
         _equity_curve(balances, symbols=('BTC', 'ETH')), _trade_log([]),
-        initial_capital=100_000.0, timeframe='1d', convention='crypto',
+        initial_capital=100_000.0, timeframe='1d', days_convention='calendar',
     )
     single = _stats(balances)
     for label in _EXPECTED_LABELS:
@@ -294,7 +294,7 @@ def test_no_closing_trades_trade_stats_are_nan():
 def test_empty_inputs_return_full_series_of_nans():
     stats = backtest_stats(pd.DataFrame(), pd.DataFrame(),
                            initial_capital=100_000.0, timeframe='1d',
-                           convention='crypto')
+                           days_convention='calendar')
     assert list(stats.index) == _EXPECTED_LABELS
     assert pd.isna(stats['Start']) and pd.isna(stats['End'])
     assert pd.isna(stats['Equity Final [$]'])
@@ -324,11 +324,11 @@ def test_non_dataframe_inputs_rejected():
     with pytest.raises(TypeError):
         backtest_stats('not a frame', _trade_log([]),
                        initial_capital=100_000.0, timeframe='1d',
-                       convention='crypto')
+                       days_convention='calendar')
     with pytest.raises(TypeError):
         backtest_stats(_equity_curve([100_000]), [1, 2, 3],
                        initial_capital=100_000.0, timeframe='1d',
-                       convention='crypto')
+                       days_convention='calendar')
 
 
 def test_non_positive_initial_capital_rejected():
@@ -338,9 +338,9 @@ def test_non_positive_initial_capital_rejected():
         _stats([100_000], initial_capital=-1.0)
 
 
-def test_unknown_convention_rejected():
-    with pytest.raises(ValueError):
-        _stats([100_000], convention='lunar')
+def test_unknown_days_convention_rejected():
+    with pytest.raises(ValueError, match="days_convention"):
+        _stats([100_000], days_convention='lunar')
 
 
 def test_missing_required_columns_rejected():
@@ -350,4 +350,4 @@ def test_missing_required_columns_rejected():
     )
     with pytest.raises(ValueError, match="account_balance"):
         backtest_stats(bad, _trade_log([]), initial_capital=100_000.0,
-                       timeframe='1d', convention='crypto')
+                       timeframe='1d', days_convention='calendar')

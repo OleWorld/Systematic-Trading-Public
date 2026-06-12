@@ -49,23 +49,24 @@ __all__ = ['VolEstimator', 'bars_per_year', '_DataHandlerLike']
 
 _SECONDS_PER_DAY = 24 * 3600
 _DAYS_PER_YEAR = {
-    'crypto': 365,    # 24/7 markets
-    'tradfi': 252,    # standard equity/futures trading-day convention
+    'calendar': 365,    # calendar days/year — 24/7 markets (e.g. crypto)
+    'business': 252,    # standard equity/futures trading-day convention
 }
 
 
-def bars_per_year(timeframe: str, convention: str) -> float:
-    """Return bars-per-year for a timeframe under the chosen convention.
+def bars_per_year(timeframe: str, days_convention: str) -> float:
+    """Return bars-per-year for a timeframe under the chosen days convention.
 
     Used as the annualization factor for ``VolEstimator`` subclasses:
-    ``annualized_vol = stdev * sqrt(bars_per_year(timeframe, convention))``.
+    ``annualized_vol = stdev * sqrt(bars_per_year(timeframe, days_convention))``.
 
     The two supported conventions:
 
-    - ``'crypto'`` (365 days/year, 24/7 markets). ``1d`` → 365,
-      ``4h`` → 365*6, ``1h`` → 365*24, ``1m`` → 365*1440.
-    - ``'tradfi'`` (252 trading days/year). ``1d`` → 252,
-      ``4h`` → 252*6, ``1h`` → 252*24, ``1m`` → 252*1440.
+    - ``'calendar'`` (365 days/year, 24/7 markets such as crypto).
+      ``1d`` → 365, ``4h`` → 365*6, ``1h`` → 365*24, ``1m`` → 365*1440.
+    - ``'business'`` (252 trading days/year — the standard tradfi
+      futures/equity convention). ``1d`` → 252, ``4h`` → 252*6,
+      ``1h`` → 252*24, ``1m`` → 252*1440.
 
     The intraday formulas hold full-time-trading hours (24/day) into the
     bar count for both conventions; for daily data the result is exactly
@@ -76,14 +77,14 @@ def bars_per_year(timeframe: str, convention: str) -> float:
     Raises
     ------
     ValueError
-        If ``convention`` is not ``'crypto'`` or ``'tradfi'``.
+        If ``days_convention`` is not ``'calendar'`` or ``'business'``.
     """
-    if convention not in _DAYS_PER_YEAR:
+    if days_convention not in _DAYS_PER_YEAR:
         raise ValueError(
-            f"Unknown convention: '{convention}'. "
-            "Must be 'crypto' (365 days/year) or 'tradfi' (252 days/year)."
+            f"Unknown days_convention: '{days_convention}'. "
+            "Must be 'calendar' (365 days/year) or 'business' (252 days/year)."
         )
-    seconds_per_year = _DAYS_PER_YEAR[convention] * _SECONDS_PER_DAY
+    seconds_per_year = _DAYS_PER_YEAR[days_convention] * _SECONDS_PER_DAY
     return seconds_per_year / parse_timeframe_to_seconds(timeframe)
 
 

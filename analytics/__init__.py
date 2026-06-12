@@ -15,7 +15,7 @@ Public surface:
   ``1 / sqrt(wᵀ ρ w)``. Quantifies the vol-cancellation credit of a
   weighted bundle.
 * ``backtest_stats(equity_curve, trade_log, *, initial_capital,
-  timeframe, convention)`` — post-run summary statistics (drawdowns,
+  timeframe, days_convention)`` — post-run summary statistics (drawdowns,
   Sharpe/Sortino/Calmar, volatility, trade stats) as an ordered
   ``pd.Series``; dollar-first with percentage twins where meaningful.
 """

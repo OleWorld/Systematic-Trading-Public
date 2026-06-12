@@ -50,7 +50,7 @@ def backtest_stats(
     *,
     initial_capital: float,
     timeframe: str,
-    convention: str,
+    days_convention: str,
 ) -> pd.Series:
     """Summarize a backtest into an ordered ``pd.Series`` of statistics.
 
@@ -75,14 +75,14 @@ def backtest_stats(
     timeframe
         Bar timeframe of the equity curve (the engine's
         ``base_timeframe``, e.g. ``'1d'``). Together with
-        ``convention``, sets the annualization factor via
+        ``days_convention``, sets the annualization factor via
         ``volatility.bars_per_year``. A mismatched value silently
         mis-annualizes — pass the timeframe the curve was actually
         recorded at.
-    convention
-        ``'crypto'`` (365 days/year) or ``'tradfi'`` (252 days/year);
-        also fixes the days-per-year used to rescale per-bar volatility
-        to the daily lines.
+    days_convention
+        ``'calendar'`` (365 days/year) or ``'business'`` (252 trading
+        days/year); also fixes the days-per-year used to rescale
+        per-bar volatility to the daily lines.
 
     Returns
     -------
@@ -102,7 +102,7 @@ def backtest_stats(
     TypeError
         If ``equity_curve`` or ``trade_log`` is not a DataFrame.
     ValueError
-        If ``initial_capital <= 0``, ``convention``/``timeframe`` is
+        If ``initial_capital <= 0``, ``days_convention``/``timeframe`` is
         invalid, or a non-empty ``equity_curve`` lacks required columns.
 
     Notes
@@ -132,8 +132,8 @@ def backtest_stats(
         raise ValueError(
             f"initial_capital must be > 0, got {initial_capital}"
         )
-    bpy = bars_per_year(timeframe, convention)      # raises on bad inputs
-    dpy = bars_per_year('1d', convention)
+    bpy = bars_per_year(timeframe, days_convention)  # raises on bad inputs
+    dpy = bars_per_year('1d', days_convention)
     if not equity_curve.empty:
         missing = [c for c in _REQUIRED_EQUITY_COLS
                    if c not in equity_curve.columns]

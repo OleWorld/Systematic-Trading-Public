@@ -96,6 +96,38 @@ def test_candlestick_mode_volume_coloring_unchanged():
 
 
 # ──────────────────────────────────────────────
+# Signal-marker offset (negative-price safety)
+# ──────────────────────────────────────────────
+
+def _marker_trace(fig: go.Figure, name: str) -> go.Scatter:
+    return next(t for t in fig.data if t.name == name)
+
+
+def test_marker_offset_above_price_for_negative_prices():
+    """WTI-2020 case: with a positive signal_offset, markers must sit ABOVE
+    the (negative) close. Pre-fix, ``price * (1 + offset)`` moved them
+    below (more negative)."""
+    df = _records_df([-37.0, -35.0, -36.0], settle_only=True)
+    df['signal'] = [['OPEN_LONG'], None, ['OPEN_LONG']]
+    fig = plot_strategy(df, chart='line', signal_offset=0.002)
+    trace = _marker_trace(fig, 'Open Long')
+    closes = [-37.0, -36.0]                 # rows carrying the signal
+    for y, close in zip(trace.y, closes):
+        assert y > close, f"marker y={y} not above close={close}"
+
+
+def test_marker_offset_above_price_for_positive_prices_unchanged():
+    """No-regression pin: for positive prices the offset is the historical
+    fraction-of-price shift, ``close * (1 + offset)``."""
+    df = _records_df([100.0, 101.0])
+    df['signal'] = [['OPEN_LONG'], None]
+    fig = plot_strategy(df, signal_offset=0.002)
+    trace = _marker_trace(fig, 'Open Long')
+    assert len(trace.y) == 1
+    assert abs(trace.y[0] - 100.0 * 1.002) < 1e-9
+
+
+# ──────────────────────────────────────────────
 # Interaction with resampling
 # ──────────────────────────────────────────────
 

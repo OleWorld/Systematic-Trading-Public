@@ -27,18 +27,21 @@ from plotting import plot_strategy
 config = BacktestConfig(
     symbols=['BTC_USDT:USDT', 'BNB_USDT:USDT', 'SOL_USDT:USDT', 'DOGE_USDT:USDT', 'ETH_USDT:USDT'],
     instrument_weight_mode = 'min_variance',
+    corr_mode='simple_return',              # crypto-style: positive prices, pct-change correlations
     start_date='2021-01-01',
     end_date='2025-12-31',
     base_timeframe='1d',
-    convention='crypto',
+    days_convention='calendar',
     timeframes={'1d': 500},
     initial_capital=1_000_000.0,
     leverage=10.0,
     annualized_target_vol=0.5,
+    vol_target_mode='percent_volatility',   # crypto-style: τ is a fraction of current equity
     position_buffer=0.25,
     slippage_mode='pct',
     slippage_value=0.001,
-    commission_rate=0.001,
+    commission_mode='rate',                 # crypto-style: bps on notional
+    commission_value=0.001,
     fill_on='signal_close',
 )
 
@@ -83,7 +86,7 @@ portfolio = BacktestPortfolio(
 vol_timeframe = '1d'
 vol_estimator = EWMAVolEstimator(
     config.symbols, data_handler=data_handler,
-    bars_per_year=bars_per_year(vol_timeframe, config.convention),
+    bars_per_year=bars_per_year(vol_timeframe, config.days_convention),
     timeframe=vol_timeframe, span=36,
 )
 
@@ -91,6 +94,7 @@ risk_manager = CarverVolTargetingRiskManager(
     portfolio, strategy, vol_estimator,
     data_handler=data_handler,
     annualized_target_vol=config.annualized_target_vol,
+    vol_target_mode=config.vol_target_mode,
     position_buffer=config.position_buffer,
     instrument_weight_mode=config.instrument_weight_mode,
     corr_lookback=config.corr_lookback,
@@ -102,7 +106,8 @@ risk_manager = CarverVolTargetingRiskManager(
 execution = BacktestExecution(
     events_queue,
     slippage_model=SlippageModel(config.slippage_mode, config.slippage_value),
-    commission_model=CommissionModel(rate=config.commission_rate),
+    commission_model=CommissionModel(mode=config.commission_mode,
+                                     value=config.commission_value),
     fill_on=config.fill_on,
 )
 
@@ -167,7 +172,7 @@ stats = backtest_stats(
     equity_df, trade_df,
     initial_capital=config.initial_capital,
     timeframe=config.base_timeframe,
-    convention=config.convention,
+    days_convention=config.days_convention,
 )
 print(stats.to_string())
 
