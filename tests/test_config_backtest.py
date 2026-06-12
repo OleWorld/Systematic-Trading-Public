@@ -19,7 +19,8 @@ def _kwargs(**overrides):
         start_date='2024-01-01',
         end_date='2024-12-31',
         base_timeframe='1d',
-        convention='crypto',
+        days_convention='calendar',
+        annualized_target_vol=0.25,     # required since the futures-first refactor
     )
     base.update(overrides)
     return base
@@ -49,3 +50,89 @@ def test_corr_step_size_zero_accepted():
     """``0`` is a valid value — disables auto-recalc."""
     cfg = BacktestConfig(**_kwargs(corr_step_size=0))
     assert cfg.corr_step_size == 0
+
+
+def test_default_vol_target_mode_is_dollar_volatility():
+    cfg = BacktestConfig(**_kwargs())
+    assert cfg.vol_target_mode == 'dollar_volatility'
+
+
+def test_none_annualized_target_vol_rejected():
+    """tau has no default — omitting it must fail at config construction."""
+    kwargs = _kwargs()
+    kwargs.pop('annualized_target_vol', None)
+    with pytest.raises(ValueError, match="annualized_target_vol"):
+        BacktestConfig(**kwargs)
+
+
+def test_percent_mode_range_validation():
+    for bad in (0.0, 1.0, -0.1):
+        with pytest.raises(ValueError, match="annualized_target_vol"):
+            BacktestConfig(**_kwargs(
+                vol_target_mode='percent_volatility',
+                annualized_target_vol=bad,
+            ))
+
+
+def test_dollar_mode_accepts_large_tau():
+    cfg = BacktestConfig(**_kwargs(
+        vol_target_mode='dollar_volatility',
+        annualized_target_vol=250_000.0,
+    ))
+    assert cfg.annualized_target_vol == 250_000.0
+
+
+def test_dollar_mode_rejects_non_positive_tau():
+    with pytest.raises(ValueError, match="annualized_target_vol"):
+        BacktestConfig(**_kwargs(
+            vol_target_mode='dollar_volatility',
+            annualized_target_vol=0.0,
+        ))
+
+
+def test_unknown_vol_target_mode_rejected():
+    with pytest.raises(ValueError, match="vol_target_mode"):
+        BacktestConfig(**_kwargs(vol_target_mode='notional_volatility'))
+
+
+def test_old_convention_values_rejected():
+    """Hard rename guard: pre-rename 'crypto'/'tradfi' must fail loudly."""
+    with pytest.raises(ValueError, match="days_convention"):
+        BacktestConfig(**_kwargs(days_convention='crypto'))
+    with pytest.raises(ValueError, match="days_convention"):
+        BacktestConfig(**_kwargs(days_convention='tradfi'))
+
+
+def test_default_corr_mode():
+    """Futures-first default: absolute price changes."""
+    cfg = BacktestConfig(**_kwargs())
+    assert cfg.corr_mode == 'absolute_price_chg'
+
+
+def test_default_size_mode_is_fixed_quantity():
+    """Futures-first default: size in contracts, not notional dollars."""
+    cfg = BacktestConfig(**_kwargs())
+    assert cfg.size_mode == 'fixed_quantity'
+
+
+def test_default_slippage_mode_is_absolute():
+    """Futures-first default: slippage in $ per unit (ticks), not % of price."""
+    cfg = BacktestConfig(**_kwargs())
+    assert cfg.slippage_mode == 'absolute'
+
+
+def test_default_commission_mode_is_per_contract():
+    """Futures-first default: commission in $ per contract."""
+    cfg = BacktestConfig(**_kwargs())
+    assert cfg.commission_mode == 'per_contract'
+    assert cfg.commission_value == 0.0
+
+
+def test_unknown_commission_mode_rejected():
+    with pytest.raises(ValueError, match="commission_mode"):
+        BacktestConfig(**_kwargs(commission_mode='bps'))
+
+
+def test_unknown_corr_mode_rejected():
+    with pytest.raises(ValueError, match="corr_mode"):
+        BacktestConfig(**_kwargs(corr_mode='log_return'))

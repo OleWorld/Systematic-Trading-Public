@@ -1,4 +1,4 @@
-"""Candlestick + indicator + signal-marker chart for strategy records."""
+"""Candlestick/line + indicator + signal-marker chart for strategy records."""
 
 from typing import Any, Dict, List, Optional
 
@@ -11,12 +11,13 @@ from data import resample
 
 def plot_strategy(df: pd.DataFrame,
                   timeframe: Optional[str] = None,
+                  chart: str = 'candlestick',
                   indicators: Optional[Dict[str, int]] = None,
                   volume: bool = True,
                   title: str = "Strategy Chart",
                   signal_offset: float = 0) -> go.Figure:
     """
-    Plot a candlestick chart from a strategy get_records() DataFrame.
+    Plot a price chart from a strategy get_records() DataFrame.
 
     Parameters
     ----------
@@ -31,6 +32,14 @@ def plot_strategy(df: pd.DataFrame,
         (as-of semantics). Signal lists are concatenated within each bucket
         so multiple signals firing in one bucket all appear on the chart.
         Bucket alignment matches ``data.resample``.
+    chart : str
+        Price-panel style: ``'candlestick'`` (default) or ``'line'``
+        (a line of ``close``). Use ``'line'`` for settle-price-only
+        futures data — the data layer requires non-NaN OHLC, so such
+        data is fed with O=H=L=C=settle and candles render degenerately.
+        In line mode the volume bars are colored by close vs *prior*
+        close (close vs open is always flat when O=C); the first bar,
+        having no prior close, renders neutral gray.
     indicators : dict of str -> int, optional
         Mapping of column name to 1-indexed panel number. Panel 1 is the
         price candlestick panel; panel 2 is the first sub-panel directly
@@ -56,6 +65,10 @@ def plot_strategy(df: pd.DataFrame,
     -------
     go.Figure
     """
+    if chart not in ('candlestick', 'line'):
+        raise ValueError(
+            f"Unknown chart: {chart!r}. Must be 'candlestick' or 'line'."
+        )
     if timeframe is not None and not df.empty:
         df = _resample_records(df, timeframe)
 
@@ -100,12 +113,20 @@ def plot_strategy(df: pd.DataFrame,
         row_heights=row_heights, vertical_spacing=0.03,
     )
 
-    # Candlestick on price panel (row 1)
-    fig.add_trace(go.Candlestick(
-        x=df.index, open=df['open'], high=df['high'],
-        low=df['low'], close=df['close'], name='Price',
-        increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
-    ), row=1, col=1)
+    # Price trace on panel (row 1)
+    if chart == 'candlestick':
+        fig.add_trace(go.Candlestick(
+            x=df.index, open=df['open'], high=df['high'],
+            low=df['low'], close=df['close'], name='Price',
+            increasing_line_color='#26a69a', decreasing_line_color='#ef5350',
+        ), row=1, col=1)
+    elif chart == 'line':
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df['close'], mode='lines', name='Price',
+            line=dict(width=1.5, color='#26a69a'),
+        ), row=1, col=1)
+    else:
+        raise ValueError(f"Unexpected chart: {chart!r}")
 
     # Indicator overlays — route to assigned panel's row
     colors = ['#2196F3', '#FF9800', '#9C27B0', '#4CAF50', '#F44336', '#00BCD4']
@@ -140,8 +161,19 @@ def plot_strategy(df: pd.DataFrame,
 
     # Volume bars on the last row
     if volume:
-        vol_colors = ['#ef5350' if c < o else '#26a69a'
-                      for o, c in zip(df['open'], df['close'])]
+        if chart == 'candlestick':
+            vol_colors = ['#ef5350' if c < o else '#26a69a'
+                          for o, c in zip(df['open'], df['close'])]
+        elif chart == 'line':
+            # Settle-only frames have O=C, so color by close vs prior
+            # close instead; the first bar has no prior → neutral gray.
+            prev = df['close'].shift()
+            vol_colors = [
+                '#9e9e9e' if pd.isna(p) else ('#ef5350' if c < p else '#26a69a')
+                for p, c in zip(prev, df['close'])
+            ]
+        else:
+            raise ValueError(f"Unexpected chart: {chart!r}")
         fig.add_trace(go.Bar(
             x=df.index, y=df['volume'], name='Volume',
             marker_color=vol_colors, opacity=0.5, showlegend=False,
@@ -167,10 +199,17 @@ def plot_strategy(df: pd.DataFrame,
 def _add_markers(fig: go.Figure, df: pd.DataFrame,
                  price_col: str, symbol: str, color: str,
                  name: str, offset_pct: float) -> None:
-    """Add signal markers slightly offset from the price for visibility."""
+    """Add signal markers slightly offset from the price for visibility.
+
+    The offset is a fraction of ``|price|`` ADDED to the price (not a
+    multiplication by ``1 + offset``) so a positive offset always shifts
+    markers upward — multiplicative offsets invert direction when the
+    price is negative (e.g. WTI 2020, futures spreads). Identical to the
+    historical behavior for positive prices.
+    """
     if df.empty:
         return
-    y_vals = df[price_col] * (1 + offset_pct)
+    y_vals = df[price_col] + df[price_col].abs() * offset_pct
     fig.add_trace(go.Scatter(
         x=df.index, y=y_vals, mode='markers', name=name,
         marker=dict(symbol=symbol, size=10, color=color, line=dict(width=1, color='white')),

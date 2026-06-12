@@ -36,7 +36,7 @@ class BarEvent(Event):
     low: float
     close: float
     volume: float
-    period: str = "1m"
+    period: str = "1d"
     is_forming: bool = False
 
 

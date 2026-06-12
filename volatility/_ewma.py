@@ -71,10 +71,10 @@ class EWMAVolEstimator(VolEstimator):
             completed ``BarEvent`` and computes the next price change
             from them.
         bars_per_year
-            Annualization factor — must match ``timeframe``. For 24/7
-            crypto: ``1d`` → 365, ``4h`` → ``365 * 6``, ``1h`` →
-            ``365 * 24``. For tradfi: ``1d`` → 252, ``4h`` → ``252 * 6``,
-            etc.
+            Annualization factor — must match ``timeframe``. For the
+            ``'calendar'`` days convention (24/7 markets): ``1d`` → 365,
+            ``4h`` → ``365 * 6``, ``1h`` → ``365 * 24``. For
+            ``'business'``: ``1d`` → 252, ``4h`` → ``252 * 6``, etc.
         timeframe
             Timeframe at which to read closes from ``data_handler``.
             Default ``'1d'``. Must be a timeframe registered with

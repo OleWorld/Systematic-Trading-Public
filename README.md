@@ -12,16 +12,19 @@ config = BacktestConfig(
     start_date='2026-01-01',
     end_date='2026-04-04',
     base_timeframe='4h',
-    convention='crypto',          # 'crypto' (365 d/y, 24/7) or 'tradfi' (252 d/y)
+    days_convention='calendar',   # 'calendar' (365 d/y, 24/7) or 'business' (252 trading d/y)
     # Timeframes — {tf: maxlen}. Omit for single-TF (defaults to {base: 500}).
     # For multi-TF: timeframes={'1m': 500, '1h': 500, '4h': 200},
     initial_capital=1_000_000.0,
     leverage=5.0,
-    annualized_target_vol=0.25,   # Carver τ — annualized vol target (default 0.25)
+    annualized_target_vol=250_000.0,        # Carver τ — REQUIRED; units depend on vol_target_mode
+    vol_target_mode='dollar_volatility',    # 'dollar_volatility' (fixed annual $ vol budget — default)
+                                            # or 'percent_volatility' (fraction of equity, e.g. 0.25)
     position_buffer=0.25,         # Carver §10.7 dead-band (0.0 trades every gap)
-    slippage_mode='pct',          # 'pct' or 'absolute'
-    slippage_value=0.001,
-    commission_rate=0.0004,       # 4 bps
+    slippage_mode='absolute',     # 'absolute' ($ per unit — default) or 'pct' (% of price)
+    slippage_value=0.5,
+    commission_mode='per_contract',  # 'per_contract' ($ per contract — default) or 'rate' (bps on notional)
+    commission_value=2.5,
     fill_on='signal_close',       # 'signal_close' or 'next_open'
 )
 ```
@@ -71,14 +74,24 @@ class MyStrategy(Strategy):
 `CarverVolTargetingRiskManager` implements Carver's cash-vol framework:
 
 ```text
+# vol_target_mode='dollar_volatility' (default — fixed annual $ vol budget):
+target_qty = (IDM × weight × annualized_target_vol × forecast / 50)
+             / annualized_$_vol
+
+# vol_target_mode='percent_volatility' (τ as a fraction of current equity):
 target_qty = (capital × IDM × weight × annualized_target_vol × forecast / 50)
              / annualized_$_vol
 ```
 
 So `|forecast| = 50` reproduces Carver's basic vol target and `|forecast| = 100`
-doubles it. The two knobs you tune live on `BacktestConfig`:
+doubles it. The knobs you tune live on `BacktestConfig`:
 
-- `annualized_target_vol` — Carver's τ (default `0.25` = 25 % annualized)
+- `annualized_target_vol` — Carver's τ (REQUIRED, no default). A dollar amount
+  (e.g. `250_000`) under `'dollar_volatility'` — the cash-vol budget stays fixed
+  as the account grows/shrinks (institutional futures convention: the risk limit
+  is a dollar number reset periodically). A fraction in `(0, 1)` (e.g. `0.25`)
+  under `'percent_volatility'` — sizes compound with equity.
+- `vol_target_mode` — `'dollar_volatility'` (default) or `'percent_volatility'`
 - `position_buffer` — Carver §10.7 dead-band (default `0.25`; `0.0` trades every gap)
 
 For simple sign-of-forecast sizing (fixed notional / fixed quantity / fixed
@@ -89,8 +102,8 @@ from riskmanager import SimpleRiskManager
 
 risk_manager = SimpleRiskManager(
     portfolio, strategy,
-    size_mode='fixed_notional',     # or 'fixed_quantity' / 'fixed_equity_pct'
-    position_size=2_000_000.0,
+    size_mode='fixed_quantity',     # default; or 'fixed_notional' / 'fixed_equity_pct'
+    position_size=10.0,             # contracts under 'fixed_quantity'
 )
 ```
 
@@ -138,14 +151,17 @@ portfolio    = BacktestPortfolio(events_queue, data_handler, config.symbols,
                                  initial_capital=config.initial_capital,
                                  leverage=config.leverage)
 vol_estimator = EWMAVolEstimator(config.symbols, data_handler=data_handler,
-                                 bars_per_year=bars_per_year('1d', config.convention),
+                                 bars_per_year=bars_per_year('1d', config.days_convention),
                                  timeframe='1d', span=36)
 risk_manager  = CarverVolTargetingRiskManager(portfolio, strategy, vol_estimator,
+                                              data_handler=data_handler,
                                               annualized_target_vol=config.annualized_target_vol,
+                                              vol_target_mode=config.vol_target_mode,
                                               position_buffer=config.position_buffer)
 execution     = BacktestExecution(events_queue,
                                   slippage_model=SlippageModel(config.slippage_mode, config.slippage_value),
-                                  commission_model=CommissionModel(rate=config.commission_rate),
+                                  commission_model=CommissionModel(mode=config.commission_mode,
+                                                                   value=config.commission_value),
                                   fill_on=config.fill_on)
 
 bt = Backtester(events_queue, data_handler, strategy, portfolio, risk_manager, execution)

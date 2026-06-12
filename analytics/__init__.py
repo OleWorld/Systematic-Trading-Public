@@ -14,9 +14,14 @@ Public surface:
 * ``diversification_multiplier(weights, corr_matrix)`` — Carver's
   ``1 / sqrt(wᵀ ρ w)``. Quantifies the vol-cancellation credit of a
   weighted bundle.
+* ``backtest_stats(equity_curve, trade_log, *, initial_capital,
+  timeframe, days_convention)`` — post-run summary statistics (drawdowns,
+  Sharpe/Sortino/Calmar, volatility, trade stats) as an ordered
+  ``pd.Series``; dollar-first with percentage twins where meaningful.
 """
 
 from analytics._correlation import correlation_matrix
 from analytics._diversification_multiplier import diversification_multiplier
+from analytics._stats import backtest_stats
 
-__all__ = ['correlation_matrix', 'diversification_multiplier']
+__all__ = ['backtest_stats', 'correlation_matrix', 'diversification_multiplier']

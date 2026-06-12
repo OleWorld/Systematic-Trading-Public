@@ -83,7 +83,7 @@ def _order(symbol: str = 'BTC', qty: float = 1.0,
 def _new_execution(
     fill_on: str = 'signal_close',
     slippage: Tuple[str, float] = ('pct', 0.0),
-    commission_rate: float = 0.0,
+    commission: Tuple[str, float] = ('per_contract', 0.0),
     exchange_name: str = 'BACKTEST',
 ) -> Tuple[BacktestExecution, FakeQueue]:
     """Build a BacktestExecution with a fake queue. Zero-cost by default."""
@@ -91,7 +91,7 @@ def _new_execution(
     ex = BacktestExecution(
         events_queue=q,
         slippage_model=SlippageModel(mode=slippage[0], value=slippage[1]),
-        commission_model=CommissionModel(rate=commission_rate),
+        commission_model=CommissionModel(mode=commission[0], value=commission[1]),
         fill_on=fill_on,
         exchange_name=exchange_name,
     )
@@ -150,15 +150,42 @@ def test_slippage_pct_sell_at_negative_price_pushes_fill_lower():
 # CommissionModel
 # ──────────────────────────────────────────────
 
-def test_commission_calculate_uses_abs_notional():
-    c = CommissionModel(rate=0.001)
+def test_commission_default_mode_is_per_contract():
+    """Futures-first default: $ per contract, zero value."""
+    c = CommissionModel()
+    assert c.mode == 'per_contract'
+    assert c.calculate(3.0, 100.0) == 0.0
+
+
+def test_commission_rate_mode_uses_abs_notional():
+    c = CommissionModel(mode='rate', value=0.001)
     # negative quantity must still produce a positive commission
     assert math.isclose(c.calculate(-2.0, 100.0), 0.2)
 
 
-def test_commission_calculate_zero_rate_returns_zero():
-    c = CommissionModel(rate=0.0)
+def test_commission_rate_mode_zero_rate_returns_zero():
+    c = CommissionModel(mode='rate', value=0.0)
     assert c.calculate(1.0, 100.0) == 0.0
+
+
+def test_commission_per_contract_is_abs_qty_times_value():
+    c = CommissionModel(mode='per_contract', value=2.5)
+    assert math.isclose(c.calculate(4.0, 100.0), 10.0)
+    # negative quantity (sell) must still produce a positive commission
+    assert math.isclose(c.calculate(-4.0, 100.0), 10.0)
+
+
+def test_commission_per_contract_ignores_price():
+    """Futures brokers charge per contract regardless of price level —
+    including negative or zero prices (WTI 2020, spreads)."""
+    c = CommissionModel(mode='per_contract', value=2.5)
+    assert math.isclose(c.calculate(4.0, -37.0), 10.0)
+    assert math.isclose(c.calculate(4.0, 0.0), 10.0)
+
+
+def test_commission_invalid_mode_raises():
+    with pytest.raises(ValueError, match="CommissionModel mode"):
+        CommissionModel(mode='bps', value=0.001)
 
 
 # ──────────────────────────────────────────────
@@ -442,7 +469,7 @@ def test_emit_fill_applies_slippage_to_base_price():
 def test_emit_fill_calls_commission_at_slipped_price():
     # commission rate 0.001 on notional = qty * slipped_price
     ex, q = _new_execution(fill_on='signal_close',
-                           slippage=('pct', 0.001), commission_rate=0.001)
+                           slippage=('pct', 0.001), commission=('rate', 0.001))
     ex.update_bar(_bar(open=100.0, high=101.0, low=99.0, close=100.0))
     ex.execute_order(_order(qty=2.0, direction=Direction.BUY,
                             order_type=OrderType.MKT))
@@ -452,7 +479,7 @@ def test_emit_fill_calls_commission_at_slipped_price():
 
 def test_emit_fill_writes_fill_event_with_expected_fields():
     ex, q = _new_execution(fill_on='signal_close',
-                           exchange_name='TESTEX', commission_rate=0.0004)
+                           exchange_name='TESTEX', commission=('rate', 0.0004))
     bar_ts = datetime(2026, 3, 15, 9, 30, 0)
     ex.update_bar(_bar(symbol='BTC', ts=bar_ts,
                        open=100.0, high=101.0, low=99.0, close=100.5))

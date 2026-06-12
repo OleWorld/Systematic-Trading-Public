@@ -9,6 +9,7 @@ sys.path.insert(0, os.getcwd())
 from logging_setup import configure_logging
 configure_logging(level=logging.WARNING)
 
+from analytics import backtest_stats
 from config import BacktestConfig
 from data import HistoricDataHandler
 from strategy import EWMACStrategy
@@ -21,23 +22,32 @@ from plotting import plot_strategy
 
 # --- Config (validated parameter holder) ---
 # EWMAC defaults need ~756 daily bars of warmup (256-day slow EMA + 500-bar
-# forecast-scalar SMA). The 2021-2025 window gives ~1825 daily bars — plenty
-# for warmup AND post-warmup signal emission.
+# forecast-scalar SMA). The 2021-01 → 2026-04 window gives ~1939 daily bars —
+# plenty for warmup AND post-warmup signal emission.
+#
+# This smoke run exercises the engine's FUTURES-FIRST defaults (dollar vol
+# target, absolute-price-change correlations, absolute slippage, per-contract
+# commission) on the bundled crypto basket. Only days_convention is data-driven:
+# crypto trades 24/7, so 'calendar' (365 d/y) is required for correct vol
+# annualization regardless of the futures-style sizing knobs.
 config = BacktestConfig(
     symbols=['BTC_USDT:USDT', 'BNB_USDT:USDT', 'SOL_USDT:USDT', 'DOGE_USDT:USDT', 'ETH_USDT:USDT'],
-    instrument_weight_mode = 'min_variance',
+    instrument_weight_mode='min_variance',
+    corr_mode='absolute_price_chg',         # futures default: .diff() correlations
     start_date='2021-01-01',
-    end_date='2025-12-31',
+    end_date='2026-04-23',
     base_timeframe='1d',
-    convention='crypto',
+    days_convention='calendar',             # data-driven: crypto is 24/7 → 365 d/y
     timeframes={'1d': 500},
     initial_capital=1_000_000.0,
     leverage=10.0,
-    annualized_target_vol=0.5,
+    vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
+    annualized_target_vol=500_000.0,        # $500k annual vol (≈ the old 0.5 × $1M start)
     position_buffer=0.25,
-    slippage_mode='pct',
-    slippage_value=0.001,
-    commission_rate=0.001,
+    slippage_mode='absolute',               # futures default: $ per unit
+    slippage_value=0.0,                     # default 0.0 — one fixed tick can't fit BTC & DOGE scales
+    commission_mode='per_contract',         # futures default: $ per contract
+    commission_value=0.0,                   # default 0.0 — per-contract cost isn't uniform across the basket
     fill_on='signal_close',
 )
 
@@ -66,7 +76,7 @@ data_handler = HistoricDataHandler(
 
 strategy = EWMACStrategy(
     data_handler, config.symbols,
-    lookback_pairs=[(4, 16), (16, 64), (64, 256)],
+    lookback_pairs=[(4, 16), (16, 64), (32, 128)],
     weights=[0.42, 0.16, 0.42],
     fdm=1.12,
     vol_lookback=25,
@@ -82,7 +92,7 @@ portfolio = BacktestPortfolio(
 vol_timeframe = '1d'
 vol_estimator = EWMAVolEstimator(
     config.symbols, data_handler=data_handler,
-    bars_per_year=bars_per_year(vol_timeframe, config.convention),
+    bars_per_year=bars_per_year(vol_timeframe, config.days_convention),
     timeframe=vol_timeframe, span=36,
 )
 
@@ -90,17 +100,20 @@ risk_manager = CarverVolTargetingRiskManager(
     portfolio, strategy, vol_estimator,
     data_handler=data_handler,
     annualized_target_vol=config.annualized_target_vol,
+    vol_target_mode=config.vol_target_mode,
     position_buffer=config.position_buffer,
     instrument_weight_mode=config.instrument_weight_mode,
     corr_lookback=config.corr_lookback,
     corr_step_size=config.corr_step_size,
     corr_timeframe=config.corr_timeframe,
+    corr_mode=config.corr_mode,
 )
 
 execution = BacktestExecution(
     events_queue,
     slippage_model=SlippageModel(config.slippage_mode, config.slippage_value),
-    commission_model=CommissionModel(rate=config.commission_rate),
+    commission_model=CommissionModel(mode=config.commission_mode,
+                                     value=config.commission_value),
     fill_on=config.fill_on,
 )
 
@@ -155,7 +168,22 @@ for sym, w in bt.risk_manager.instrument_weight.items():
     print(f"    {sym:<22} {w:.4f}")
 
 # =====================================================================
-#  2. TRADES SUMMARY
+#  2. BACKTEST STATISTICS
+# =====================================================================
+print(f"\n{'='*80}")
+print("  BACKTEST STATISTICS")
+print(f"{'='*80}")
+
+stats = backtest_stats(
+    equity_df, trade_df,
+    initial_capital=config.initial_capital,
+    timeframe=config.base_timeframe,
+    days_convention=config.days_convention,
+)
+print(stats.to_string())
+
+# =====================================================================
+#  3. TRADES SUMMARY
 # =====================================================================
 print(f"\n{'='*80}")
 print("  TRADES SUMMARY")
@@ -168,7 +196,7 @@ if not trade_df.empty:
     print(trade_df.tail(10).to_string(index=False))
 
 # =====================================================================
-#  3. FORECAST SUMMARY  (one symbol — all symbols share the same format)
+#  4. FORECAST SUMMARY  (one symbol — all symbols share the same format)
 # =====================================================================
 print(f"\n{'='*80}")
 print("  FORECAST SUMMARY")
