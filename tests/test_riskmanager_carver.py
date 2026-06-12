@@ -260,6 +260,26 @@ def test_constructor_with_min_variance_mode_and_empty_deques_falls_back(caplog):
                for r in caplog.records)
 
 
+def test_constructor_with_risk_parity_mode_and_empty_deques_falls_back(caplog):
+    """risk_parity + empty data handler → WARNING + equal-weight fallback,
+    no exception (same degradation contract as min_variance)."""
+    pf = FakePortfolio(balance=100_000.0, positions={'BTC': 0.0, 'ETH': 0.0})
+    strat = FakeStrategy({'BTC': 0.0, 'ETH': 0.0}, symbol_list=['BTC', 'ETH'])
+    vol = FakeVolEstimator({'BTC': 8000.0, 'ETH': 8000.0})
+    dh = FakeDataHandler()                                      # empty closes
+    with caplog.at_level('WARNING'):
+        rm = CarverVolTargetingRiskManager(
+            pf, strat, vol, data_handler=dh,
+            instrument_weight_mode='risk_parity',
+            annualized_target_vol=0.25,
+        )
+    assert math.isclose(rm.instrument_weight['BTC'], 0.5, rel_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['ETH'], 0.5, rel_tol=1e-12)
+    assert rm.idm == 1.0                                        # constructor default
+    assert any('risk_parity' in r.message and 'falling back' in r.message
+               for r in caplog.records)
+
+
 def test_constructor_with_unknown_instrument_weight_mode_raises():
     """A bogus mode passed to the constructor surfaces immediately via __init__."""
     pf = FakePortfolio(balance=100_000.0, positions={'BTC': 0.0})
@@ -933,12 +953,12 @@ def test_min_variance_downweights_correlated_pair_against_uncorrelated_solo():
     assert math.isclose(w_a + w_b + w_c, 1.0, abs_tol=1e-12)
 
 
-def test_min_variance_clips_negative_weight_and_renormalizes():
-    """Construct a corr matrix where the raw inverse-corr formula produces a
-    negative weight for one symbol: A is highly correlated with both B and
-    C, while B and C are only mildly correlated with each other. The
-    risk-manager must clip A's weight to 0 and renormalize the survivors
-    to sum to 1."""
+def test_min_variance_pins_negative_weight_to_long_only_bound():
+    """Construct a corr matrix where the unconstrained min-variance weight
+    is negative for one symbol: A is highly correlated with both B and C,
+    while B and C are only mildly correlated with each other (raw closed
+    form = (-0.2, 0.6, 0.6)). The long-only QP pins A at the ``w >= 0``
+    bound and re-optimizes the survivors → (0, 0.5, 0.5)."""
     rm = _build_rm(['A', 'B', 'C'])
     rho = pd.DataFrame(
         [[1.0, 0.7, 0.7],
@@ -947,9 +967,9 @@ def test_min_variance_clips_negative_weight_and_renormalizes():
         index=['A', 'B', 'C'], columns=['A', 'B', 'C'],
     )
     rm.calculate_instrument_weight(mode='min_variance', corr_matrix=rho)
-    assert rm.instrument_weight['A'] == 0.0
-    assert math.isclose(rm.instrument_weight['B'], 0.5, rel_tol=1e-12)
-    assert math.isclose(rm.instrument_weight['C'], 0.5, rel_tol=1e-12)
+    assert abs(rm.instrument_weight['A']) < 1e-9
+    assert math.isclose(rm.instrument_weight['B'], 0.5, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['C'], 0.5, abs_tol=1e-9)
     assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-12)
 
 
@@ -962,6 +982,41 @@ def test_min_variance_accepts_corr_matrix_with_scrambled_symbol_order():
     rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
     assert math.isclose(rm.instrument_weight['BTC'], 0.5, rel_tol=1e-12)
     assert math.isclose(rm.instrument_weight['ETH'], 0.5, rel_tol=1e-12)
+
+
+# ──────────────────────────────────────────────
+# calculate_instrument_weight — mode='risk_parity'
+# ──────────────────────────────────────────────
+
+def test_risk_parity_two_uncorrelated_assets_yields_equal_weights_and_idm():
+    """ERC on ρ=0, equal vols → 1/N weights; the IDM auto-update fires
+    from the same matrix → sqrt(2)."""
+    rm = _build_rm(['BTC', 'ETH'])
+    corr = _corr_df(['BTC', 'ETH'], off_diag=0.0)
+    rm.calculate_instrument_weight(mode='risk_parity', corr_matrix=corr)
+    assert math.isclose(rm.instrument_weight['BTC'], 0.5, abs_tol=1e-8)
+    assert math.isclose(rm.instrument_weight['ETH'], 0.5, abs_tol=1e-8)
+    assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
+    assert math.isclose(rm.idm, math.sqrt(2.0), rel_tol=1e-6)
+
+
+def test_risk_parity_overweights_uncorrelated_solo_without_zeroing_pair():
+    """ERC on the A/B-correlated, C-uncorrelated matrix: C gets the largest
+    weight, but — unlike min-variance — every weight stays strictly
+    positive (the ERC log barrier forbids zero allocations)."""
+    rm = _build_rm(['A', 'B', 'C'])
+    rho = pd.DataFrame(
+        [[1.0, 0.7, 0.0],
+         [0.7, 1.0, 0.0],
+         [0.0, 0.0, 1.0]],
+        index=['A', 'B', 'C'], columns=['A', 'B', 'C'],
+    )
+    rm.calculate_instrument_weight(mode='risk_parity', corr_matrix=rho)
+    w = rm.instrument_weight
+    assert math.isclose(w['A'], w['B'], abs_tol=1e-8)           # symmetry
+    assert w['C'] > w['A']                                      # uncorrelated dominates
+    assert all(wi > 0 for wi in w.values())                     # strictly positive
+    assert math.isclose(sum(w.values()), 1.0, abs_tol=1e-9)
 
 
 # ──────────────────────────────────────────────
@@ -1205,11 +1260,14 @@ def test_absolute_price_chg_handles_negative_and_zero_prices():
 # Auto-recalc cadence in update_bar
 # ──────────────────────────────────────────────
 
-def _make_min_variance_rm_with_closes(symbols, n_bars, step_size, *, lookback=100):
-    """Build a min-variance risk manager with pre-loaded closes for ``symbols``.
+def _make_min_variance_rm_with_closes(symbols, n_bars, step_size, *,
+                                      lookback=100, mode='min_variance'):
+    """Build a corr-based risk manager with pre-loaded closes for ``symbols``.
 
     Returns ``(rm, dh, vol, pf)`` — the data handler is non-empty so the
-    initial __init__ recompute succeeds (not a fallback).
+    initial __init__ recompute succeeds (not a fallback). ``mode``
+    defaults to ``'min_variance'``; pass ``'risk_parity'`` to exercise
+    the other corr-based scheme.
     """
     closes = {s: _price_series(n_bars, seed=i) for i, s in enumerate(symbols)}
     dh = FakeDataHandler(closes=closes)
@@ -1218,7 +1276,7 @@ def _make_min_variance_rm_with_closes(symbols, n_bars, step_size, *, lookback=10
     vol = FakeVolEstimator({s: 8000.0 for s in symbols})
     rm = CarverVolTargetingRiskManager(
         pf, strat, vol, data_handler=dh,
-        instrument_weight_mode='min_variance',
+        instrument_weight_mode=mode,
         corr_lookback=lookback,
         corr_step_size=step_size,
         annualized_target_vol=0.25,
@@ -1316,6 +1374,27 @@ def test_auto_recalc_only_active_under_min_variance_mode():
     for i in range(10):
         rm.update_bar(_bar(ts=datetime(2026, 1, 1 + i)))
     assert calls == []
+
+
+def test_auto_recalc_also_active_under_risk_parity_mode():
+    """risk_parity is a corr-based mode, so the walk-forward auto-recalc
+    fires on the same cadence as under min_variance."""
+    rm, _, _, _ = _make_min_variance_rm_with_closes(
+        ['BTC', 'ETH'], n_bars=120, step_size=3, mode='risk_parity',
+    )
+    calls: List[int] = []
+    original = rm.calculate_instrument_weight
+
+    def spy(*args, **kwargs):
+        calls.append(len(calls))
+        return original(*args, **kwargs)
+    rm.calculate_instrument_weight = spy                        # type: ignore[assignment]
+
+    symbols_cycle = ['BTC', 'ETH']
+    for i in range(10):
+        sym = symbols_cycle[i % 2]
+        rm.update_bar(_bar(symbol=sym, ts=datetime(2026, 1, 1 + i)))
+    assert len(calls) == 3                                      # bars 3, 6, 9
 
 
 def test_auto_recalc_does_not_multi_increment_within_same_period():

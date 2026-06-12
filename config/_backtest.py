@@ -35,7 +35,7 @@ class BacktestConfig:
     annualized_target_vol: Optional[float] = None  # Carver's τ; REQUIRED — $ amount ('dollar_volatility') or fraction in (0,1) ('percent_volatility')
     vol_target_mode: str = 'dollar_volatility'     # 'dollar_volatility' (fixed annual $ vol budget) or 'percent_volatility' (fraction of equity)
     position_buffer: float = 0.25        # Carver §10.7 dead-band (0.0 to trade every gap)
-    instrument_weight_mode: str = 'equal_weight'   # 'equal_weight' or 'min_variance'
+    instrument_weight_mode: str = 'equal_weight'   # 'equal_weight', 'min_variance', or 'risk_parity'
     corr_lookback: int = 500              # trailing window for correlation (in corr_timeframe bars)
     corr_step_size: int = 30              # auto-recalc cadence in completed bars; 0 disables
     corr_timeframe: str = '1d'            # data-handler timeframe to read closes from
@@ -137,10 +137,12 @@ class BacktestConfig:
             raise ValueError(
                 f"position_buffer must be in [0, 1), got {self.position_buffer}"
             )
-        if self.instrument_weight_mode not in ('equal_weight', 'min_variance'):
+        if self.instrument_weight_mode not in (
+            'equal_weight', 'min_variance', 'risk_parity',
+        ):
             raise ValueError(
                 f"Unknown instrument_weight_mode: '{self.instrument_weight_mode}'. "
-                "Must be 'equal_weight' or 'min_variance'."
+                "Must be 'equal_weight', 'min_variance', or 'risk_parity'."
             )
         if self.corr_lookback < 2:
             raise ValueError(

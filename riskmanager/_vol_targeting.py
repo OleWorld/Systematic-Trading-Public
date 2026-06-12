@@ -67,25 +67,28 @@ dicts are populated at ``__init__`` by ``calculate_instrument_weight()``
 (or its dict overwritten directly) to refresh weights — e.g. monthly
 rebalances, correlation-driven weight schemes — without per-bar wiring.
 
-With ``instrument_weight_mode='min_variance'`` the manager performs
-**walk-forward** weight estimation: at each recalc point it pulls
-``corr_lookback`` bars (default ``500``) at ``corr_timeframe`` (default
-``'1d'``) for every symbol via the data handler, computes per-bar price
-changes per ``corr_mode`` (``'absolute_price_chg'`` → ``.diff()``,
-default — futures-safe for negative/zero prices; ``'simple_return'`` →
-``.pct_change()`` — for strictly positive-price assets), and derives
-ρ → weights via the existing
-min-variance formula. The matching IDM (``analytics.diversification_multiplier``)
-is updated from the same ρ on every successful recompute, keeping the
-two coherent. ``update_bar`` auto-recalls the method every
-``corr_step_size`` completed ``corr_timeframe`` periods (default ``30``;
-multi-symbol bars at the same timestamp and sub-period base bars are
-de-duplicated via ``data.get_period_start``); set ``corr_step_size=0``
-to disable auto-recalc. When the deque holds
-fewer than 30 valid return observations — always the case at
-construction time — the manager logs a WARNING and falls back to
-equal-weight (the ρ=1 / risk-parity degenerate case); ``self.idm``
-is left untouched in this branch.
+With ``instrument_weight_mode='min_variance'`` or ``'risk_parity'``
+the manager performs **walk-forward** weight estimation: at each recalc
+point it pulls ``corr_lookback`` bars (default ``500``) at
+``corr_timeframe`` (default ``'1d'``) for every symbol via the data
+handler, computes per-bar price changes per ``corr_mode``
+(``'absolute_price_chg'`` → ``.diff()``, default — futures-safe for
+negative/zero prices; ``'simple_return'`` → ``.pct_change()`` — for
+strictly positive-price assets), and derives ρ → weights via the
+``analytics`` portfolio optimizers (``analytics.min_variance`` — exact
+long-only minimum-variance QP; ``analytics.risk_parity`` — equal risk
+contribution). Both run correlation-only — the equal-vol convention,
+consistent with sizing already dividing by each instrument's σ. The
+matching IDM (``analytics.diversification_multiplier``) is updated from
+the same ρ on every successful recompute, keeping the two coherent.
+``update_bar`` auto-recalls the method every ``corr_step_size``
+completed ``corr_timeframe`` periods (default ``30``; multi-symbol bars
+at the same timestamp and sub-period base bars are de-duplicated via
+``data.get_period_start``); set ``corr_step_size=0`` to disable
+auto-recalc. When the deque holds fewer than 30 valid return
+observations — always the case at construction time — the manager logs
+a WARNING and falls back to equal-weight (the ρ=1 degenerate case);
+``self.idm`` is left untouched in this branch.
 
 On every completed bar the manager:
 1. Updates the vol estimator.
@@ -102,10 +105,12 @@ import datetime
 import logging
 from typing import Any, Dict, Optional
 
-import numpy as np
 import pandas as pd
 
-from analytics import correlation_matrix, diversification_multiplier
+from analytics import (
+    correlation_matrix, diversification_multiplier, equal_weight,
+    min_variance, risk_parity,
+)
 from data import get_period_start
 from event import BarEvent, OrderType, Direction
 from riskmanager._base import (
@@ -117,9 +122,9 @@ from volatility import VolEstimator
 logger = logging.getLogger(__name__)
 
 # Minimum number of valid return observations (rows surviving
-# ``pct_change().dropna()``) required for a stable Pearson correlation
-# estimate. Below this, ``calculate_instrument_weight`` logs a WARNING
-# and falls back to equal-weight (the ρ=1 / risk-parity degenerate case).
+# ``.diff()`` / ``.pct_change()`` + ``.dropna()``) required for a stable
+# Pearson correlation estimate. Below this, ``calculate_instrument_weight``
+# logs a WARNING and falls back to equal-weight (the ρ=1 degenerate case).
 _MIN_CORR_OBS = 30
 
 
@@ -130,9 +135,10 @@ class CarverVolTargetingRiskManager(RiskManager):
 
     - ``instrument_weight``: per-symbol capital weight, populated at
       construction by ``calculate_instrument_weight()`` (default 1/N
-      across ``strategy.symbol_list``; with ``mode='min_variance'``
-      derived inline from a trailing window of returns pulled from
-      ``self.data_handler``).
+      across ``strategy.symbol_list``; with ``mode='min_variance'`` or
+      ``'risk_parity'`` derived inline from a trailing window of
+      returns pulled from ``self.data_handler`` and optimized by the
+      ``analytics`` portfolio optimizers).
     - ``strategy_weight``: per-strategy capital weight, populated at
       construction by ``calculate_strategy_weight()`` (default
       ``{strategy_class_name: 1.0}`` — placeholder until multi-strategy
@@ -140,7 +146,8 @@ class CarverVolTargetingRiskManager(RiskManager):
 
     Either ``calculate_*`` method can be re-called or its dict
     overwritten directly to refresh weights without per-bar wiring.
-    With ``mode='min_variance'`` and ``corr_step_size > 0``,
+    With a corr-based mode (``'min_variance'`` / ``'risk_parity'``)
+    and ``corr_step_size > 0``,
     ``update_bar`` auto-recalls ``calculate_instrument_weight`` every
     ``corr_step_size`` completed ``corr_timeframe`` periods
     (walk-forward; period crossings are detected via
@@ -230,11 +237,11 @@ class CarverVolTargetingRiskManager(RiskManager):
             Default weighting scheme stored on ``self.instrument_weight_mode``
             and used by ``calculate_instrument_weight`` when it is called
             without an explicit ``mode`` (including the call from this
-            constructor). One of ``'equal_weight'`` (default) or
-            ``'min_variance'``. With ``'min_variance'``, the construction-
-            time call derives the corr matrix from the data handler;
-            cold/short deques degrade to equal-weight + WARNING rather
-            than raising.
+            constructor). One of ``'equal_weight'`` (default),
+            ``'min_variance'``, or ``'risk_parity'``. With a corr-based
+            mode, the construction-time call derives the corr matrix
+            from the data handler; cold/short deques degrade to
+            equal-weight + WARNING rather than raising.
         corr_lookback
             Trailing window in ``corr_timeframe`` bars used to pull
             closes for the inline correlation derivation. Default ``500``.
@@ -249,8 +256,10 @@ class CarverVolTargetingRiskManager(RiskManager):
             symbols at the same timestamp and sub-period base bars (e.g.
             base='1h' with corr_timeframe='1d') both contribute exactly
             one period crossing. Default ``30``. Set to ``0`` to disable
-            auto-recalc (one-shot at ``__init__`` only). Has no effect
-            when ``instrument_weight_mode='equal_weight'``.
+            auto-recalc (one-shot at ``__init__`` only). Only active
+            under a corr-based ``instrument_weight_mode``
+            (``'min_variance'`` / ``'risk_parity'``); no effect under
+            ``'equal_weight'``.
         corr_timeframe
             Timeframe the data handler reads when assembling the closes
             window. Default ``'1d'``. Must be a key of
@@ -365,6 +374,13 @@ class CarverVolTargetingRiskManager(RiskManager):
     ) -> None:
         """Populate ``self.instrument_weight`` according to ``mode``.
 
+        Thin orchestrator over the ``analytics`` portfolio optimizers:
+        this method owns the risk-manager concerns — deriving ρ from the
+        data handler, the insufficient-history fallback, the symbol-set
+        check against ``strategy.symbol_list``, and the IDM side effect —
+        and delegates the weight math itself to ``analytics.equal_weight``
+        / ``analytics.min_variance`` / ``analytics.risk_parity``.
+
         Parameters
         ----------
         mode
@@ -375,104 +391,63 @@ class CarverVolTargetingRiskManager(RiskManager):
             * ``'equal_weight'`` — ``{symbol: 1/N}`` across
               ``self.strategy.symbol_list``. ``corr_matrix`` is ignored
               if passed.
-            * ``'min_variance'`` — minimum-variance weights under the
-              equal-volatility assumption, derived from the inverse
-              correlation matrix:
+            * ``'min_variance'`` — exact long-only minimum-variance
+              weights (``min wᵀρw`` s.t. ``Σw = 1``, ``w ≥ 0``), solved
+              numerically by ``analytics.min_variance``.
+            * ``'risk_parity'`` — equal-risk-contribution weights
+              (``analytics.risk_parity``).
 
-                  w = (ρ⁻¹ · 1) / (1ᵀ ρ⁻¹ 1)
-
-              Negative raw weights are clipped to ``0`` and the
-              survivors are renormalized to sum to ``1`` (Carver
-              long-only convention). When ``corr_matrix`` is omitted,
-              ρ is derived inline from a trailing window of per-bar
-              price changes (per ``self.corr_mode``) pulled from
-              ``self.data_handler`` (see below).
+            Both corr-based modes run correlation-only — the equal-vol
+            convention, which is exactly equivalent to optimizing the
+            covariance under equal per-instrument vols and is the right
+            assumption here since sizing already divides by each
+            instrument's σ.
         corr_matrix
-            Correlation matrix of per-symbol price returns, indexed and
+            Correlation matrix of per-symbol price changes, indexed and
             columned by the same labels as ``self.strategy.symbol_list``
             (set-equal; row order is taken from the matrix). Optional
-            for ``mode='min_variance'``: when ``None``, the method pulls
-            ``self.corr_lookback`` bars at ``self.corr_timeframe`` for
-            each symbol via ``self.data_handler.get_latest_bars``,
-            computes per-bar price changes per ``self.corr_mode``
-            (``'simple_return'`` → ``.pct_change().dropna()``;
-            ``'absolute_price_chg'`` → ``.diff().dropna()``), and
-            calls ``analytics.correlation_matrix`` on the result. If
-            fewer than ``_MIN_CORR_OBS`` (=30) valid observations
-            survive — always the case at construction time in a backtest
-            since deques are empty — the method logs a WARNING and
-            falls back to equal-weight (the ρ=1 / risk-parity
-            degenerate case). Ignored for ``mode='equal_weight'``.
+            for the corr-based modes: when ``None``, ρ is derived inline
+            from the data handler (see ``_derive_corr_matrix``); if too
+            little history has accumulated — always the case at
+            construction time in a backtest since deques are empty — a
+            WARNING is logged and the method falls back to equal-weight
+            (the ρ=1 degenerate case). Ignored for
+            ``mode='equal_weight'``.
 
         Raises
         ------
         ValueError
-            On unknown ``mode``; ``corr_matrix`` (passed or derived) whose
-            index does not equal ``corr_matrix.columns`` or does not
-            match ``self.strategy.symbol_list`` as a set; or degenerate
-            min-variance weights that all clip to zero.
+            On unknown ``mode``; a ``corr_matrix`` (passed or derived)
+            failing the ``analytics`` validators (index ≠ columns,
+            asymmetric, NaN/inf) or not matching
+            ``self.strategy.symbol_list`` as a set; or optimizer solver
+            failure.
 
         Notes
         -----
         Mutates ``self.instrument_weight`` in place and, on successful
-        min-variance computes, also updates ``self.idm`` via
+        corr-based computes, also updates ``self.idm`` via
         ``analytics.diversification_multiplier(...)`` so weights and IDM
         stay coherent. The equal-weight fallback path leaves ``self.idm``
         untouched. Safe to re-call any time (e.g. monthly rebalances,
         regime-driven scheme switches); ``update_bar`` re-calls this
-        method every ``corr_step_size`` completed bars when min-variance
-        is active.
+        method every ``corr_step_size`` completed ``corr_timeframe``
+        periods when a corr-based mode is active.
         """
         if mode is None:
             mode = self.instrument_weight_mode
         if mode == 'equal_weight':
-            syms = self.strategy.symbol_list
-            n = len(syms)
-            self.instrument_weight = {s: 1.0 / n for s in syms}
-        elif mode == 'min_variance':
+            self.instrument_weight = equal_weight(self.strategy.symbol_list)
+        elif mode in ('min_variance', 'risk_parity'):
             if corr_matrix is None:
-                # Derive ρ from a trailing window of simple returns pulled
-                # from the data handler. Empty/short deques degrade to
-                # equal-weight + WARNING (equivalent to assuming ρ=1).
-                closes = {
-                    s: self.data_handler.get_latest_bars(
-                        s, self.corr_lookback,
-                        timeframe=self.corr_timeframe,
-                    )['Close']
-                    for s in self.strategy.symbol_list
-                }
-                # ``fill_method=None`` opts out of pandas's deprecated default
-                # forward-fill: NaN prices stay NaN and ``.dropna()`` drops them,
-                # instead of synthesising a 0 % return from a forward-filled
-                # stale close. Defensive — the DataHandler NaN invariant already
-                # rules out NaN closes in the bar deques.
-                frame = pd.DataFrame(closes)
-                if self.corr_mode == 'simple_return':
-                    returns = frame.pct_change(fill_method=None).dropna()
-                elif self.corr_mode == 'absolute_price_chg':
-                    returns = frame.diff().dropna()
-                else:
-                    raise ValueError(
-                        f"Unexpected corr_mode: {self.corr_mode!r}"
+                corr_matrix = self._derive_corr_matrix(mode)
+                if corr_matrix is None:
+                    # Insufficient history — equal-weight fallback (ρ=1
+                    # degenerate case); IDM intentionally left untouched.
+                    self.instrument_weight = equal_weight(
+                        self.strategy.symbol_list,
                     )
-                if len(returns) < _MIN_CORR_OBS:
-                    logger.warning(
-                        "min_variance: only %d valid return observations "
-                        "(need >= %d for stable correlation estimate); "
-                        "falling back to equal-weight "
-                        "(rho=1 / risk-parity under Carver's equal-vol assumption)",
-                        len(returns), _MIN_CORR_OBS,
-                    )
-                    syms = self.strategy.symbol_list
-                    n = len(syms)
-                    self.instrument_weight = {s: 1.0 / n for s in syms}
                     return
-                corr_matrix = correlation_matrix(returns)
-            if not corr_matrix.index.equals(corr_matrix.columns):
-                raise ValueError(
-                    "corr_matrix.index must equal corr_matrix.columns "
-                    "(labels and order)"
-                )
             expected = set(self.strategy.symbol_list)
             got = set(corr_matrix.index)
             if got != expected:
@@ -483,20 +458,12 @@ class CarverVolTargetingRiskManager(RiskManager):
                     f"as a set; missing={sorted(missing)}, "
                     f"extra={sorted(extra)}"
                 )
-            inv = np.linalg.inv(corr_matrix.to_numpy())
-            raw = inv.sum(axis=1) / inv.sum()
-            clipped = np.clip(raw, 0.0, None)
-            total = float(clipped.sum())
-            if total <= 0:
-                raise ValueError(
-                    "min_variance produced all-zero weights after clipping; "
-                    "review the correlation matrix"
-                )
-            normalized = clipped / total
-            self.instrument_weight = {
-                label: float(w)
-                for label, w in zip(corr_matrix.index, normalized)
-            }
+            if mode == 'min_variance':
+                self.instrument_weight = min_variance(corr_matrix)
+            elif mode == 'risk_parity':
+                self.instrument_weight = risk_parity(corr_matrix)
+            else:
+                raise ValueError(f"Unexpected mode: {mode!r}")
             # Auto-update IDM from the same matrix used for weights so
             # the two stay coherent across walk-forward recomputes.
             self.idm = diversification_multiplier(
@@ -505,18 +472,65 @@ class CarverVolTargetingRiskManager(RiskManager):
         else:
             raise ValueError(
                 f"Unexpected mode: {mode!r} "
-                "(expected 'equal_weight' or 'min_variance')"
+                "(expected 'equal_weight', 'min_variance', or 'risk_parity')"
             )
+
+    def _derive_corr_matrix(self, mode: str) -> Optional[pd.DataFrame]:
+        """Derive ρ from a trailing window of per-bar price changes.
+
+        Pulls ``self.corr_lookback`` bars at ``self.corr_timeframe`` for
+        each symbol via ``self.data_handler.get_latest_bars``, computes
+        per-bar price changes per ``self.corr_mode``
+        (``'simple_return'`` → ``.pct_change().dropna()``;
+        ``'absolute_price_chg'`` → ``.diff().dropna()``), and calls
+        ``analytics.correlation_matrix`` on the result.
+
+        Returns ``None`` — after logging a WARNING that names ``mode`` —
+        when fewer than ``_MIN_CORR_OBS`` (=30) valid observations
+        survive; the caller falls back to equal-weight. Raises
+        ``ValueError`` on an unexpected ``self.corr_mode``.
+        """
+        closes = {
+            s: self.data_handler.get_latest_bars(
+                s, self.corr_lookback,
+                timeframe=self.corr_timeframe,
+            )['Close']
+            for s in self.strategy.symbol_list
+        }
+        # ``fill_method=None`` opts out of pandas's deprecated default
+        # forward-fill: NaN prices stay NaN and ``.dropna()`` drops them,
+        # instead of synthesising a 0 % return from a forward-filled
+        # stale close. Defensive — the DataHandler NaN invariant already
+        # rules out NaN closes in the bar deques.
+        frame = pd.DataFrame(closes)
+        if self.corr_mode == 'simple_return':
+            returns = frame.pct_change(fill_method=None).dropna()
+        elif self.corr_mode == 'absolute_price_chg':
+            returns = frame.diff().dropna()
+        else:
+            raise ValueError(
+                f"Unexpected corr_mode: {self.corr_mode!r}"
+            )
+        if len(returns) < _MIN_CORR_OBS:
+            logger.warning(
+                "%s: only %d valid return observations "
+                "(need >= %d for stable correlation estimate); "
+                "falling back to equal-weight (rho=1 degenerate case)",
+                mode, len(returns), _MIN_CORR_OBS,
+            )
+            return None
+        return correlation_matrix(returns)
 
     def calculate_strategy_weight(self) -> None:
         """Populate ``self.strategy_weight`` with the single-strategy placeholder.
 
+        ``analytics.equal_weight`` over the one bound strategy —
         ``{strategy_class_name: 1.0}``. Will become a real ``1/M`` (or
         correlation-driven) allocation once the risk manager holds
         multiple strategies. Mutates in place; safe to re-call any time.
         """
         name = self.strategy.__class__.__name__
-        self.strategy_weight = {name: 1.0}
+        self.strategy_weight = equal_weight([name])
 
     def update_bar(self, event: BarEvent) -> None:
         """Update sizing inputs and resize the position to the Carver target.
@@ -539,12 +553,12 @@ class CarverVolTargetingRiskManager(RiskManager):
         # the bucket changes, so multi-symbol bars at the same timestamp
         # and sub-period base bars don't multi-increment. The actual
         # matrix work runs every ``corr_step_size`` periods and only when
-        # min-variance is active. Counter resets whether the recompute
-        # succeeded or fell back to equal-weight (cold-deque path) — by
-        # the next attempt the deque has accumulated more bars.
+        # a corr-based weight mode is active. Counter resets whether the
+        # recompute succeeded or fell back to equal-weight (cold-deque
+        # path) — by the next attempt the deque has accumulated more bars.
         if (
             self.corr_step_size > 0
-            and self.instrument_weight_mode == 'min_variance'
+            and self.instrument_weight_mode in ('min_variance', 'risk_parity')
         ):
             period_start = get_period_start(event.timestamp, self.corr_timeframe)
             if period_start != self._last_seen_period_start:

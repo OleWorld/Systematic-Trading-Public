@@ -52,6 +52,17 @@ def test_corr_step_size_zero_accepted():
     assert cfg.corr_step_size == 0
 
 
+def test_instrument_weight_mode_accepts_all_three_schemes():
+    for mode in ('equal_weight', 'min_variance', 'risk_parity'):
+        cfg = BacktestConfig(**_kwargs(instrument_weight_mode=mode))
+        assert cfg.instrument_weight_mode == mode
+
+
+def test_unknown_instrument_weight_mode_rejected():
+    with pytest.raises(ValueError, match="instrument_weight_mode"):
+        BacktestConfig(**_kwargs(instrument_weight_mode='bogus'))
+
+
 def test_default_vol_target_mode_is_dollar_volatility():
     cfg = BacktestConfig(**_kwargs())
     assert cfg.vol_target_mode == 'dollar_volatility'
