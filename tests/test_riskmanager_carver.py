@@ -1385,6 +1385,7 @@ def test_min_variance_derives_corr_from_filled_deques_and_auto_updates_idm():
         instrument_weight_mode='min_variance', corr_lookback=lookback,
         annualized_target_vol=0.25,
         corr_mode='simple_return',          # this test pins the pct_change path
+        corr_floor=None,    # raw-path test: pins the trailing-window sourcing, not the floor
     )
     # Weights sum to 1, non-negative.
     assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
@@ -1393,10 +1394,7 @@ def test_min_variance_derives_corr_from_filled_deques_and_auto_updates_idm():
     # corr matrix externally from the SAME ``corr_lookback`` trailing
     # window (the risk manager calls get_latest_bars(s, lookback, ...)).
     trailing = pd.DataFrame({s: closes[s].iloc[-lookback:] for s in symbols})
-    expected_corr = (
-        trailing.pct_change(fill_method=None).dropna().corr()
-        .clip(lower=0.0)                # mirror the RM's default corr_floor
-    )
+    expected_corr = trailing.pct_change(fill_method=None).dropna().corr()
     expected_idm = diversification_multiplier(rm.instrument_weight, expected_corr)
     assert math.isclose(rm.idm, expected_idm, rel_tol=1e-9)
 
@@ -1448,15 +1446,13 @@ def test_returns_used_are_simple_pct_change():
         pf, strat, FakeVolEstimator(), data_handler=dh,
         corr_lookback=100, annualized_target_vol=0.25,
         corr_mode='simple_return',          # this test pins the pct_change path
+        corr_floor=None,    # raw-path test: pins the pct_change dispatch, not the floor
     )
     rm.calculate_instrument_weight(mode='min_variance')
 
     # The min-variance solution for a 2-asset matrix with the data-handler
     # corr should be reproducible end-to-end from the pct_change call.
-    expected_corr = (
-        pd.DataFrame(closes).pct_change(fill_method=None).dropna().corr()
-        .clip(lower=0.0)                # mirror the RM's default corr_floor
-    )
+    expected_corr = pd.DataFrame(closes).pct_change(fill_method=None).dropna().corr()
     rho = expected_corr.loc['A', 'B']
     # Closed form for the 2-asset min-variance under equal-vol: still 1/N
     # regardless of ρ, so we use that as a sanity check on the solver…
@@ -1510,14 +1506,12 @@ def test_absolute_price_chg_mode_uses_diff():
         FakeVolEstimator(), data_handler=dh,
         corr_lookback=100, corr_mode='absolute_price_chg',
         annualized_target_vol=0.25,
+        corr_floor=None,    # raw-path test: pins the .diff() dispatch, not the floor
     )
     rm.calculate_instrument_weight(mode='min_variance')
 
-    expected_corr_raw = pd.DataFrame(closes).diff().dropna().corr()
-    expected_corr = expected_corr_raw.clip(lower=0.0)   # mirror the RM's default corr_floor
-    # The mode-disambiguation sanity below needs the UNfloored value
-    # (both modes' ρ could clip to the same 0.0).
-    rho = expected_corr_raw.loc['A', 'B']
+    expected_corr = pd.DataFrame(closes).diff().dropna().corr()
+    rho = expected_corr.loc['A', 'B']
     # 2-asset min-variance under equal-vol is 1/N regardless of ρ.
     assert math.isclose(rm.instrument_weight['A'], 0.5, rel_tol=1e-9)
     assert math.isclose(rm.instrument_weight['B'], 0.5, rel_tol=1e-9)
