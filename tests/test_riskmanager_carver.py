@@ -201,6 +201,10 @@ def _make(
 def test_constructor_rejects_non_positive_idm():
     with pytest.raises(ValueError, match="idm"):
         _make(idm=0)
+    # NaN must be rejected too: every downstream use (target_qty formula,
+    # idm > idm_cap coherence check) would silently swallow it.
+    with pytest.raises(ValueError, match="idm"):
+        _make(idm=float('nan'))
 
 
 def test_constructor_rejects_annualized_target_vol_outside_open_unit_interval():
@@ -1249,6 +1253,8 @@ def test_constructor_rejects_idm_above_idm_cap():
         _build_rm(['BTC'], idm=3.0)                 # default cap 2.5
     assert _build_rm(['BTC'], idm=3.0, idm_cap=None).idm == 3.0
     assert _build_rm(['BTC'], idm=3.0, idm_cap=3.5).idm == 3.0
+    # Boundary: idm exactly equal to the cap is coherent (strict > check).
+    assert _build_rm(['BTC'], idm=2.5, idm_cap=2.5).idm == 2.5
 
 
 # ──────────────────────────────────────────────
@@ -1311,6 +1317,58 @@ def test_corr_floor_prevents_overweighting_of_anti_correlated_pair():
     assert raw.instrument_weight['C'] < floored.instrument_weight['C']
     assert floored.idm <= math.sqrt(3.0) + 1e-9
     assert raw.idm > floored.idm
+
+
+# ──────────────────────────────────────────────
+# idm_cap — behavioral (auto-update site)
+# ──────────────────────────────────────────────
+
+def test_idm_capped_at_default_two_point_five():
+    """7 uncorrelated instruments → raw DM = sqrt(7) ≈ 2.6458; the stored
+    idm is clamped to the default 2.5. Exercised via the explicit
+    corr_matrix path: the cap is leverage policy and applies regardless
+    of where the matrix came from."""
+    labels = [f'S{i}' for i in range(7)]
+    rm = _build_rm(labels)
+    corr = _corr_df(labels, off_diag=0.0)
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert rm.idm == 2.5
+
+
+def test_idm_cap_none_disables_capping():
+    labels = [f'S{i}' for i in range(7)]
+    rm = _build_rm(labels, idm_cap=None)
+    corr = _corr_df(labels, off_diag=0.0)
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert math.isclose(rm.idm, math.sqrt(7.0), rel_tol=1e-6)
+
+
+def test_idm_cap_applies_under_risk_parity_too():
+    """The cap sits at the shared assignment site, after the mode dispatch."""
+    labels = [f'S{i}' for i in range(7)]
+    rm = _build_rm(labels)
+    corr = _corr_df(labels, off_diag=0.0)
+    rm.calculate_instrument_weight(mode='risk_parity', corr_matrix=corr)
+    assert rm.idm == 2.5
+
+
+def test_explicit_corr_matrix_is_not_floored():
+    """The research hook owns the matrix: negative entries reach the
+    optimizer raw. A/B at ρ=-0.5 with C uncorrelated → exact long-only
+    min-variance is (0.4, 0.4, 0.2): the 'hedged' pair out-weights C.
+    A (wrongly) floored matrix would yield w_C >= w_A instead."""
+    rm = _build_rm(['A', 'B', 'C'])
+    rho = pd.DataFrame(
+        [[1.0, -0.5, 0.0],
+         [-0.5, 1.0, 0.0],
+         [0.0, 0.0, 1.0]],
+        index=['A', 'B', 'C'], columns=['A', 'B', 'C'],
+    )
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=rho)
+    w = rm.instrument_weight
+    assert math.isclose(w['A'], 0.4, abs_tol=1e-6)
+    assert math.isclose(w['B'], 0.4, abs_tol=1e-6)
+    assert math.isclose(w['C'], 0.2, abs_tol=1e-6)
 
 
 # ──────────────────────────────────────────────

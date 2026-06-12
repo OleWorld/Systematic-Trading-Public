@@ -222,16 +222,18 @@ class CarverVolTargetingRiskManager(RiskManager):
         data_handler
             Data-handler surface used to pull a trailing window of closes
             for the inline correlation-matrix derivation when
-            ``calculate_instrument_weight`` is called with ``mode='min_variance'``
-            and ``corr_matrix=None``. ``corr_timeframe`` must be a key of
+            ``calculate_instrument_weight`` is called with a corr-based
+            ``mode`` (``'min_variance'`` / ``'risk_parity'``) and
+            ``corr_matrix=None``. ``corr_timeframe`` must be a key of
             ``data_handler.timeframes``.
         idm
             Instrument diversification multiplier (Carver Ch. 8).
             Default ``1.0``. Must be ``> 0``. Auto-updated whenever a
-            min-variance recompute consumes a corr matrix (passed or
-            derived); the constructor default applies only until the
-            first successful recompute. Must not exceed ``idm_cap``
-            when the cap is enabled.
+            corr-based (min-variance or risk-parity) recompute consumes
+            a corr matrix (passed or derived), clamped to ``idm_cap``
+            when the cap is enabled; the constructor default applies
+            only until the first successful recompute. Must not exceed
+            ``idm_cap`` when the cap is enabled.
         idm_cap
             Upper bound applied to ``self.idm`` whenever it is
             auto-updated from a corr-based weight recompute — both the
@@ -335,7 +337,9 @@ class CarverVolTargetingRiskManager(RiskManager):
         ValueError
             On invalid constructor parameters.
         """
-        if idm <= 0:
+        # ``not (>)`` instead of ``<=`` so NaN is rejected too (mirrors
+        # the idm_cap check below).
+        if not (idm > 0):
             raise ValueError(f"idm must be > 0, got {idm}")
         if idm_cap is not None:
             # ``not (>=)`` instead of ``<`` so NaN is rejected too —
@@ -553,7 +557,8 @@ class CarverVolTargetingRiskManager(RiskManager):
         -----
         Mutates ``self.instrument_weight`` in place and, on successful
         corr-based computes, also updates ``self.idm`` via
-        ``analytics.diversification_multiplier(...)`` so weights and IDM
+        ``analytics.diversification_multiplier(...)``, clamped to
+        ``idm_cap`` when the cap is enabled, so weights and IDM
         stay coherent. The equal-weight fallback and empty-universe
         paths leave ``self.idm`` untouched. Safe to re-call any time
         (e.g. monthly rebalances, regime-driven scheme switches);
@@ -605,10 +610,15 @@ class CarverVolTargetingRiskManager(RiskManager):
             else:
                 raise ValueError(f"Unexpected mode: {mode!r}")
             # Auto-update IDM from the same matrix used for weights so
-            # the two stay coherent across walk-forward recomputes.
-            self.idm = diversification_multiplier(
+            # the two stay coherent across walk-forward recomputes. The
+            # cap is leverage policy: it applies regardless of whether
+            # the matrix was derived inline or passed explicitly.
+            idm = diversification_multiplier(
                 self.instrument_weight, corr_matrix,
             )
+            if self.idm_cap is not None:
+                idm = min(idm, self.idm_cap)
+            self.idm = idm
         else:
             raise ValueError(
                 f"Unexpected mode: {mode!r} "
