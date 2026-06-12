@@ -175,6 +175,8 @@ class BacktestConfig:
                 f"Unknown corr_mode: {self.corr_mode!r}. "
                 "Must be 'simple_return' or 'absolute_price_chg'."
             )
+        # NaN-rejecting comparison forms (``not (...)``), mirroring the
+        # RM constructor: a plain ``<`` / ``>`` check would let NaN through.
         if self.corr_floor is not None and not (-1.0 <= self.corr_floor <= 1.0):
             raise ValueError(
                 f"corr_floor must be in [-1.0, 1.0] or None to disable, "

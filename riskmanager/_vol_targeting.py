@@ -93,7 +93,8 @@ long-only minimum-variance QP; ``analytics.risk_parity`` — equal risk
 contribution). Both run correlation-only — the equal-vol convention,
 consistent with sizing already dividing by each instrument's σ. The
 matching IDM (``analytics.diversification_multiplier``) is updated from
-the same ρ on every successful recompute, keeping the two coherent.
+the same ρ on every successful recompute (clamped to ``idm_cap``),
+keeping the two coherent.
 ``update_bar`` auto-recalls the method every ``corr_step_size``
 completed ``corr_timeframe`` periods (default ``30``; multi-symbol bars
 at the same timestamp and sub-period base bars are de-duplicated via
@@ -171,7 +172,7 @@ class CarverVolTargetingRiskManager(RiskManager):
     (walk-forward; period crossings are detected via
     ``data.get_period_start`` so multi-symbol bars at the same timestamp
     and sub-period base bars contribute one tick per period, not N or 24N);
-    the matching IDM is recomputed alongside.
+    the matching IDM is recomputed alongside (clamped to ``idm_cap``).
 
     Per-bar diagnostic log analogous to ``Strategy.get_records``: every
     completed bar appends one row to ``self._records[symbol]`` and emits

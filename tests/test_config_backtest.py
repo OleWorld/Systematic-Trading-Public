@@ -181,6 +181,7 @@ def test_corr_floor_none_and_bounds_accepted():
     assert BacktestConfig(**_kwargs(corr_floor=None)).corr_floor is None
     assert BacktestConfig(**_kwargs(corr_floor=-1.0)).corr_floor == -1.0
     assert BacktestConfig(**_kwargs(corr_floor=1.0)).corr_floor == 1.0
+    assert BacktestConfig(**_kwargs(corr_floor=0)).corr_floor == 0
 
 
 def test_idm_cap_below_one_rejected():

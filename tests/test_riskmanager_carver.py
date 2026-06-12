@@ -1369,6 +1369,16 @@ def test_explicit_corr_matrix_is_not_floored():
     assert math.isclose(w['A'], 0.4, abs_tol=1e-6)
     assert math.isclose(w['B'], 0.4, abs_tol=1e-6)
     assert math.isclose(w['C'], 0.2, abs_tol=1e-6)
+    # IDM auto-update passes through uncapped when below the cap.
+    assert math.isclose(rm.idm, 1.0 / math.sqrt(0.2), rel_tol=1e-6)
+
+
+def test_idm_cap_binds_on_inline_derivation_path_too():
+    """corr_floor=None lets the anti-correlated fixture's inline DM run to
+    ≈3.3; the default cap clamps it — pins capping for the inline ρ source
+    (the other cap tests all use the explicit corr_matrix hook)."""
+    rm = _floor_rm(_anti_correlated_closes(), corr_floor=None)   # default idm_cap
+    assert rm.idm == 2.5
 
 
 # ──────────────────────────────────────────────
