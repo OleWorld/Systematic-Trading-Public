@@ -636,6 +636,10 @@ class CarverVolTargetingRiskManager(RiskManager):
         (``'simple_return'`` → ``.pct_change().dropna()``;
         ``'absolute_price_chg'`` → ``.diff().dropna()``), and calls
         ``analytics.correlation_matrix`` on the result.
+        When ``self.corr_floor`` is not ``None``, the resulting matrix
+        is element-wise floored at ``corr_floor`` before being returned
+        (estimation hygiene: applies to this inline path only, never to
+        an explicitly passed ``corr_matrix``).
 
         Returns ``None`` — after logging a WARNING that names ``mode`` —
         when fewer than ``_MIN_CORR_OBS`` (=30) valid observations
@@ -673,7 +677,14 @@ class CarverVolTargetingRiskManager(RiskManager):
                 mode, len(returns), _MIN_CORR_OBS,
             )
             return None
-        return correlation_matrix(returns)
+        corr = correlation_matrix(returns)
+        if self.corr_floor is not None:
+            # Element-wise floor (Carver: zero out spurious negative
+            # correlations before weighting). Clipping preserves symmetry
+            # and the 1.0 diagonal for any floor <= 1. NOTE: must be an
+            # ``is not None`` check — the default 0.0 is falsy.
+            corr = corr.clip(lower=self.corr_floor)
+        return corr
 
     def calculate_strategy_weight(self) -> None:
         """Populate ``self.strategy_weight`` with the single-strategy placeholder.

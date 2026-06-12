@@ -1252,6 +1252,68 @@ def test_constructor_rejects_idm_above_idm_cap():
 
 
 # ──────────────────────────────────────────────
+# corr_floor — behavioral (inline derivation path)
+# ──────────────────────────────────────────────
+
+def _anti_correlated_closes():
+    """Three 61-bar series: A and B with strongly negative
+    absolute-price-change correlation (ρ ≈ -0.8 by construction), C
+    independent of both. Deterministic (seeded)."""
+    rng = np.random.default_rng(seed=7)
+    idx = pd.date_range('2024-01-01', periods=61, freq='D')
+    chg_a = rng.normal(0.0, 1.0, 60)
+    chg_b = -0.8 * chg_a + 0.6 * rng.normal(0.0, 1.0, 60)
+    chg_c = rng.normal(0.0, 1.0, 60)
+
+    def prices(chg):
+        return pd.Series(
+            100.0 + np.concatenate([[0.0], np.cumsum(chg)]), index=idx,
+        )
+
+    return {'A': prices(chg_a), 'B': prices(chg_b), 'C': prices(chg_c)}
+
+
+def _floor_rm(closes, **kwargs):
+    """Min-variance RM over ``closes`` with corr_lookback=61 (all live)."""
+    dh = FakeDataHandler(closes=closes)
+    return CarverVolTargetingRiskManager(
+        FakePortfolio(), FakeStrategy(symbol_list=list(closes)),
+        FakeVolEstimator(), data_handler=dh,
+        instrument_weight_mode='min_variance',
+        corr_lookback=61, annualized_target_vol=0.25, **kwargs,
+    )
+
+
+def test_derived_corr_matrix_is_floored_at_zero_by_default():
+    """The inline derivation clips ρ at corr_floor; with corr_floor=None
+    the raw (verifiably negative) matrix flows through."""
+    closes = _anti_correlated_closes()
+    rm = _floor_rm(closes)
+    symbols = list(closes)
+    floored = rm._derive_corr_matrix('min_variance', symbols)
+    off_diag = floored.values[~np.eye(len(floored), dtype=bool)]
+    assert off_diag.min() >= 0.0
+    # Sanity: the raw matrix really is negative somewhere, otherwise
+    # this test proves nothing.
+    rm.corr_floor = None
+    raw = rm._derive_corr_matrix('min_variance', symbols)
+    assert raw.values[~np.eye(len(raw), dtype=bool)].min() < -0.5
+
+
+def test_corr_floor_prevents_overweighting_of_anti_correlated_pair():
+    """min_variance on the raw matrix (corr_floor=None) treats the A/B
+    anti-correlation as a free hedge and starves C; the default floor
+    removes the spurious credit. Floored IDM respects the sqrt(N) bound;
+    the raw IDM exceeds the floored one (idm_cap disabled to expose it)."""
+    closes = _anti_correlated_closes()
+    floored = _floor_rm(closes)                          # corr_floor=0.0 default
+    raw = _floor_rm(closes, corr_floor=None, idm_cap=None)
+    assert raw.instrument_weight['C'] < floored.instrument_weight['C']
+    assert floored.idm <= math.sqrt(3.0) + 1e-9
+    assert raw.idm > floored.idm
+
+
+# ──────────────────────────────────────────────
 # calculate_instrument_weight — validation
 # ──────────────────────────────────────────────
 
@@ -1331,7 +1393,10 @@ def test_min_variance_derives_corr_from_filled_deques_and_auto_updates_idm():
     # corr matrix externally from the SAME ``corr_lookback`` trailing
     # window (the risk manager calls get_latest_bars(s, lookback, ...)).
     trailing = pd.DataFrame({s: closes[s].iloc[-lookback:] for s in symbols})
-    expected_corr = trailing.pct_change(fill_method=None).dropna().corr()
+    expected_corr = (
+        trailing.pct_change(fill_method=None).dropna().corr()
+        .clip(lower=0.0)                # mirror the RM's default corr_floor
+    )
     expected_idm = diversification_multiplier(rm.instrument_weight, expected_corr)
     assert math.isclose(rm.idm, expected_idm, rel_tol=1e-9)
 
@@ -1388,7 +1453,10 @@ def test_returns_used_are_simple_pct_change():
 
     # The min-variance solution for a 2-asset matrix with the data-handler
     # corr should be reproducible end-to-end from the pct_change call.
-    expected_corr = pd.DataFrame(closes).pct_change(fill_method=None).dropna().corr()
+    expected_corr = (
+        pd.DataFrame(closes).pct_change(fill_method=None).dropna().corr()
+        .clip(lower=0.0)                # mirror the RM's default corr_floor
+    )
     rho = expected_corr.loc['A', 'B']
     # Closed form for the 2-asset min-variance under equal-vol: still 1/N
     # regardless of ρ, so we use that as a sanity check on the solver…
@@ -1445,8 +1513,11 @@ def test_absolute_price_chg_mode_uses_diff():
     )
     rm.calculate_instrument_weight(mode='min_variance')
 
-    expected_corr = pd.DataFrame(closes).diff().dropna().corr()
-    rho = expected_corr.loc['A', 'B']
+    expected_corr_raw = pd.DataFrame(closes).diff().dropna().corr()
+    expected_corr = expected_corr_raw.clip(lower=0.0)   # mirror the RM's default corr_floor
+    # The mode-disambiguation sanity below needs the UNfloored value
+    # (both modes' ρ could clip to the same 0.0).
+    rho = expected_corr_raw.loc['A', 'B']
     # 2-asset min-variance under equal-vol is 1/N regardless of ρ.
     assert math.isclose(rm.instrument_weight['A'], 0.5, rel_tol=1e-9)
     assert math.isclose(rm.instrument_weight['B'], 0.5, rel_tol=1e-9)
