@@ -90,7 +90,7 @@ class EWMACStrategy(Strategy):
         weights: Optional[List[float]] = None,
         fdm: float = 1.0,
         vol_lookback: int = 25,
-        forecast_scalar_lookback: int = 500,
+        forecast_scalar_lookback: int = 256,
     ):
         """Configure parameters and instantiate per-symbol indicators.
 

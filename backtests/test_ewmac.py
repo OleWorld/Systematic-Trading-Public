@@ -29,10 +29,13 @@ sample_csv = os.path.join(os.path.dirname(__file__), 'sample_data', 'crypto_1d.c
 _raw = pd.read_csv(sample_csv)
 _raw['timestamp'] = pd.to_datetime(_raw['timestamp'], utc=True)
 _grouped = {sym: g for sym, g in _raw.groupby('symbol')}
+stables = ['USDC_USDT:USDT', 'USTC_USDT:USDT']
+for sym in stables:
+    del _grouped[sym]
 _symbols = list(str(x) for x in _grouped.keys())
 
 # --- Config (validated parameter holder) ---
-# EWMAC defaults need ~756 daily bars of warmup (256-day slow EMA + 500-bar
+# EWMAC defaults need ~756 daily bars of warmup (256-day slow EMA + 256-bar
 # forecast-scalar SMA). The 2021-01 → 2026-04 window gives ~1939 daily bars —
 # plenty for warmup AND post-warmup signal emission.
 #
@@ -113,6 +116,8 @@ risk_manager = CarverVolTargetingRiskManager(
     corr_step_size=config.corr_step_size,
     corr_timeframe=config.corr_timeframe,
     corr_mode=config.corr_mode,
+    corr_floor=config.corr_floor,
+    idm_cap=config.idm_cap,
 )
 
 execution = BacktestExecution(
@@ -255,9 +260,9 @@ if not riskmanager_records.empty:
 # )
 # pnl_by_instrument = total.groupby(level=0).last()   # one row per timestamp
 # fig = px.line(pnl_by_instrument)
-# fig.show()
-# fig = px.line(equity_df[['account_balance', 'available_balance']])
-# fig.show()
+# fig.show(renderer='browser')
+# fig = px.line(equity_df[['account_balance', 'available_balance']].resample('d').last())
+# fig.show(renderer='browser')
 
 # df_weight = pd.DataFrame()
 # for x in config.symbols:
