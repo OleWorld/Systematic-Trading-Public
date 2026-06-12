@@ -203,6 +203,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         corr_step_size: int = 30,
         corr_timeframe: str = '1d',
         corr_mode: str = 'absolute_price_chg',
+        corr_floor: Optional[float] = 0.0,
     ):
         """
         Parameters
@@ -300,6 +301,19 @@ class CarverVolTargetingRiskManager(RiskManager):
             inf at zero crossings, sign-flipped below zero) or
             ``'simple_return'`` (``.pct_change()`` — for strictly
             positive-price assets such as crypto/equities).
+        corr_floor
+            Element-wise lower bound applied to the inline-derived
+            correlation matrix (see ``_derive_corr_matrix``) before it
+            feeds the optimizer and the IDM. Default ``0.0`` — Carver's
+            practice: negative correlations estimated from a short
+            window are mostly sampling noise, and trusting them both
+            overweights spuriously anti-correlated instruments
+            (min-variance treats them as a free hedge) and inflates the
+            IDM. With the default floor and long-only weights the
+            pre-cap IDM is bounded by ``sqrt(N)``. ``None`` disables
+            flooring. Must be in ``[-1.0, 1.0]`` when not ``None``.
+            NOT applied to an explicitly passed ``corr_matrix`` — the
+            caller owns that matrix.
 
         Raises
         ------
@@ -371,6 +385,11 @@ class CarverVolTargetingRiskManager(RiskManager):
                 f"Unknown corr_mode: {corr_mode!r}. "
                 "Must be 'simple_return' or 'absolute_price_chg'."
             )
+        if corr_floor is not None and not (-1.0 <= corr_floor <= 1.0):
+            raise ValueError(
+                f"corr_floor must be in [-1.0, 1.0] or None to disable, "
+                f"got {corr_floor}"
+            )
         super().__init__(portfolio, strategy)
         self.vol_estimator = vol_estimator
         self.data_handler = data_handler
@@ -383,6 +402,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         self.corr_step_size = corr_step_size
         self.corr_timeframe = corr_timeframe
         self.corr_mode = corr_mode
+        self.corr_floor = corr_floor
         # Default weighting scheme used by ``calculate_instrument_weight``
         # when called without an explicit ``mode``. Set before the
         # construction-time recalc below so the method can read it.

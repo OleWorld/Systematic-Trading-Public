@@ -1175,6 +1175,30 @@ def test_explicit_corr_matrix_over_subset_is_accepted():
     assert math.isclose(rm.instrument_weight['ETH'], 0.5, abs_tol=1e-9)
 
 
+# ──────────────────────────────────────────────
+# corr_floor (element-wise ρ floor, Carver: zero out spurious
+# negative correlations) — constructor validation
+# ──────────────────────────────────────────────
+
+def test_constructor_corr_floor_defaults_to_zero():
+    """Futures-first default: floor the inline-derived ρ at 0 (Carver)."""
+    rm = _build_rm(['BTC'])
+    assert rm.corr_floor == 0.0
+
+
+def test_constructor_rejects_corr_floor_outside_minus_one_one():
+    for bad in (1.5, -1.5, 2.0):
+        with pytest.raises(ValueError, match="corr_floor"):
+            _build_rm(['BTC'], corr_floor=bad)
+
+
+def test_constructor_corr_floor_accepts_none_and_bounds():
+    """None disables flooring; the closed interval ends are valid."""
+    assert _build_rm(['BTC'], corr_floor=None).corr_floor is None
+    assert _build_rm(['BTC'], corr_floor=-1.0).corr_floor == -1.0
+    assert _build_rm(['BTC'], corr_floor=1.0).corr_floor == 1.0
+
+
 def test_explicit_corr_matrix_with_label_outside_symbol_list_raises():
     rm = _build_rm(['BTC', 'ETH'])
     bad = _corr_df(['BTC', 'SOL'], off_diag=0.0)
