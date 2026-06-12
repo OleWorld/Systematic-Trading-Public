@@ -22,26 +22,32 @@ from plotting import plot_strategy
 
 # --- Config (validated parameter holder) ---
 # EWMAC defaults need ~756 daily bars of warmup (256-day slow EMA + 500-bar
-# forecast-scalar SMA). The 2021-2025 window gives ~1825 daily bars — plenty
-# for warmup AND post-warmup signal emission.
+# forecast-scalar SMA). The 2021-01 → 2026-04 window gives ~1939 daily bars —
+# plenty for warmup AND post-warmup signal emission.
+#
+# This smoke run exercises the engine's FUTURES-FIRST defaults (dollar vol
+# target, absolute-price-change correlations, absolute slippage, per-contract
+# commission) on the bundled crypto basket. Only days_convention is data-driven:
+# crypto trades 24/7, so 'calendar' (365 d/y) is required for correct vol
+# annualization regardless of the futures-style sizing knobs.
 config = BacktestConfig(
     symbols=['BTC_USDT:USDT', 'BNB_USDT:USDT', 'SOL_USDT:USDT', 'DOGE_USDT:USDT', 'ETH_USDT:USDT'],
-    instrument_weight_mode = 'min_variance',
-    corr_mode='simple_return',              # crypto-style: positive prices, pct-change correlations
+    instrument_weight_mode='min_variance',
+    corr_mode='absolute_price_chg',         # futures default: .diff() correlations
     start_date='2021-01-01',
-    end_date='2025-12-31',
+    end_date='2026-04-23',
     base_timeframe='1d',
-    days_convention='calendar',
+    days_convention='calendar',             # data-driven: crypto is 24/7 → 365 d/y
     timeframes={'1d': 500},
     initial_capital=1_000_000.0,
     leverage=10.0,
-    annualized_target_vol=0.5,
-    vol_target_mode='percent_volatility',   # crypto-style: τ is a fraction of current equity
+    vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
+    annualized_target_vol=500_000.0,        # $500k annual vol (≈ the old 0.5 × $1M start)
     position_buffer=0.25,
-    slippage_mode='pct',
-    slippage_value=0.001,
-    commission_mode='rate',                 # crypto-style: bps on notional
-    commission_value=0.001,
+    slippage_mode='absolute',               # futures default: $ per unit
+    slippage_value=0.0,                     # default 0.0 — one fixed tick can't fit BTC & DOGE scales
+    commission_mode='per_contract',         # futures default: $ per contract
+    commission_value=0.0,                   # default 0.0 — per-contract cost isn't uniform across the basket
     fill_on='signal_close',
 )
 
