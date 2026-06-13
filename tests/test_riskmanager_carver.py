@@ -19,6 +19,7 @@ Pin:
 Run from the repo root:  pytest tests/test_riskmanager_carver.py -v
 """
 
+import logging
 import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from analytics import correlation_matrix
 from event import BarEvent, OrderType, Direction
 from riskmanager import CarverVolTargetingRiskManager
 
@@ -1280,8 +1282,14 @@ def _anti_correlated_closes():
 
 
 def _floor_rm(closes, **kwargs):
-    """Min-variance RM over ``closes`` with corr_lookback=61 (all live)."""
+    """Min-variance RM over ``closes`` with corr_lookback=61 (all live).
+
+    Shrinkage defaults OFF here so the floor tests pin floor semantics
+    in isolation; the corr_shrinkage section overrides explicitly where
+    the shrink→floor interplay is the subject.
+    """
     dh = FakeDataHandler(closes=closes)
+    kwargs.setdefault('corr_shrinkage', None)
     return CarverVolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=list(closes)),
         FakeVolEstimator(), data_handler=dh,
@@ -1317,6 +1325,121 @@ def test_corr_floor_prevents_overweighting_of_anti_correlated_pair():
     assert raw.instrument_weight['C'] < floored.instrument_weight['C']
     assert floored.idm <= math.sqrt(3.0) + 1e-9
     assert raw.idm > floored.idm
+
+
+# ──────────────────────────────────────────────
+# corr_shrinkage (Ledoit-Wolf on the inline ρ) — constructor + behavior
+# ──────────────────────────────────────────────
+
+def test_constructor_corr_shrinkage_defaults_to_ledoit_wolf():
+    """Estimation hygiene on by default — like corr_floor."""
+    rm = _build_rm(['BTC'])
+    assert rm.corr_shrinkage == 'ledoit_wolf'
+
+
+def test_constructor_corr_shrinkage_accepts_none():
+    assert _build_rm(['BTC'], corr_shrinkage=None).corr_shrinkage is None
+
+
+def test_constructor_rejects_unknown_corr_shrinkage():
+    with pytest.raises(ValueError, match="corr_shrinkage"):
+        _build_rm(['BTC'], corr_shrinkage='oas')
+
+
+def test_derive_corr_matrix_applies_ledoit_wolf_by_default():
+    """The inline ρ is the LW-shrunk matrix (floor disabled to isolate)."""
+    closes = _anti_correlated_closes()
+    dh = FakeDataHandler(closes=closes)
+    rm = CarverVolTargetingRiskManager(
+        FakePortfolio(), FakeStrategy(symbol_list=list(closes)),
+        FakeVolEstimator(), data_handler=dh,
+        instrument_weight_mode='min_variance',
+        corr_lookback=61, annualized_target_vol=0.25,
+        corr_floor=None,    # isolate shrinkage from the floor
+    )
+    derived = rm._derive_corr_matrix('min_variance', list(closes))
+    expected = correlation_matrix(
+        pd.DataFrame(closes).diff().dropna(), shrinkage='ledoit_wolf',
+    )
+    pd.testing.assert_frame_equal(derived, expected)
+
+
+def test_corr_shrinkage_none_reproduces_raw_sample_corr():
+    """OFF path is a true no-op: bit-identical to the pre-shrinkage
+    pipeline (raw pandas sample correlation)."""
+    closes = _anti_correlated_closes()
+    rm = _floor_rm(closes, corr_shrinkage=None, corr_floor=None)
+    derived = rm._derive_corr_matrix('min_variance', list(closes))
+    expected = pd.DataFrame(closes).diff().dropna().corr()
+    pd.testing.assert_frame_equal(derived, expected)
+
+
+def test_corr_floor_applies_after_shrinkage():
+    """Pipeline order is estimate → shrink → floor: the default floor
+    clips the LW-shrunk matrix, not the raw one."""
+    closes = _anti_correlated_closes()
+    rm = _floor_rm(closes, corr_shrinkage='ledoit_wolf')  # default floor 0.0
+    derived = rm._derive_corr_matrix('min_variance', list(closes))
+    expected = correlation_matrix(
+        pd.DataFrame(closes).diff().dropna(), shrinkage='ledoit_wolf',
+    ).clip(lower=0.0)
+    pd.testing.assert_frame_equal(derived, expected)
+
+
+def test_derive_corr_matrix_logs_lw_intensity(caplog):
+    """One DEBUG line per derivation reports the fitted LW intensity."""
+    closes = _anti_correlated_closes()
+    rm = _floor_rm(closes, corr_shrinkage='ledoit_wolf')
+    with caplog.at_level(logging.DEBUG, logger='riskmanager._vol_targeting'):
+        rm._derive_corr_matrix('min_variance', list(closes))
+    assert any('shrinkage intensity' in r.message for r in caplog.records)
+
+
+# ──────────────────────────────────────────────
+# _nearest_psd_correlation (post-floor repair)
+# ──────────────────────────────────────────────
+
+def test_nearest_psd_correlation_repairs_non_psd_matrix():
+    """A unit-diagonal non-PSD matrix (λ_min ≈ -0.27) comes back as a
+    valid correlation matrix close to the input."""
+    labels = ['A', 'B', 'C']
+    bad = pd.DataFrame(
+        [[1.0, 0.9, 0.9],
+         [0.9, 1.0, 0.0],
+         [0.9, 0.0, 1.0]],
+        index=labels, columns=labels,
+    )
+    assert np.linalg.eigvalsh(bad.to_numpy()).min() < -0.2
+    fixed = CarverVolTargetingRiskManager._nearest_psd_correlation(bad)
+    arr = fixed.to_numpy()
+    assert np.linalg.eigvalsh(arr).min() >= -1e-12
+    np.testing.assert_allclose(np.diag(arr), 1.0)
+    np.testing.assert_allclose(arr, arr.T, atol=1e-12)
+    assert list(fixed.index) == labels and list(fixed.columns) == labels
+    # Eigenvalue clipping is a small perturbation, not a rebuild.
+    assert np.abs(arr - bad.to_numpy()).max() < 0.25
+
+
+def test_nearest_psd_correlation_passes_psd_through_unchanged():
+    """PSD input short-circuits — returned as-is (cheap eig check only)."""
+    labels = ['A', 'B']
+    good = pd.DataFrame(
+        [[1.0, 0.5], [0.5, 1.0]], index=labels, columns=labels,
+    )
+    fixed = CarverVolTargetingRiskManager._nearest_psd_correlation(good)
+    assert fixed is good
+
+
+def test_derived_corr_matrix_is_always_psd_across_floors():
+    """End-to-end invariant: whatever the floor/shrinkage combination,
+    the matrix handed to the optimizer and the IDM is PSD within dust."""
+    closes = _anti_correlated_closes()
+    for shrink in (None, 'ledoit_wolf'):
+        for floor in (None, 0.0, 0.3, 0.6):
+            rm = _floor_rm(closes, corr_shrinkage=shrink, corr_floor=floor)
+            derived = rm._derive_corr_matrix('min_variance', list(closes))
+            lam_min = np.linalg.eigvalsh(derived.to_numpy()).min()
+            assert lam_min >= -1e-12, (shrink, floor, lam_min)
 
 
 # ──────────────────────────────────────────────
@@ -1454,6 +1577,7 @@ def test_min_variance_derives_corr_from_filled_deques_and_auto_updates_idm():
         annualized_target_vol=0.25,
         corr_mode='simple_return',          # this test pins the pct_change path
         corr_floor=None,    # raw-path test: pins the trailing-window sourcing, not the floor
+        corr_shrinkage=None,    # raw-path test: shrinkage off for the same reason
     )
     # Weights sum to 1, non-negative.
     assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
@@ -1515,6 +1639,7 @@ def test_returns_used_are_simple_pct_change():
         corr_lookback=100, annualized_target_vol=0.25,
         corr_mode='simple_return',          # this test pins the pct_change path
         corr_floor=None,    # raw-path test: pins the pct_change dispatch, not the floor
+        corr_shrinkage=None,    # raw-path test: shrinkage off for the same reason
     )
     rm.calculate_instrument_weight(mode='min_variance')
 
@@ -1575,6 +1700,7 @@ def test_absolute_price_chg_mode_uses_diff():
         corr_lookback=100, corr_mode='absolute_price_chg',
         annualized_target_vol=0.25,
         corr_floor=None,    # raw-path test: pins the .diff() dispatch, not the floor
+        corr_shrinkage=None,    # raw-path test: shrinkage off for the same reason
     )
     rm.calculate_instrument_weight(mode='min_variance')
 

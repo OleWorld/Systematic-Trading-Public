@@ -117,6 +117,7 @@ risk_manager = CarverVolTargetingRiskManager(
     corr_timeframe=config.corr_timeframe,
     corr_mode=config.corr_mode,
     corr_floor=config.corr_floor,
+    corr_shrinkage=config.corr_shrinkage,
     idm_cap=config.idm_cap,
 )
 
@@ -264,7 +265,10 @@ if not riskmanager_records.empty:
 # fig = px.line(equity_df[['account_balance', 'available_balance']].resample('d').last())
 # fig.show(renderer='browser')
 
-# df_weight = pd.DataFrame()
+# list_weights = []
 # for x in config.symbols:
-#     df_weight[x] = bt.risk_manager.get_records(x)['instrument_weight']
+#     weight = bt.risk_manager.get_records(x)['instrument_weight'].astype(float)
+#     weight.name = x
+#     list_weights.append( weight )
+# df_weight = pd.concat(list_weights, axis=1)
 # px.line(df_weight)

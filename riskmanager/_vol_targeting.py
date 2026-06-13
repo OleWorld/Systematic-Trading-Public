@@ -124,6 +124,7 @@ import datetime
 import logging
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 
 from analytics import (
@@ -206,6 +207,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         corr_timeframe: str = '1d',
         corr_mode: str = 'absolute_price_chg',
         corr_floor: Optional[float] = 0.0,
+        corr_shrinkage: Optional[str] = 'ledoit_wolf',
     ):
         """
         Parameters
@@ -332,6 +334,19 @@ class CarverVolTargetingRiskManager(RiskManager):
             flooring. Must be in ``[-1.0, 1.0]`` when not ``None``.
             NOT applied to an explicitly passed ``corr_matrix`` — the
             caller owns that matrix.
+        corr_shrinkage
+            Shrinkage estimator applied when deriving the inline
+            correlation matrix (see ``_derive_corr_matrix``). Default
+            ``'ledoit_wolf'`` — Ledoit-Wolf shrinkage toward scaled
+            identity with the closed-form optimal intensity, keeping ρ
+            well-conditioned as the instrument count grows toward (or
+            past) ``corr_lookback`` observations, where the raw sample
+            estimator degrades into noise. Applied *before*
+            ``corr_floor`` (estimate → shrink → floor → PSD repair).
+            ``None`` disables shrinkage (raw sample correlation, the
+            pre-shrinkage behavior). Like ``corr_floor``, estimation
+            hygiene for the inline path only — NOT applied to an
+            explicitly passed ``corr_matrix``.
 
         Raises
         ------
@@ -425,6 +440,11 @@ class CarverVolTargetingRiskManager(RiskManager):
                 f"corr_floor must be in [-1.0, 1.0] or None to disable, "
                 f"got {corr_floor}"
             )
+        if corr_shrinkage not in (None, 'ledoit_wolf'):
+            raise ValueError(
+                f"corr_shrinkage must be None or 'ledoit_wolf', "
+                f"got {corr_shrinkage!r}"
+            )
         super().__init__(portfolio, strategy)
         self.vol_estimator = vol_estimator
         self.data_handler = data_handler
@@ -439,6 +459,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         self.corr_timeframe = corr_timeframe
         self.corr_mode = corr_mode
         self.corr_floor = corr_floor
+        self.corr_shrinkage = corr_shrinkage
         # Default weighting scheme used by ``calculate_instrument_weight``
         # when called without an explicit ``mode``. Set before the
         # construction-time recalc below so the method can read it.
@@ -640,17 +661,24 @@ class CarverVolTargetingRiskManager(RiskManager):
     ) -> Optional[pd.DataFrame]:
         """Derive ρ from a trailing window of per-bar price changes.
 
+        Pipeline order: **estimate → shrink → floor → PSD repair**.
         Pulls ``self.corr_lookback`` bars at ``self.corr_timeframe`` for
         each of ``symbols`` (the live subset, per ``get_live_symbols``)
         via ``self.data_handler.get_latest_bars``, computes per-bar
         price changes per ``self.corr_mode``
         (``'simple_return'`` → ``.pct_change().dropna()``;
         ``'absolute_price_chg'`` → ``.diff().dropna()``), and calls
-        ``analytics.correlation_matrix`` on the result.
-        When ``self.corr_floor`` is not ``None``, the resulting matrix
-        is element-wise floored at ``corr_floor`` before being returned
-        (estimation hygiene: applies to this inline path only, never to
-        an explicitly passed ``corr_matrix``).
+        ``analytics.correlation_matrix`` on the result, forwarding
+        ``self.corr_shrinkage`` (Ledoit-Wolf by default; the fitted
+        intensity is DEBUG-logged). When ``self.corr_floor`` is not
+        ``None``, the matrix is then element-wise floored at
+        ``corr_floor``; since element-wise clipping does not preserve
+        positive-semidefiniteness in general, the floored matrix passes
+        through ``_nearest_psd_correlation`` before being returned, so
+        the optimizer and the IDM always consume the same valid
+        correlation matrix. (All three transforms are estimation
+        hygiene: they apply to this inline path only, never to an
+        explicitly passed ``corr_matrix``.)
 
         Returns ``None`` — after logging a WARNING that names ``mode`` —
         when fewer than ``_MIN_CORR_OBS`` (=30) valid observations
@@ -688,14 +716,47 @@ class CarverVolTargetingRiskManager(RiskManager):
                 mode, len(returns), _MIN_CORR_OBS,
             )
             return None
-        corr = correlation_matrix(returns)
+        corr = correlation_matrix(returns, shrinkage=self.corr_shrinkage)
+        if self.corr_shrinkage is not None:
+            logger.debug(
+                "%s: %s shrinkage intensity %.4f over %d observations",
+                mode, self.corr_shrinkage,
+                corr.attrs.get('lw_shrinkage', float('nan')), len(returns),
+            )
         if self.corr_floor is not None:
             # Element-wise floor (Carver: zero out spurious negative
             # correlations before weighting). Clipping preserves symmetry
             # and the 1.0 diagonal for any floor <= 1. NOTE: must be an
             # ``is not None`` check — the default 0.0 is falsy.
             corr = corr.clip(lower=self.corr_floor)
-        return corr
+        # Element-wise clipping does not preserve PSD in general; the
+        # CVXPY optimizers (and the IDM quadratic form) require a valid
+        # correlation matrix, so repair here — at the producer — keeps
+        # every consumer on the same matrix.
+        return self._nearest_psd_correlation(corr)
+
+    @staticmethod
+    def _nearest_psd_correlation(corr: pd.DataFrame) -> pd.DataFrame:
+        """Project ``corr`` back to a valid (PSD) correlation matrix.
+
+        Cheap ``eigvalsh`` check first: PSD input is returned unchanged
+        (the common case — repair only triggers when ``corr_floor``
+        clipping actually broke PSD-ness). Otherwise: clip negative
+        eigenvalues to zero, reconstruct, rescale to a unit diagonal
+        (a congruence transform, so PSD-ness is preserved exactly), and
+        re-symmetrize. The result is a small perturbation of the input,
+        not a rebuild — labels and the unit diagonal are preserved.
+        """
+        vals = corr.to_numpy(dtype=float)
+        if float(np.linalg.eigvalsh(vals)[0]) >= 0.0:
+            return corr
+        eigvals, eigvecs = np.linalg.eigh(vals)
+        repaired = (eigvecs * np.clip(eigvals, 0.0, None)) @ eigvecs.T
+        d = np.sqrt(np.diag(repaired))
+        repaired = repaired / np.outer(d, d)
+        repaired = 0.5 * (repaired + repaired.T)
+        np.fill_diagonal(repaired, 1.0)
+        return pd.DataFrame(repaired, index=corr.index, columns=corr.columns)
 
     def calculate_strategy_weight(self) -> None:
         """Populate ``self.strategy_weight`` with the single-strategy placeholder.

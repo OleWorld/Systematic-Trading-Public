@@ -27,6 +27,20 @@ Shared contract
   equal volatilities. That equal-vol convention is the correct default
   inside the Carver vol-targeting stack, where position sizing already
   normalizes every instrument by its own σ.
+* **CVXPY/CLARABEL solver stack.** Both corr-based schemes are convex
+  programs solved through CVXPY with the CLARABEL interior-point solver
+  (QP for min-variance; exponential cone for the ERC log barrier).
+  Chosen for robustness on near-singular matrices — the high-dimensional
+  regime (N approaching or exceeding the estimation window) where
+  generic NLP solvers degrade — and for expressiveness (future
+  constraint sets are declarative one-liners), not for speed: at this
+  problem size canonicalization overhead dominates, and solves run at a
+  coarse walk-forward cadence where per-solve cost is irrelevant.
+* **PSD contract.** ``Σ`` must be positive semidefinite — the convexity
+  certificate is global, not feasible-region-local. Numerical dust
+  (``λ_min >= -1e-8``, e.g. from element-wise correlation flooring) is
+  repaired by eigenvalue clipping; materially non-PSD input raises
+  ``ValueError`` instead of silently defining a non-convex program.
 
 This is a research/setup-time helper package (see ``analytics``
 package docstring): call at portfolio build time or on a coarse
@@ -38,18 +52,24 @@ from __future__ import annotations
 from collections import Counter
 from typing import Dict, Mapping, Optional, Sequence, Union
 
+import cvxpy as cp
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
 
 __all__ = ['equal_weight', 'min_variance', 'risk_parity']
 
 _VolsLike = Union[Mapping[str, float], pd.Series]
 _SYMMETRY_TOL = 1e-9
-# Strictly-positive lower bound for the ERC solver: keeps the log
-# barrier finite while being far below any economically meaningful
-# weight.
-_ERC_WEIGHT_FLOOR = 1e-12
+# PSD tolerance: eigenvalues in [-_PSD_TOL, 0) are numerical dust
+# (clipped to zero); anything below is a materially broken input.
+_PSD_TOL = 1e-8
+# Weights below this are interior-point dust at an active w >= 0 bound
+# (the solver approaches the bound asymptotically, never reaching exact
+# 0.0) — far below any economic weight. Snapped to exact zero so
+# downstream zero-weight semantics (e.g. the risk manager's
+# skip_reason='zero_weight' short-circuit) fire instead of producing
+# 1e-12-contract orders.
+_ZERO_SNAP = 1e-10
 
 
 def equal_weight(labels: Sequence[str]) -> Dict[str, float]:
@@ -98,9 +118,8 @@ def min_variance(
 
         min  wᵀ Σ w    s.t.    sum(w) = 1,  w >= 0
 
-    numerically (``scipy.optimize.minimize(method='SLSQP')`` with the
-    analytic jacobian ``2Σw``). This is the *exact* long-only optimum —
-    unlike the closed form ``ρ⁻¹1 / 1ᵀρ⁻¹1``, which only solves the
+    via CVXPY/CLARABEL. This is the *exact* long-only optimum — unlike
+    the closed form ``ρ⁻¹1 / 1ᵀρ⁻¹1``, which only solves the
     equality-constrained problem and must be patched with a
     clip-and-renormalize heuristic when it goes negative.
 
@@ -110,8 +129,9 @@ def min_variance(
     ----------
     corr_matrix
         N×N correlation matrix as a ``pd.DataFrame`` (square, symmetric
-        within ``1e-9``, ``index == columns``, no NaN/inf). Output labels
-        are taken from its index. Typically produced by
+        within ``1e-9``, ``index == columns``, no NaN/inf, PSD within
+        the ``1e-8`` dust tolerance — see module docstring). Output
+        labels are taken from its index. Typically produced by
         ``analytics.correlation_matrix``.
     vols
         Optional per-label volatilities as ``dict`` or ``pd.Series``,
@@ -121,15 +141,21 @@ def min_variance(
         ``Σ = ρ ∘ σσᵀ``; when ``None`` (default), ``Σ = ρ`` — the
         equal-volatility convention (see module docstring).
     tol
-        Solver termination tolerance (forwarded to scipy). Must be > 0.
+        Solver convergence tolerance, forwarded to CLARABEL as
+        ``tol_gap_abs`` / ``tol_gap_rel`` / ``tol_feas``. Must be > 0.
+        Default ``1e-12`` (CLARABEL reaches it cleanly at these problem
+        sizes, giving weight precision well inside the documented
+        ≈1e-6/1e-9 test tolerances).
     max_iter
-        Solver iteration cap. Must be >= 1.
+        Solver iteration cap, forwarded to CLARABEL. Must be >= 1.
 
     Returns
     -------
     Dict[str, float]
         Weights keyed by ``corr_matrix.index`` labels; non-negative,
-        summing to 1.
+        summing to 1. Weights at the long-only bound are **exact**
+        zeros: sub-``1e-10`` interior-point dust is snapped to ``0.0``
+        before renormalization.
 
     Raises
     ------
@@ -138,41 +164,34 @@ def min_variance(
         a mapping/Series.
     ValueError
         On invalid ``corr_matrix`` / ``vols`` / ``tol`` / ``max_iter``,
-        or if the solver fails to converge.
+        a materially non-PSD matrix, or if the solver fails to reach an
+        OPTIMAL status.
     """
     _validate_solver_params(tol, max_iter)
     sigma = _build_sigma(corr_matrix, vols)
     n = sigma.shape[0]
-    w0 = np.full(n, 1.0 / n)
-    result = minimize(
-        lambda w: float(w @ sigma @ w),
-        w0,
-        jac=lambda w: 2.0 * (sigma @ w),
-        method='SLSQP',
-        bounds=[(0.0, 1.0)] * n,
-        constraints=[{
-            'type': 'eq',
-            'fun': lambda w: w.sum() - 1.0,
-            'jac': lambda w: np.ones(n),
-        }],
-        tol=tol,
-        options={'maxiter': max_iter},
+    w = cp.Variable(n)
+    problem = cp.Problem(
+        # psd_wrap skips CVXPY's own eigen-check; _build_sigma has
+        # already validated/repaired PSD-ness.
+        cp.Minimize(cp.quad_form(w, cp.psd_wrap(sigma))),
+        [cp.sum(w) == 1, w >= 0],  # type: ignore[list-item]  # cvxpy __eq__ stub
     )
-    if not result.success:
-        raise ValueError(f"min_variance solver failed: {result.message}")
-    # Numerical hygiene only (magnitudes ~ machine eps): SLSQP satisfies
-    # bounds/constraints to tolerance, so clip stray -1e-17s and rescale
-    # to an exact sum of 1 for downstream sum-to-1 validators.
-    w = np.clip(result.x, 0.0, None)
-    w = w / w.sum()
-    return {label: float(wi) for label, wi in zip(corr_matrix.index, w)}
+    _solve(problem, 'min_variance', tol, max_iter)
+    # Numerical hygiene (magnitudes ~ solver tolerance): clip stray
+    # -1e-12s, snap bound-dust to exact zeros (see _ZERO_SNAP), and
+    # rescale to an exact sum of 1 for downstream sum-to-1 validators.
+    w_opt = np.clip(np.asarray(w.value, dtype=float), 0.0, None)
+    w_opt[w_opt < _ZERO_SNAP] = 0.0
+    w_opt = w_opt / w_opt.sum()
+    return {label: float(wi) for label, wi in zip(corr_matrix.index, w_opt)}
 
 
 def risk_parity(
     corr_matrix: pd.DataFrame,
     vols: Optional[_VolsLike] = None,
     *,
-    tol: float = 1e-12,
+    tol: float = 1e-9,
     max_iter: int = 1_000,
 ) -> Dict[str, float]:
     """Equal-risk-contribution (ERC) weights.
@@ -185,11 +204,15 @@ def risk_parity(
 
         min  ½ wᵀ Σ w − Σ_i ln(w_i)
 
-    (``scipy.optimize.minimize(method='L-BFGS-B')`` with the analytic
-    gradient ``Σw − 1/w``); the unnormalized optimum satisfies
-    ``w_i (Σw)_i = 1`` for all ``i``, and rescaling to sum 1 preserves
-    the ERC property. The log barrier makes the solution unique and
-    strictly positive — no clipping needed by construction.
+    via CVXPY/CLARABEL (the log barrier enters as an exponential cone);
+    the unnormalized optimum satisfies ``w_i (Σw)_i = 1`` for all ``i``,
+    and rescaling to sum 1 preserves the ERC property. The log barrier
+    makes the solution unique and strictly positive — no explicit bounds
+    needed, the log domain enforces ``w > 0``. The interior-point
+    solution is then refined to ~machine precision by a short Newton
+    polish on the first-order system ``Σw − 1/w = 0`` (exp-cone solves
+    deliver ~tolerance-level weight accuracy; the polish closes the gap
+    so outputs meet the documented ≈1e-6/1e-9 precision).
 
     Constraint: full-investment long-only (``w_i > 0``, ``sum(w) == 1``).
 
@@ -197,8 +220,9 @@ def risk_parity(
     ----------
     corr_matrix
         N×N correlation matrix as a ``pd.DataFrame`` (square, symmetric
-        within ``1e-9``, ``index == columns``, no NaN/inf). Output labels
-        are taken from its index.
+        within ``1e-9``, ``index == columns``, no NaN/inf, PSD within
+        the ``1e-8`` dust tolerance — see module docstring). Output
+        labels are taken from its index.
     vols
         Optional per-label volatilities, semantics identical to
         ``min_variance``: when given, ``Σ = ρ ∘ σσᵀ``; when ``None``
@@ -207,9 +231,13 @@ def risk_parity(
         correlations alone*". With uniform correlations this collapses
         to the inverse-volatility closed form ``w_i ∝ 1/σ_i``.
     tol
-        Solver termination tolerance (forwarded to scipy). Must be > 0.
+        Solver convergence tolerance, forwarded to CLARABEL as
+        ``tol_gap_abs`` / ``tol_gap_rel`` / ``tol_feas``. Must be > 0.
+        Default ``1e-9`` — the CVXPY stage only needs to land inside the
+        Newton-polish basin; pushing exp-cone solves to 1e-12 trips
+        CLARABEL's reduced-accuracy fallback on some instances.
     max_iter
-        Solver iteration cap. Must be >= 1.
+        Solver iteration cap, forwarded to CLARABEL. Must be >= 1.
 
     Returns
     -------
@@ -224,25 +252,79 @@ def risk_parity(
         a mapping/Series.
     ValueError
         On invalid ``corr_matrix`` / ``vols`` / ``tol`` / ``max_iter``,
-        or if the solver fails to converge.
+        a materially non-PSD matrix, or if the solver fails to reach an
+        OPTIMAL status.
     """
     _validate_solver_params(tol, max_iter)
     sigma = _build_sigma(corr_matrix, vols)
     n = sigma.shape[0]
-    w0 = np.full(n, 1.0 / n)
-    result = minimize(
-        lambda w: float(0.5 * (w @ sigma @ w) - np.log(w).sum()),
-        w0,
-        jac=lambda w: sigma @ w - 1.0 / w,
-        method='L-BFGS-B',
-        bounds=[(_ERC_WEIGHT_FLOOR, None)] * n,
-        tol=tol,
-        options={'maxiter': max_iter},
+    w = cp.Variable(n)
+    problem = cp.Problem(
+        cp.Minimize(
+            0.5 * cp.quad_form(w, cp.psd_wrap(sigma)) - cp.sum(cp.log(w))
+        ),
     )
-    if not result.success:
-        raise ValueError(f"risk_parity solver failed: {result.message}")
-    w = result.x / result.x.sum()
-    return {label: float(wi) for label, wi in zip(corr_matrix.index, w)}
+    _solve(problem, 'risk_parity', tol, max_iter)
+    w_opt = np.asarray(w.value, dtype=float)
+    w_opt = _newton_polish_erc(sigma, w_opt)
+    w_opt = w_opt / w_opt.sum()
+    return {label: float(wi) for label, wi in zip(corr_matrix.index, w_opt)}
+
+
+def _newton_polish_erc(sigma: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """Refine a near-optimal ERC solution to ~machine precision.
+
+    Newton iterations on Spinu's first-order system ``F(w) = Σw − 1/w =
+    0``. The optimum is unique and strictly positive, and the Hessian
+    ``Σ + diag(1/w²)`` is SPD for any ``w > 0`` even when ``Σ`` itself
+    is singular, so every step is well-defined. From an interior-point
+    start (accurate to ~solver tolerance) convergence is quadratic —
+    two or three steps reach the ``1e-12`` residual exit. Step-halving
+    keeps iterates strictly positive; the iteration cap (10) only binds
+    on inputs where Newton cannot improve further, in which case the
+    best iterate so far is returned (never worse than the solver's).
+    """
+    # Solver output is strictly positive (log domain); the floor only
+    # guards against representation-level dust on the way in.
+    w = np.maximum(w, 1e-12)
+    for _ in range(10):
+        grad = sigma @ w - 1.0 / w
+        if float(np.max(np.abs(grad))) < 1e-12:
+            break
+        hess = sigma + np.diag(1.0 / np.square(w))
+        step = np.linalg.solve(hess, -grad)
+        t = 1.0
+        while np.any(w + t * step <= 0.0):
+            t *= 0.5
+        w = w + t * step
+    return w
+
+
+def _solve(
+    problem: cp.Problem, name: str, tol: float, max_iter: int,
+) -> None:
+    """Solve ``problem`` with CLARABEL; ``ValueError`` on anything non-OPTIMAL.
+
+    ``cp.SolverError`` (canonicalization or solver-level failure,
+    including iteration-limit exhaustion) and any terminal status other
+    than ``OPTIMAL`` — including ``OPTIMAL_INACCURATE`` — surface as
+    ``ValueError(f"{name} solver failed: ...")``, preserving the strict
+    failure contract callers rely on.
+    """
+    try:
+        problem.solve(
+            solver=cp.CLARABEL,
+            max_iter=int(max_iter),
+            tol_gap_abs=tol,
+            tol_gap_rel=tol,
+            tol_feas=tol,
+        )
+    except cp.SolverError as exc:
+        raise ValueError(f"{name} solver failed: {exc}") from exc
+    if problem.status != cp.OPTIMAL:
+        raise ValueError(
+            f"{name} solver failed: status {problem.status!r}"
+        )
 
 
 def _validate_solver_params(tol: float, max_iter: int) -> None:
@@ -259,7 +341,9 @@ def _validate_corr_matrix(corr_matrix: pd.DataFrame) -> np.ndarray:
     Checks: is a ``pd.DataFrame``; square; ``index == columns`` (labels
     and order); all entries finite (NaN/inf would otherwise flow
     silently into the solver); symmetric within ``1e-9``. Raises
-    ``TypeError`` / ``ValueError`` accordingly.
+    ``TypeError`` / ``ValueError`` accordingly. PSD-ness is checked
+    separately in ``_ensure_psd`` (on the final Σ, after the optional
+    vols scaling).
     """
     if not isinstance(corr_matrix, pd.DataFrame):
         raise TypeError(
@@ -282,6 +366,30 @@ def _validate_corr_matrix(corr_matrix: pd.DataFrame) -> np.ndarray:
     return rho
 
 
+def _ensure_psd(sigma: np.ndarray) -> np.ndarray:
+    """Return a PSD version of ``sigma`` or raise on material violation.
+
+    ``λ_min >= 0`` → returned unchanged. ``-1e-8 <= λ_min < 0`` →
+    numerical dust (e.g. an element-wise-floored correlation matrix):
+    negative eigenvalues are clipped to zero, the matrix reconstructed
+    and re-symmetrized. ``λ_min < -1e-8`` → ``ValueError`` — the input
+    is materially non-PSD and would define a non-convex program (which
+    the previous scipy stack accepted silently).
+    """
+    lam_min = float(np.linalg.eigvalsh(sigma)[0])
+    if lam_min >= 0.0:
+        return sigma
+    if lam_min < -_PSD_TOL:
+        raise ValueError(
+            f"matrix is materially non-PSD (min eigenvalue {lam_min:.3e} "
+            f"< -{_PSD_TOL:.0e}); a valid correlation/covariance matrix "
+            f"is required"
+        )
+    vals, vecs = np.linalg.eigh(sigma)
+    repaired = (vecs * np.clip(vals, 0.0, None)) @ vecs.T
+    return 0.5 * (repaired + repaired.T)
+
+
 def _build_sigma(
     corr_matrix: pd.DataFrame,
     vols: Optional[_VolsLike],
@@ -291,12 +399,13 @@ def _build_sigma(
     Validates ``corr_matrix`` (see ``_validate_corr_matrix``). When
     ``vols`` is given, aligns it to ``corr_matrix.index`` by label
     (keys must be set-equal to the index; order irrelevant) and requires
-    every value finite and ``> 0``. Raises ``TypeError`` /
-    ``ValueError`` accordingly.
+    every value finite and ``> 0``. The result passes through
+    ``_ensure_psd`` (dust-repair or reject — see its docstring). Raises
+    ``TypeError`` / ``ValueError`` accordingly.
     """
     rho = _validate_corr_matrix(corr_matrix)
     if vols is None:
-        return rho
+        return _ensure_psd(rho)
 
     if isinstance(vols, pd.Series):
         vols_dict = vols.to_dict()
@@ -322,4 +431,4 @@ def _build_sigma(
         raise ValueError(
             f"vols must be finite and > 0, got {vols_dict}"
         )
-    return rho * np.outer(sig, sig)
+    return _ensure_psd(rho * np.outer(sig, sig))

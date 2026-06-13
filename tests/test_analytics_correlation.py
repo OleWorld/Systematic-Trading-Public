@@ -170,3 +170,113 @@ def test_accepts_all_documented_methods():
     for m in ('pearson', 'spearman', 'kendall'):
         result = correlation_matrix(df, method=m)
         assert result.shape == (2, 2)
+
+
+# ──────────────────────────────────────────────
+# Ledoit-Wolf shrinkage
+# ──────────────────────────────────────────────
+
+def _noisy_frame(n_rows: int = 60, n_cols: int = 4, seed: int = 5) -> pd.DataFrame:
+    """Correlated noisy returns — small sample so LW intensity is > 0."""
+    rng = np.random.default_rng(seed=seed)
+    common = rng.normal(size=n_rows)
+    cols = {
+        f'c{i}': common + rng.normal(scale=1.5, size=n_rows)
+        for i in range(n_cols)
+    }
+    return pd.DataFrame(cols)
+
+
+def _sklearn_lw_corr(values: pd.DataFrame) -> np.ndarray:
+    """Reference: direct sklearn LedoitWolf fit + cov→corr conversion."""
+    from sklearn.covariance import LedoitWolf
+    cov = LedoitWolf().fit(values.to_numpy(dtype=float)).covariance_
+    d = np.sqrt(np.diag(cov))
+    corr = cov / np.outer(d, d)
+    np.fill_diagonal(corr, 1.0)
+    return corr
+
+
+def test_ledoit_wolf_matches_direct_sklearn_fit():
+    """Golden: shrinkage='ledoit_wolf' equals cov2corr of a direct sklearn fit."""
+    df = _noisy_frame()
+    m = correlation_matrix(df, shrinkage='ledoit_wolf')
+    np.testing.assert_allclose(m.to_numpy(), _sklearn_lw_corr(df), atol=1e-12)
+    assert list(m.index) == list(df.columns)
+    assert list(m.columns) == list(df.columns)
+
+
+def test_ledoit_wolf_output_is_valid_correlation_matrix():
+    """Unit diagonal, symmetric, strictly PD, entries in [-1, 1]."""
+    m = correlation_matrix(_noisy_frame(), shrinkage='ledoit_wolf')
+    arr = m.to_numpy()
+    np.testing.assert_allclose(np.diag(arr), 1.0)
+    np.testing.assert_allclose(arr, arr.T, atol=0.0)
+    assert np.all(arr >= -1.0) and np.all(arr <= 1.0)
+    assert np.linalg.eigvalsh(arr).min() > 0.0  # PD, not just PSD
+
+
+def test_ledoit_wolf_pulls_off_diagonals_toward_zero():
+    """Identity-target shrinkage shrinks every off-diagonal toward 0
+    (|shrunk| <= |sample| holds elementwise; strict on noisy data)."""
+    df = _noisy_frame()
+    sample = correlation_matrix(df).to_numpy()
+    shrunk = correlation_matrix(df, shrinkage='ledoit_wolf').to_numpy()
+    off = ~np.eye(len(df.columns), dtype=bool)
+    assert np.all(np.abs(shrunk[off]) < np.abs(sample[off]))
+
+
+def test_ledoit_wolf_attrs_expose_intensity():
+    """Fitted shrinkage coefficient is attached as attrs['lw_shrinkage']."""
+    df = _noisy_frame()
+    m = correlation_matrix(df, shrinkage='ledoit_wolf')
+    delta = m.attrs['lw_shrinkage']
+    assert 0.0 < delta <= 1.0
+    from sklearn.covariance import LedoitWolf
+    expected = LedoitWolf().fit(df.to_numpy(dtype=float)).shrinkage_
+    assert np.isclose(delta, expected)
+
+
+def test_ledoit_wolf_respects_lookback():
+    """Shrinkage on lookback=N equals a direct fit on the last N rows."""
+    df = _noisy_frame(n_rows=200)
+    m = correlation_matrix(df, lookback=60, shrinkage='ledoit_wolf')
+    np.testing.assert_allclose(
+        m.to_numpy(), _sklearn_lw_corr(df.iloc[-60:]), atol=1e-12,
+    )
+
+
+def test_ledoit_wolf_uses_listwise_deletion_for_nans():
+    """LW needs complete rows: NaN rows are dropped listwise (unlike the
+    pairwise unshrunk path), so the result equals a fit on df.dropna()."""
+    df = _noisy_frame()
+    df.iloc[3, 0] = np.nan
+    df.iloc[10, 2] = np.nan
+    m = correlation_matrix(df, shrinkage='ledoit_wolf')
+    np.testing.assert_allclose(
+        m.to_numpy(), _sklearn_lw_corr(df.dropna()), atol=1e-12,
+    )
+
+
+def test_ledoit_wolf_too_few_complete_rows_raises():
+    """Fewer than 2 complete rows after listwise deletion → ValueError."""
+    df = _frame(
+        a=np.array([1.0, np.nan, 2.0, np.nan]),
+        b=np.array([np.nan, 1.0, 3.0, np.nan]),
+    )
+    with pytest.raises(ValueError, match="complete rows"):
+        correlation_matrix(df, shrinkage='ledoit_wolf')
+
+
+def test_ledoit_wolf_requires_pearson():
+    """Shrinkage is covariance-based — only valid with method='pearson'."""
+    df = _noisy_frame()
+    for m in ('spearman', 'kendall'):
+        with pytest.raises(ValueError, match="method='pearson'"):
+            correlation_matrix(df, method=m, shrinkage='ledoit_wolf')
+
+
+def test_rejects_unknown_shrinkage():
+    df = _noisy_frame()
+    with pytest.raises(ValueError, match="shrinkage must be"):
+        correlation_matrix(df, shrinkage='bogus')

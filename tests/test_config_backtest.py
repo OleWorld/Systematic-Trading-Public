@@ -193,3 +193,18 @@ def test_idm_cap_below_one_rejected():
 def test_idm_cap_one_and_none_accepted():
     assert BacktestConfig(**_kwargs(idm_cap=1.0)).idm_cap == 1.0
     assert BacktestConfig(**_kwargs(idm_cap=None)).idm_cap is None
+
+
+def test_default_corr_shrinkage():
+    """Estimation hygiene on by default: Ledoit-Wolf shrink the inline rho."""
+    assert BacktestConfig(**_kwargs()).corr_shrinkage == 'ledoit_wolf'
+
+
+def test_corr_shrinkage_invalid_rejected():
+    for bad in ('oas', 'constant_correlation', ''):
+        with pytest.raises(ValueError, match="corr_shrinkage"):
+            BacktestConfig(**_kwargs(corr_shrinkage=bad))
+
+
+def test_corr_shrinkage_none_accepted():
+    assert BacktestConfig(**_kwargs(corr_shrinkage=None)).corr_shrinkage is None

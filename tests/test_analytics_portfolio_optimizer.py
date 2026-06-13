@@ -145,6 +145,23 @@ def test_min_variance_bound_activation_zeroes_diversification_drag():
     assert math.isclose(sum(w.values()), 1.0, abs_tol=1e-9)
 
 
+def test_min_variance_bound_weights_snap_to_exact_zero():
+    """Interior-point solvers approach an active bound asymptotically
+    (~1e-12 dust, never exact 0.0). Sub-threshold weights must come back
+    as EXACT zeros so downstream zero-weight semantics fire (the RM's
+    skip_reason='zero_weight' short-circuit keys on == 0, and dust
+    weights otherwise produce absurd 1e-12-contract orders)."""
+    rho = pd.DataFrame(
+        [[1.0, 0.7, 0.7],
+         [0.7, 1.0, 0.3],
+         [0.7, 0.3, 1.0]],
+        index=['A', 'B', 'C'], columns=['A', 'B', 'C'],
+    )
+    w = min_variance(rho)
+    assert w['A'] == 0.0    # exact — not just close
+    assert math.isclose(sum(w.values()), 1.0, abs_tol=1e-12)
+
+
 def test_min_variance_with_vols_matches_two_asset_closed_form():
     """Two-asset covariance min-var closed form:
     w1 = (σ2² − ρσ1σ2) / (σ1² + σ2² − 2ρσ1σ2)."""
@@ -254,14 +271,15 @@ def test_min_variance_bad_solver_params_raise():
         min_variance(rho, max_iter=0)
 
 
+@pytest.mark.filterwarnings("ignore::UserWarning")  # cvxpy warns pre-raise
 def test_min_variance_solver_failure_raises():
-    """An iteration budget too small to converge surfaces as ValueError."""
-    rho = pd.DataFrame(
-        [[1.0, 0.9, 0.9],
-         [0.9, 1.0, 0.0],
-         [0.9, 0.0, 1.0]],
-        index=['A', 'B', 'C'], columns=['A', 'B', 'C'],
-    )
+    """An iteration budget too small to converge surfaces as ValueError.
+
+    (The pre-CVXPY fixture here was a materially non-PSD matrix that
+    merely stalled SLSQP; that input is now rejected up front by the PSD
+    validation, so failure is injected on a *valid* matrix instead.)
+    """
+    rho = _random_pd_corr(['A', 'B', 'C', 'D', 'E'], seed=5)
     with pytest.raises(ValueError, match="solver failed"):
         min_variance(rho, max_iter=1)
 
@@ -349,7 +367,72 @@ def test_risk_parity_bad_solver_params_raise():
         risk_parity(rho, max_iter=0)
 
 
+@pytest.mark.filterwarnings("ignore::UserWarning")  # cvxpy warns pre-raise
 def test_risk_parity_solver_failure_raises():
     rho = _random_pd_corr(['A', 'B', 'C', 'D', 'E'], seed=3)
     with pytest.raises(ValueError, match="solver failed"):
         risk_parity(rho, max_iter=1)
+
+
+# ──────────────────────────────────────────────
+# PSD validation / repair (shared via _build_sigma)
+# ──────────────────────────────────────────────
+
+def test_min_variance_repairs_eps_non_psd_matrix():
+    """λ_min barely below zero (numerical dust, e.g. a floored matrix) is
+    repaired by eigenvalue clipping, not rejected. Uniform off-diag just
+    under -1/2 on N=3 puts λ_min ≈ -4e-11."""
+    rho = _corr(['a', 'b', 'c'], off_diag=-0.5 - 2e-11)
+    assert np.linalg.eigvalsh(rho.to_numpy()).min() < 0  # genuinely non-PSD
+    w = min_variance(rho)
+    assert math.isclose(sum(w.values()), 1.0, abs_tol=1e-9)
+    for label in ('a', 'b', 'c'):
+        assert w[label] >= 0
+        assert math.isclose(w[label], 1.0 / 3.0, abs_tol=1e-6)  # symmetry
+
+
+def test_min_variance_materially_non_psd_raises():
+    """λ_min far below tolerance (-0.2 here) is a broken input, not dust —
+    it would silently define a non-convex QP. Must raise."""
+    rho = _corr(['a', 'b', 'c'], off_diag=-0.6)  # λ_min = 1 - 1.2 = -0.2
+    with pytest.raises(ValueError, match="non-PSD"):
+        min_variance(rho)
+
+
+def test_risk_parity_materially_non_psd_raises():
+    """risk_parity shares the PSD validation via _build_sigma."""
+    rho = _corr(['a', 'b', 'c'], off_diag=-0.6)
+    with pytest.raises(ValueError, match="non-PSD"):
+        risk_parity(rho)
+
+
+# ──────────────────────────────────────────────
+# Near-singular robustness (high-dimensional regime)
+# ──────────────────────────────────────────────
+
+def _near_singular_sample_corr(n_assets=100, n_obs=61, seed=42):
+    """Sample correlation of more assets than observations — rank-deficient
+    (rank <= n_obs - 1), the regime that motivated the CVXPY migration."""
+    rng = np.random.default_rng(seed)
+    common = rng.normal(size=(n_obs, 1))
+    data = common * rng.uniform(0.2, 1.0, size=n_assets) \
+        + rng.normal(size=(n_obs, n_assets))
+    labels = [f's{i}' for i in range(n_assets)]
+    m = np.corrcoef(data, rowvar=False)
+    return pd.DataFrame(m, index=labels, columns=labels)
+
+
+def test_min_variance_solves_near_singular_100x100():
+    rho = _near_singular_sample_corr()
+    w = min_variance(rho)
+    arr = np.array(list(w.values()))
+    assert math.isclose(arr.sum(), 1.0, abs_tol=1e-9)
+    assert np.all(arr >= 0)
+
+
+def test_risk_parity_solves_near_singular_100x100():
+    rho = _near_singular_sample_corr()
+    w = risk_parity(rho)
+    arr = np.array(list(w.values()))
+    assert math.isclose(arr.sum(), 1.0, abs_tol=1e-9)
+    assert np.all(arr > 0)
