@@ -17,7 +17,7 @@ config = BacktestConfig(
     # For multi-TF: timeframes={'1m': 500, '1h': 500, '4h': 200},
     initial_capital=1_000_000.0,
     leverage=5.0,
-    annualized_target_vol=250_000.0,        # Carver τ — REQUIRED; units depend on vol_target_mode
+    annual_target_vol=250_000.0,        # Carver τ — REQUIRED; units depend on vol_target_mode
     vol_target_mode='dollar_volatility',    # 'dollar_volatility' (fixed annual $ vol budget — default)
                                             # or 'percent_volatility' (fraction of equity, e.g. 0.25)
     position_buffer=0.25,         # Carver §10.7 dead-band (0.0 trades every gap)
@@ -75,18 +75,18 @@ class MyStrategy(Strategy):
 
 ```text
 # vol_target_mode='dollar_volatility' (default — fixed annual $ vol budget):
-target_qty = (IDM × weight × annualized_target_vol × forecast / 50)
-             / annualized_$_vol
+target_qty = (IDM × weight × annual_target_vol × forecast / 50)
+             / annual_$_vol
 
 # vol_target_mode='percent_volatility' (τ as a fraction of current equity):
-target_qty = (capital × IDM × weight × annualized_target_vol × forecast / 50)
-             / annualized_$_vol
+target_qty = (capital × IDM × weight × annual_target_vol × forecast / 50)
+             / annual_$_vol
 ```
 
 So `|forecast| = 50` reproduces Carver's basic vol target and `|forecast| = 100`
 doubles it. The knobs you tune live on `BacktestConfig`:
 
-- `annualized_target_vol` — Carver's τ (REQUIRED, no default). A dollar amount
+- `annual_target_vol` — Carver's τ (REQUIRED, no default). A dollar amount
   (e.g. `250_000`) under `'dollar_volatility'` — the cash-vol budget stays fixed
   as the account grows/shrinks (institutional futures convention: the risk limit
   is a dollar number reset periodically). A fraction in `(0, 1)` (e.g. `0.25`)
@@ -155,7 +155,7 @@ vol_estimator = EWMAVolEstimator(config.symbols, data_handler=data_handler,
                                  timeframe='1d', span=36)
 risk_manager  = CarverVolTargetingRiskManager(portfolio, strategy, vol_estimator,
                                               data_handler=data_handler,
-                                              annualized_target_vol=config.annualized_target_vol,
+                                              annual_target_vol=config.annual_target_vol,
                                               vol_target_mode=config.vol_target_mode,
                                               position_buffer=config.position_buffer)
 execution     = BacktestExecution(events_queue,

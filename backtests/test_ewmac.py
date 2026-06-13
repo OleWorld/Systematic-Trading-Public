@@ -50,7 +50,7 @@ config = BacktestConfig(
     end_date='2026-04-23',
     base_timeframe='1d',
     days_convention='calendar',             # data-driven: crypto is 24/7 → 365 d/y
-    timeframes={'1d': 5000},
+    timeframes={'1d': 500},
 
     instrument_weight_mode='min_variance',
     corr_mode='absolute_price_chg',         # futures default: .diff() correlations
@@ -60,9 +60,9 @@ config = BacktestConfig(
     initial_capital=10_000_000,
     leverage=10.0,
     vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
-    annualized_target_vol=1_000_000,        # $1M annual vol
+    annual_target_vol=1_000_000,        # $1M annual vol
     position_buffer=0.25,
-    
+
     slippage_mode='absolute',               # futures default: $ per unit
     slippage_value=0.0,                     # default 0.0 — one fixed tick can't fit BTC & DOGE scales
     commission_mode='per_contract',         # futures default: $ per contract
@@ -111,7 +111,7 @@ vol_estimator = EWMAVolEstimator(
 risk_manager = CarverVolTargetingRiskManager(
     portfolio, strategy, vol_estimator,
     data_handler=data_handler,
-    annualized_target_vol=config.annualized_target_vol,
+    annual_target_vol=config.annual_target_vol,
     vol_target_mode=config.vol_target_mode,
     position_buffer=config.position_buffer,
     instrument_weight_mode=config.instrument_weight_mode,
@@ -249,15 +249,15 @@ if not riskmanager_records.empty:
 
 # import plotly.express as px
 # import pandas as pd
-# df = bt.strategy.get_records("BTC_USDT:USDT")
+# symbol = 'DOGE_USDT:USDT'
+# df = bt.strategy.get_records(symbol)
 # fig = plot_strategy(df,
 #                     indicators={'fast_ema_16_64': 1, 'slow_ema_16_64': 1,
-#                                 'forecast_16_64': 2, 'forecast_32_128': 2,
-#                                 'forecast_64_256': 2, 'forecast': 2},
-#                     title='BTC_USDT:USDT EWMAC', timeframe='1d')
-# fig.show(config=dict({'scrollZoom':True}))
+#                                 'forecast': 2},
+#                     title=f'{symbol} EWMAC', timeframe='1d')
+# fig.show(config=dict({'scrollZoom':True}), renderer='browser')
 
-
+# import plotly.express as px
 # total = (
 #     pd.DataFrame(equity_df['realized_pnl'].tolist(),   index=equity_df.index)
 #     + pd.DataFrame(equity_df['unrealized_pnl'].tolist(), index=equity_df.index)
@@ -268,18 +268,22 @@ if not riskmanager_records.empty:
 # fig = px.line(equity_df[['account_balance', 'available_balance']].resample('d').last())
 # fig.show(renderer='browser')
 
+# import plotly.express as px
 # list_weights = []
 # for x in bt.risk_manager.get_live_symbols():
 #     weight = bt.risk_manager.get_records(x)['instrument_weight'].astype(float)
 #     weight.name = x
 #     list_weights.append( weight )
 # df_weight = pd.concat(list_weights, axis=1)
-# px.line(df_weight)
+# fig = px.line(df_weight)
+# fig.show(renderer='browser')
 
+# from analytics import correlation_matrix
 # list_close = []
 # for x in bt.risk_manager.get_live_symbols():
 #     close = bt.strategy.get_records(x)['close'].astype(float)
 #     close.name = x
 #     list_close.append( close )
 # df_close = pd.concat(list_close, axis=1)
-# correlation_matrix(df_close.diff().dropna(), lookback=60)
+# corr_matrix = correlation_matrix(df_close.diff().dropna(), lookback=60)
+# corr_matrix = correlation_matrix(df_close.diff().dropna(), lookback=60, shrinkage='ledoit_wolf')

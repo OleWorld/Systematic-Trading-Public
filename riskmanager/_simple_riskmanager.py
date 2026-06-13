@@ -37,8 +37,11 @@ class SimpleRiskManager(RiskManager):
     every completed bar appends one row to ``self._records[symbol]``.
     Columns: ``forecast``, ``price``, ``size_mode``, ``position_size``,
     ``target_qty``, ``current_qty``, ``trade_qty``, ``submitted``
-    (bool), and ``skip_reason`` ∈ ``{None, 'no_price', 'at_target'}``.
-    Read via ``risk_manager.get_records(symbol)``.
+    (bool), and ``skip_reason`` ∈
+    ``{None, 'no_price', 'warmup_forecast', 'at_target'}``
+    (``'warmup_forecast'`` — the strategy has not cached a forecast yet,
+    so ``get_forecast`` returns ``None``). Read via
+    ``risk_manager.get_records(symbol)``.
 
     For calibrated continuous forecasts (e.g. EWMAC), use
     ``CarverVolTargetingRiskManager`` instead — it scales the notional
@@ -137,8 +140,10 @@ class SimpleRiskManager(RiskManager):
         """Map forecast sign + sizing mode to a signed target quantity.
 
         Owns the ``'no_price'`` skip (price missing or zero in the
-        portfolio). ``forecast == 0`` returns ``target_qty = 0.0``
-        with ``skip_reason = None`` — a valid flat target, not a skip.
+        portfolio) and the ``'warmup_forecast'`` skip (``get_forecast``
+        returns ``None`` before the strategy's first cached forecast).
+        ``forecast == 0`` returns ``target_qty = 0.0`` with
+        ``skip_reason = None`` — a valid flat target, not a skip.
 
         Uses ``abs(price)`` in the divides so negative-priced
         instruments (e.g. WTI 2020) produce a sensible magnitude — the
@@ -159,6 +164,11 @@ class SimpleRiskManager(RiskManager):
         out['price'] = price
 
         forecast = self.strategy.get_forecast(symbol)
+        if forecast is None:
+            # No forecast cached yet (warmup). Skip before the sign logic,
+            # which would raise on None ( ``None > 0`` is a TypeError).
+            out['skip_reason'] = 'warmup_forecast'
+            return out
         if forecast == 0:
             out['target_qty'] = 0.0
             return out

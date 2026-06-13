@@ -163,13 +163,13 @@ def test_default_span_is_36():
 
 def test_warmup_returns_none_before_first_bar():
     est, _ = _make_estimator(['BTC'], bars_per_year=365, span=5)
-    assert est.get_annualized_vol('BTC') is None
+    assert est.get_annual_vol('BTC') is None
 
 
 def test_warmup_returns_none_after_only_seed_bar():
     est, stub = _make_estimator(['BTC'], bars_per_year=365, span=5)
     _push_series(est, stub, 'BTC', [100.0])
-    assert est.get_annualized_vol('BTC') is None
+    assert est.get_annual_vol('BTC') is None
 
 
 def test_warmup_returns_none_at_span_plus_one_bars():
@@ -180,7 +180,7 @@ def test_warmup_returns_none_at_span_plus_one_bars():
     # _outputs[-2] is still NaN. `.latest` returns NaN-payload → None.
     _push_series(est, stub, 'BTC',
                  [100.0 + i for i in range(span + 1)])
-    assert est.get_annualized_vol('BTC') is None
+    assert est.get_annual_vol('BTC') is None
 
 
 def test_warmup_first_valid_at_span_plus_two_bars():
@@ -189,7 +189,7 @@ def test_warmup_first_valid_at_span_plus_two_bars():
     # 1 seed + (span+1) price changes → first finalized stdev at `.latest`.
     _push_series(est, stub, 'BTC',
                  [100.0 + i for i in range(span + 2)])
-    sigma = est.get_annualized_vol('BTC')
+    sigma = est.get_annual_vol('BTC')
     assert sigma is not None
     assert not math.isnan(sigma)
 
@@ -216,7 +216,7 @@ def test_ewma_matches_pandas_reference():
     ewm_stdev = ewm_var.pow(0.5)
     expected_sigma = float(ewm_stdev.iloc[-2])
 
-    sigma = est.get_annualized_vol('BTC')
+    sigma = est.get_annual_vol('BTC')
     assert sigma is not None
     # bars_per_year=1 → sqrt(1)=1 → no scaling.
     assert math.isclose(sigma, expected_sigma, rel_tol=1e-12)
@@ -230,8 +230,8 @@ def test_annualization_scaling_365():
     _push_series(est_unscaled, stub_u, 'BTC', closes)
     _push_series(est_daily, stub_d, 'BTC', closes)
 
-    s_unscaled = est_unscaled.get_annualized_vol('BTC')
-    s_daily = est_daily.get_annualized_vol('BTC')
+    s_unscaled = est_unscaled.get_annual_vol('BTC')
+    s_daily = est_daily.get_annual_vol('BTC')
     assert s_unscaled is not None and s_daily is not None
     assert math.isclose(s_daily, s_unscaled * math.sqrt(365.0), rel_tol=1e-9)
 
@@ -245,8 +245,8 @@ def test_annualization_scaling_4h():
     _push_series(est_unscaled, stub_u, 'BTC', closes)
     _push_series(est_4h, stub_4h, 'BTC', closes)
 
-    s_unscaled = est_unscaled.get_annualized_vol('BTC')
-    s_4h = est_4h.get_annualized_vol('BTC')
+    s_unscaled = est_unscaled.get_annual_vol('BTC')
+    s_4h = est_4h.get_annual_vol('BTC')
     assert s_unscaled is not None and s_4h is not None
     assert math.isclose(s_4h, s_unscaled * math.sqrt(365.0 * 6), rel_tol=1e-9)
 
@@ -257,7 +257,7 @@ def test_zero_vol_input_returns_zero_not_nan():
     span = 3
     est, stub = _make_estimator(['BTC'], bars_per_year=365, span=span)
     _push_series(est, stub, 'BTC', [100.0] * (span + 2))
-    sigma = est.get_annualized_vol('BTC')
+    sigma = est.get_annual_vol('BTC')
     assert sigma is not None
     assert sigma == 0.0
 
@@ -291,14 +291,14 @@ def test_forming_bars_are_ignored():
                          .pow(0.5))
     expected = float(ewm.iloc[-2])
 
-    sigma = est.get_annualized_vol('BTC')
+    sigma = est.get_annual_vol('BTC')
     assert sigma is not None
     assert math.isclose(sigma, expected, rel_tol=1e-12)
 
 
 def test_unknown_symbol_returns_none_silently():
     est, _ = _make_estimator(['BTC'], bars_per_year=365, span=3)
-    assert est.get_annualized_vol('ETH') is None
+    assert est.get_annual_vol('ETH') is None
 
 
 def test_unknown_symbol_update_is_no_op():
@@ -306,8 +306,8 @@ def test_unknown_symbol_update_is_no_op():
     t0 = datetime(2026, 1, 1)
     stub.add_close('ETH', t0, 100.0, timeframe='1d')
     est.update(_bar('ETH', t0, 100.0))
-    assert est.get_annualized_vol('ETH') is None
-    assert est.get_annualized_vol('BTC') is None
+    assert est.get_annual_vol('ETH') is None
+    assert est.get_annual_vol('BTC') is None
 
 
 def test_zero_prior_close_is_not_special():
@@ -330,7 +330,7 @@ def test_zero_prior_close_is_not_special():
                          .pow(0.5))
     expected = float(ewm.iloc[-2])
 
-    sigma = est.get_annualized_vol('BTC')
+    sigma = est.get_annual_vol('BTC')
     assert sigma is not None
     assert math.isclose(sigma, expected, rel_tol=1e-12)
 
@@ -350,8 +350,8 @@ def test_multi_symbol_isolation():
         est.update(_bar('BTC', ts, b))
         est.update(_bar('ETH', ts, e))
 
-    btc_sigma = est.get_annualized_vol('BTC')
-    eth_sigma = est.get_annualized_vol('ETH')
+    btc_sigma = est.get_annual_vol('BTC')
+    eth_sigma = est.get_annual_vol('ETH')
     assert btc_sigma is not None and eth_sigma is not None
 
     def _expected(closes):
@@ -395,7 +395,7 @@ def test_sigma_invariant_to_event_cadence():
         ['BTC'], bars_per_year=365, span=span, timeframe='1d',
     )
     _push_series(est_1d, stub_1d, 'BTC', daily_closes, timeframe='1d')
-    sigma_1d = est_1d.get_annualized_vol('BTC')
+    sigma_1d = est_1d.get_annual_vol('BTC')
 
     # --- (b) 1h-cadence events with same 1d series in the stub ------
     # For each day D, register the day's close in the stub at '1d'
@@ -416,7 +416,7 @@ def test_sigma_invariant_to_event_cadence():
         for h in range(24):
             hour_ts = day_ts + timedelta(hours=h)
             est_1h.update(_bar('BTC', hour_ts, close))
-    sigma_1h = est_1h.get_annualized_vol('BTC')
+    sigma_1h = est_1h.get_annual_vol('BTC')
 
     assert sigma_1d is not None and sigma_1h is not None
     assert math.isclose(sigma_1d, sigma_1h, rel_tol=1e-12)

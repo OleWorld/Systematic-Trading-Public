@@ -97,9 +97,11 @@ class Strategy(ABC):
         """
         self.data_handler = data_handler
         self.symbol_list = symbol_list
-        # Per-symbol cached forecast in [-100, +100], default 0.0 (flat).
-        # The risk manager reads this dict on every completed bar.
-        self.forecasts: Dict[str, float] = {s: 0.0 for s in symbol_list}
+        # Per-symbol cached forecast in [-100, +100]. Default None means
+        # "no forecast cached yet" (warmup) — distinct from a genuine flat
+        # forecast of 0.0. The risk manager reads this dict on every
+        # completed bar via get_forecast().
+        self.forecasts: Dict[str, Optional[float]] = {s: None for s in symbol_list}
         # Per-symbol warmup flag: False until the first non-NaN forecast
         # is cached for the symbol, then True forever (monotone). This is
         # the *measured* end-of-warmup signal the risk manager's universe
@@ -159,13 +161,18 @@ class Strategy(ABC):
         """
         raise NotImplementedError
 
-    def get_forecast(self, symbol: str) -> float:
-        """Return the cached forecast for ``symbol`` (default ``0.0``).
+    def get_forecast(self, symbol: str) -> Optional[float]:
+        """Return the cached forecast for ``symbol``, or ``None`` if none yet.
 
-        The risk manager calls this on every completed bar to derive the
-        target position. Unknown symbols silently return ``0.0``.
+        ``None`` means no real forecast has been cached (warmup) — distinct
+        from a genuine flat forecast of ``0.0``. The risk manager calls this
+        on every completed bar to derive the target position; its liveness
+        gate keeps weight off un-warmed symbols, so the sizing arithmetic
+        never sees ``None``. Mirrors ``VolEstimator.get_annual_vol`` which
+        likewise returns ``None`` while warming up. Unknown symbols return
+        ``None``.
         """
-        return self.forecasts.get(symbol, 0.0)
+        return self.forecasts.get(symbol)
 
     def is_warmed_up(self, symbol: str) -> bool:
         """Return True once ``symbol`` has produced its first non-NaN forecast.

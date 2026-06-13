@@ -20,7 +20,7 @@ def _kwargs(**overrides):
         end_date='2024-12-31',
         base_timeframe='1d',
         days_convention='calendar',
-        annualized_target_vol=0.25,     # required since the futures-first refactor
+        annual_target_vol=0.25,     # required since the futures-first refactor
     )
     base.update(overrides)
     return base
@@ -83,36 +83,36 @@ def test_default_vol_target_mode_is_dollar_volatility():
     assert cfg.vol_target_mode == 'dollar_volatility'
 
 
-def test_none_annualized_target_vol_rejected():
+def test_none_annual_target_vol_rejected():
     """tau has no default — omitting it must fail at config construction."""
     kwargs = _kwargs()
-    kwargs.pop('annualized_target_vol', None)
-    with pytest.raises(ValueError, match="annualized_target_vol"):
+    kwargs.pop('annual_target_vol', None)
+    with pytest.raises(ValueError, match="annual_target_vol"):
         BacktestConfig(**kwargs)
 
 
 def test_percent_mode_range_validation():
     for bad in (0.0, 1.0, -0.1):
-        with pytest.raises(ValueError, match="annualized_target_vol"):
+        with pytest.raises(ValueError, match="annual_target_vol"):
             BacktestConfig(**_kwargs(
                 vol_target_mode='percent_volatility',
-                annualized_target_vol=bad,
+                annual_target_vol=bad,
             ))
 
 
 def test_dollar_mode_accepts_large_tau():
     cfg = BacktestConfig(**_kwargs(
         vol_target_mode='dollar_volatility',
-        annualized_target_vol=250_000.0,
+        annual_target_vol=250_000.0,
     ))
-    assert cfg.annualized_target_vol == 250_000.0
+    assert cfg.annual_target_vol == 250_000.0
 
 
 def test_dollar_mode_rejects_non_positive_tau():
-    with pytest.raises(ValueError, match="annualized_target_vol"):
+    with pytest.raises(ValueError, match="annual_target_vol"):
         BacktestConfig(**_kwargs(
             vol_target_mode='dollar_volatility',
-            annualized_target_vol=0.0,
+            annual_target_vol=0.0,
         ))
 
 

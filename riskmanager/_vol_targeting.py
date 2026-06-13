@@ -9,27 +9,27 @@ give the size:
     # convention: a fixed annual $ vol budget, like a drawdown limit that
     # resets yearly instead of compounding with the account):
     annual_cash_target = IDM × strategy_weight × instrument_weight
-                                × annualized_target_vol × (forecast / TARGET_AVG_ABS_FORECAST)
+                                × annual_target_vol × (forecast / TARGET_AVG_ABS_FORECAST)
 
     # vol_target_mode='percent_volatility' (Carver's original form — the
     # vol budget is a fraction of *current* account equity, so position
     # sizes compound as the account grows/shrinks):
     annual_cash_target = capital × IDM × strategy_weight × instrument_weight
-                                × annualized_target_vol × (forecast / TARGET_AVG_ABS_FORECAST)
+                                × annual_target_vol × (forecast / TARGET_AVG_ABS_FORECAST)
 
     daily_cash_target  = annual_cash_target / sqrt(days_per_year)
     target_qty         = daily_cash_target / daily_price_vol
-                       = annual_cash_target / annualized_price_vol
+                       = annual_cash_target / annual_price_vol
 
 where:
     capital                = portfolio.calculate_balance()              (account equity)
     IDM                    = instrument diversification multiplier      (constructor)
     strategy_weight        = per-strategy capital weight                (self.strategy_weight)
     instrument_weight      = per-symbol capital weight                  (self.instrument_weight)
-    annualized_target_vol  = annualized vol target                      (constructor; REQUIRED —
+    annual_target_vol  = annualized vol target                      (constructor; REQUIRED —
                              $ amount in dollar mode, e.g. 250_000;
                              fraction of equity in percent mode, e.g. 0.25 = 25 %)
-    annualized_price_vol   = annualized stdev of price changes ($-units)  (VolEstimator)
+    annual_price_vol   = annualized stdev of price changes ($-units)  (VolEstimator)
     forecast               = strategy.get_forecast(symbol) ∈ [-FORECAST_CAP, +FORECAST_CAP]
 
 The two equalities for ``target_qty`` are algebraically equivalent: the
@@ -44,7 +44,7 @@ cleanly to instruments where percent change is undefined or meaningless
 — futures spreads (price can cross zero), instruments quoted in
 basis-point terms, synthetic legs. For positive-price single
 instruments the result is identical to the old
-``annualized_target_vol / σ_pct`` form (``σ_$ = price × σ_pct``).
+``annual_target_vol / σ_pct`` form (``σ_$ = price × σ_pct``).
 
 ``TARGET_AVG_ABS_FORECAST`` and ``FORECAST_CAP`` are project-wide
 constants on ``Strategy`` (default ``50.0`` and ``100.0``). The
@@ -75,8 +75,10 @@ member contributes the complete correlation window, so the estimation
 window never shrinks) and (2) ``strategy.is_warmed_up(symbol)`` is True
 (strategy gate — the measured flag the ``Strategy`` base sets when the
 first non-NaN forecast is cached). Non-live symbols are absent from
-``instrument_weight`` and skip sizing with ``skip_reason='not_live'``;
-live weights sum to 1 across the live subset. The live set is monotone
+``instrument_weight`` and skip sizing with a ``skip_reason`` naming the
+warmup stage they're in (``'warmup_forecast'`` / ``'warmup_correlation'``
+/ ``'warmup_weight'`` — see ``_classify_warmup_reason``); live weights
+sum to 1 across the live subset. The live set is monotone
 non-decreasing during a backtest. Delisting/universe-exit handling is
 future work.
 
@@ -179,14 +181,19 @@ class CarverVolTargetingRiskManager(RiskManager):
     completed bar appends one row to ``self._records[symbol]`` and emits
     a DEBUG log line. Columns capture all sizing inputs and
     intermediates (``forecast``, ``sigma``, ``instrument_weight``,
-    ``strategy_weight``, ``capital``, ``idm``, ``annualized_target_vol``,
+    ``strategy_weight``, ``capital``, ``idm``, ``annual_target_vol``,
     ``position_buffer``, ``annual_cash_target``, ``target_qty``,
     ``current_qty``, ``trade_qty``, ``buffer_threshold``) plus
     ``submitted`` (bool) and ``skip_reason`` — ``None`` when an order
-    was submitted, otherwise one of ``'warmup'``, ``'zero_vol'``,
-    ``'not_live'`` (symbol absent from ``instrument_weight`` — outside
-    the current tradable universe per the liveness gate),
-    ``'zero_weight'``, ``'dead_band'``, ``'at_target'``. Read via
+    was submitted, otherwise one of the warmup labels
+    ``'warmup_volatility'`` (sigma not ready), ``'warmup_forecast'``
+    (strategy has no forecast yet), ``'warmup_correlation'`` (fewer than
+    ``corr_lookback`` bars), ``'warmup_weight'`` (ready but no weight
+    assigned yet — recalc lag); or the substantive skips ``'zero_vol'``,
+    ``'zero_weight'``, ``'dead_band'``, ``'at_target'``. Symbols absent
+    from ``instrument_weight`` (outside the tradable universe per the
+    liveness gate) carry one of the three universe warmup labels with
+    ``instrument_weight`` left ``None``. Read via
     ``risk_manager.get_records(symbol)``.
     """
 
@@ -198,7 +205,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         data_handler: _DataHandlerLike,
         idm: float = 1.0,
         idm_cap: Optional[float] = 2.5,
-        annualized_target_vol: Optional[float] = None,
+        annual_target_vol: Optional[float] = None,
         vol_target_mode: str = 'dollar_volatility',
         position_buffer: float = 0.25,
         instrument_weight_mode: str = 'equal_weight',
@@ -219,7 +226,7 @@ class CarverVolTargetingRiskManager(RiskManager):
             Read on every completed bar (forecast) and at construction
             (symbol_list, for the equal-weight default).
         vol_estimator
-            ``VolEstimator`` providing ``get_annualized_vol(symbol)`` in
+            ``VolEstimator`` providing ``get_annual_vol(symbol)`` in
             price (cash) units. Updated by ``update_bar`` on every
             completed bar.
         data_handler
@@ -250,7 +257,7 @@ class CarverVolTargetingRiskManager(RiskManager):
             Direct assignments to ``self.idm`` by subclasses or
             downstream code are NOT capped — the same owner-may-
             overwrite convention as the weight dicts.
-        annualized_target_vol
+        annual_target_vol
             Annualized volatility target (Carver's ``τ``). REQUIRED —
             no default; its units depend on ``vol_target_mode``:
             a dollar amount (must be ``> 0``, e.g. ``250_000`` = $250k
@@ -258,7 +265,7 @@ class CarverVolTargetingRiskManager(RiskManager):
             of current account equity (must be in ``(0, 1)``, e.g.
             ``0.25`` = 25 %) under ``'percent_volatility'``.
         vol_target_mode
-            How ``annualized_target_vol`` is interpreted. One of:
+            How ``annual_target_vol`` is interpreted. One of:
 
             * ``'dollar_volatility'`` (default) — fixed annual dollar
               vol budget; the cash target does NOT scale with account
@@ -377,23 +384,23 @@ class CarverVolTargetingRiskManager(RiskManager):
                 f"Unknown vol_target_mode: {vol_target_mode!r}. "
                 "Must be 'dollar_volatility' or 'percent_volatility'."
             )
-        if annualized_target_vol is None:
+        if annual_target_vol is None:
             raise ValueError(
-                "annualized_target_vol must be supplied explicitly (no "
+                "annual_target_vol must be supplied explicitly (no "
                 "default): a dollar amount under 'dollar_volatility' or "
                 "a fraction in (0, 1) under 'percent_volatility'."
             )
         if vol_target_mode == 'percent_volatility':
-            if not (0 < annualized_target_vol < 1):
+            if not (0 < annual_target_vol < 1):
                 raise ValueError(
-                    f"annualized_target_vol must be in (0, 1) under "
-                    f"'percent_volatility', got {annualized_target_vol}"
+                    f"annual_target_vol must be in (0, 1) under "
+                    f"'percent_volatility', got {annual_target_vol}"
                 )
         elif vol_target_mode == 'dollar_volatility':
-            if annualized_target_vol <= 0:
+            if annual_target_vol <= 0:
                 raise ValueError(
-                    f"annualized_target_vol must be > 0 under "
-                    f"'dollar_volatility', got {annualized_target_vol}"
+                    f"annual_target_vol must be > 0 under "
+                    f"'dollar_volatility', got {annual_target_vol}"
                 )
         else:
             raise ValueError(
@@ -451,7 +458,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         self.idm = idm
         self.idm_cap = idm_cap
         # Narrowed to float by the None-rejection above.
-        self.annualized_target_vol: float = annualized_target_vol
+        self.annual_target_vol: float = annual_target_vol
         self.vol_target_mode = vol_target_mode
         self.position_buffer = position_buffer
         self.corr_lookback = corr_lookback
@@ -486,15 +493,44 @@ class CarverVolTargetingRiskManager(RiskManager):
         self.calculate_instrument_weight()
         self.calculate_strategy_weight()
 
+    def _data_gate_met(self, symbol: str) -> bool:
+        """True once ``symbol`` carries the full ``corr_lookback`` bars at
+        ``corr_timeframe`` — the data half of the liveness gate, and the
+        ``warmup_correlation`` boundary. ``get_latest_bars`` returns *up
+        to* n rows, so ``len == corr_lookback`` means at least that many
+        are available (count includes the current forming bar)."""
+        return len(self.data_handler.get_latest_bars(
+            symbol, self.corr_lookback, timeframe=self.corr_timeframe,
+        )) >= self.corr_lookback
+
+    def _classify_warmup_reason(self, symbol: str) -> str:
+        """Classify why a symbol absent from ``instrument_weight`` cannot be
+        sized, in precedence order **forecast → correlation → weight**:
+
+        * ``'warmup_forecast'`` — the strategy has not cached a forecast
+          yet (``not is_warmed_up``); the most fundamental prerequisite,
+          checked first.
+        * ``'warmup_correlation'`` — forecast ready but the data gate is
+          unmet (fewer than ``corr_lookback`` bars at ``corr_timeframe``).
+        * ``'warmup_weight'`` — both gates pass but no weight is assigned
+          yet (the periodic walk-forward recalc hasn't picked the symbol
+          up, or the universe is still empty at construction).
+
+        Swap the first two checks to flip the precedence.
+        """
+        if not self.strategy.is_warmed_up(symbol):
+            return 'warmup_forecast'
+        if not self._data_gate_met(symbol):
+            return 'warmup_correlation'
+        return 'warmup_weight'
+
     def get_live_symbols(self) -> List[str]:
         """Return the symbols currently in the tradable universe.
 
         A symbol is *live* when both gates pass:
 
-        1. **Data gate** — it has the full ``corr_lookback`` bars at
-           ``corr_timeframe`` (``get_latest_bars`` returns *up to* n
-           rows, so ``len == corr_lookback`` means "at least that many
-           available"; the count includes the current forming bar).
+        1. **Data gate** — ``_data_gate_met``: it has the full
+           ``corr_lookback`` bars at ``corr_timeframe``.
         2. **Strategy gate** — ``strategy.is_warmed_up(symbol)``: the
            strategy has cached its first non-NaN forecast for the
            symbol, so it can actually trade it.
@@ -505,10 +541,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         """
         return [
             s for s in self.strategy.symbol_list
-            if len(self.data_handler.get_latest_bars(
-                s, self.corr_lookback, timeframe=self.corr_timeframe,
-            )) >= self.corr_lookback
-            and self.strategy.is_warmed_up(s)
+            if self._data_gate_met(s) and self.strategy.is_warmed_up(s)
         ]
 
     def calculate_instrument_weight(
@@ -529,7 +562,8 @@ class CarverVolTargetingRiskManager(RiskManager):
 
         Weights cover the **live subset** only (see ``get_live_symbols``)
         and sum to 1 across it; non-live symbols are absent from the
-        dict and skip sizing with ``skip_reason='not_live'``.
+        dict and skip sizing with a ``warmup_*`` ``skip_reason`` naming
+        the stage they're in (see ``_classify_warmup_reason``).
 
         Parameters
         ----------
@@ -773,10 +807,9 @@ class CarverVolTargetingRiskManager(RiskManager):
         """Update sizing inputs and resize the position to the Carver target.
 
         Skips forming bars (one resize per completed bar). Delegates
-        target-qty derivation (and *target-derivation* skip reasons
-        ``'warmup'`` / ``'zero_vol'`` / ``'not_live'`` /
-        ``'zero_weight'``) to ``_compute_target_qty``; owns *post-target*
-        concerns
+        target-qty derivation (and *target-derivation* skip reasons —
+        the ``'warmup_*'`` family / ``'zero_vol'`` / ``'zero_weight'``)
+        to ``_compute_target_qty``; owns *post-target* concerns
         (``'at_target'`` / ``'dead_band'`` / submit). Records one
         diagnostic row per *completed* bar — including every early-exit
         branch — into ``self._records[symbol]`` via ``_record_row``,
@@ -824,7 +857,7 @@ class CarverVolTargetingRiskManager(RiskManager):
             'strategy_weight': None,
             'capital': capital,
             'idm': self.idm,
-            'annualized_target_vol': self.annualized_target_vol,
+            'annual_target_vol': self.annual_target_vol,
             'vol_target_mode': self.vol_target_mode,
             'position_buffer': self.position_buffer,
             'annual_cash_target': None,
@@ -875,16 +908,18 @@ class CarverVolTargetingRiskManager(RiskManager):
     def _compute_target_qty(self, event: BarEvent) -> Dict[str, Any]:
         """Carver cash-vol target-qty pipeline.
 
-        target_qty = annual_cash_target / annualized_price_vol, where
+        target_qty = annual_cash_target / annual_price_vol, where
         annual_cash_target = IDM × strategy_weight × instrument_weight
-        × annualized_target_vol × (forecast / TARGET_AVG_ABS_FORECAST),
+        × annual_target_vol × (forecast / TARGET_AVG_ABS_FORECAST),
         additionally scaled by ``capital`` (current account equity) under
         ``vol_target_mode='percent_volatility'`` — see the module
         docstring for the two forms.
 
-        Owns the *target-derivation* skip ladder (``'warmup'`` /
-        ``'zero_vol'`` / ``'not_live'`` / ``'zero_weight'``). The
-        returned dict is
+        Owns the *target-derivation* skip ladder: ``'warmup_volatility'``
+        (sigma not ready) / ``'zero_vol'`` / the universe warmup labels
+        from ``_classify_warmup_reason`` (``'warmup_forecast'`` /
+        ``'warmup_correlation'`` / ``'warmup_weight'``) / ``'zero_weight'``.
+        The returned dict is
         spliced into the diagnostic row by ``update_bar`` via
         ``row.update(...)``; intermediates computed before an
         early-exit fires are populated, those after remain ``None``,
@@ -897,9 +932,9 @@ class CarverVolTargetingRiskManager(RiskManager):
             'strategy_weight': None, 'annual_cash_target': None,
         }
 
-        sigma = self.vol_estimator.get_annualized_vol(symbol)
+        sigma = self.vol_estimator.get_annual_vol(symbol)
         if sigma is None:
-            out['skip_reason'] = 'warmup'
+            out['skip_reason'] = 'warmup_volatility'
             return out
         out['sigma'] = sigma
         if sigma == 0:
@@ -907,10 +942,11 @@ class CarverVolTargetingRiskManager(RiskManager):
             return out
 
         if symbol not in self.instrument_weight:
-            # Not in the current tradable universe (liveness gate): no
-            # weight assigned. ``instrument_weight`` stays None in the
-            # diagnostic row — truthful, vs. recording a synthetic 0.0.
-            out['skip_reason'] = 'not_live'
+            # Absent from the tradable universe — classify which warmup
+            # stage (forecast → correlation → weight) the symbol is still
+            # in. ``instrument_weight`` stays None in the diagnostic row —
+            # truthful, vs. recording a synthetic 0.0.
+            out['skip_reason'] = self._classify_warmup_reason(symbol)
             return out
         iw = self.instrument_weight[symbol]
         sw = self.strategy_weight.get(self.strategy.__class__.__name__, 0.0)
@@ -927,7 +963,7 @@ class CarverVolTargetingRiskManager(RiskManager):
             # account.
             capital = self.portfolio.calculate_balance()
             annual_cash_target = (
-                capital * self.idm * sw * iw * self.annualized_target_vol
+                capital * self.idm * sw * iw * self.annual_target_vol
                 * (forecast / Strategy.TARGET_AVG_ABS_FORECAST)
             )
         elif self.vol_target_mode == 'dollar_volatility':
@@ -935,7 +971,7 @@ class CarverVolTargetingRiskManager(RiskManager):
             # futures convention: the risk limit is a dollar number, not
             # a compounding fraction of equity).
             annual_cash_target = (
-                self.idm * sw * iw * self.annualized_target_vol
+                self.idm * sw * iw * self.annual_target_vol
                 * (forecast / Strategy.TARGET_AVG_ABS_FORECAST)
             )
         else:
@@ -951,7 +987,7 @@ class CarverVolTargetingRiskManager(RiskManager):
         super()._record_row(symbol, row)
         action = 'submit' if row['submitted'] else row['skip_reason']
         logger.debug(
-            "[CARVER] %s fc=%.2f sigma=%s iw=%s sw=%s cap=%.2f "
+            "[CARVER] %s fc=%s sigma=%s iw=%s sw=%s cap=%.2f "
             "target=%s cur=%.6f trade=%s action=%s",
             symbol, row['forecast'], row['sigma'],
             row['instrument_weight'], row['strategy_weight'],

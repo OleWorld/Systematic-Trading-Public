@@ -32,7 +32,7 @@ class BacktestConfig:
     # Carver vol-targeting knobs consumed by `CarverVolTargetingRiskManager`.
     # ``idm`` is not in config — pass it directly to the risk manager
     # constructor if a non-default value is needed.
-    annualized_target_vol: Optional[float] = None  # Carver's τ; REQUIRED — $ amount ('dollar_volatility') or fraction in (0,1) ('percent_volatility')
+    annual_target_vol: Optional[float] = None  # Carver's τ; REQUIRED — $ amount ('dollar_volatility') or fraction in (0,1) ('percent_volatility')
     vol_target_mode: str = 'dollar_volatility'     # 'dollar_volatility' (fixed annual $ vol budget) or 'percent_volatility' (fraction of equity)
     position_buffer: float = 0.25        # Carver §10.7 dead-band (0.0 to trade every gap)
     instrument_weight_mode: str = 'equal_weight'   # 'equal_weight', 'min_variance', or 'risk_parity'
@@ -114,23 +114,23 @@ class BacktestConfig:
                 f"Unknown vol_target_mode: {self.vol_target_mode!r}. "
                 "Must be 'dollar_volatility' or 'percent_volatility'."
             )
-        if self.annualized_target_vol is None:
+        if self.annual_target_vol is None:
             raise ValueError(
-                "annualized_target_vol must be supplied explicitly (no "
+                "annual_target_vol must be supplied explicitly (no "
                 "default): a dollar amount under 'dollar_volatility' or "
                 "a fraction in (0, 1) under 'percent_volatility'."
             )
         if self.vol_target_mode == 'percent_volatility':
-            if not (0 < self.annualized_target_vol < 1):
+            if not (0 < self.annual_target_vol < 1):
                 raise ValueError(
-                    f"annualized_target_vol must be in (0, 1) under "
-                    f"'percent_volatility', got {self.annualized_target_vol}"
+                    f"annual_target_vol must be in (0, 1) under "
+                    f"'percent_volatility', got {self.annual_target_vol}"
                 )
         elif self.vol_target_mode == 'dollar_volatility':
-            if self.annualized_target_vol <= 0:
+            if self.annual_target_vol <= 0:
                 raise ValueError(
-                    f"annualized_target_vol must be > 0 under "
-                    f"'dollar_volatility', got {self.annualized_target_vol}"
+                    f"annual_target_vol must be > 0 under "
+                    f"'dollar_volatility', got {self.annual_target_vol}"
                 )
         else:
             raise ValueError(

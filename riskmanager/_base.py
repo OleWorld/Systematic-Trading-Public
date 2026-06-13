@@ -69,7 +69,7 @@ class _StrategyLike(Protocol):
 
     symbol_list: List[str]
 
-    def get_forecast(self, symbol: str) -> float: ...
+    def get_forecast(self, symbol: str) -> Optional[float]: ...
 
     def is_warmed_up(self, symbol: str) -> bool: ...
 
@@ -135,9 +135,10 @@ class RiskManager(ABC):
         Owns the entire target-derivation pipeline — fetching sigma /
         price / forecast / weights, building any intermediate values,
         and applying the target formula. Owns *target-derivation* skip
-        reasons (e.g. ``'warmup'`` / ``'zero_vol'`` / ``'zero_weight'``
-        for Carver; ``'no_price'`` for Simple). Has no side effects on
-        the portfolio or the records buffer.
+        reasons (e.g. the ``'warmup_*'`` family / ``'zero_vol'`` /
+        ``'zero_weight'`` for Carver; ``'no_price'`` / ``'warmup_forecast'``
+        for Simple). Has no side effects on the portfolio or the records
+        buffer.
 
         Returns a dict that ``update_bar`` splices into the diagnostic
         row. Required keys (every subclass):

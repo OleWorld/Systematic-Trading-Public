@@ -8,7 +8,7 @@ Submodules (internal):
                      price changes × sqrt(bars_per_year))
 
 Used by ``CarverVolTargetingRiskManager`` to derive
-``annualized_target_vol / sigma`` per completed bar. Future estimators
+``annual_target_vol / sigma`` per completed bar. Future estimators
 (Yang-Zhang, GARCH) slot in by implementing the same ``VolEstimator``
 interface.
 """

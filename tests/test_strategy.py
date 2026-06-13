@@ -92,15 +92,15 @@ def test_strategy_abc_cannot_be_instantiated():
 # Forecast cache initialization
 # ──────────────────────────────────────────────
 
-def test_forecasts_initialized_to_zero_for_each_symbol():
+def test_forecasts_initialized_to_none_for_each_symbol():
     s = _build(symbols=('BTC', 'ETH', 'SOL'))
-    assert s.forecasts == {'BTC': 0.0, 'ETH': 0.0, 'SOL': 0.0}
+    assert s.forecasts == {'BTC': None, 'ETH': None, 'SOL': None}
 
 
-def test_get_forecast_default_is_zero():
+def test_get_forecast_default_is_none():
     s = _build()
-    assert s.get_forecast('BTC') == 0.0
-    assert s.get_forecast('UNKNOWN') == 0.0
+    assert s.get_forecast('BTC') is None
+    assert s.get_forecast('UNKNOWN') is None
 
 
 # ──────────────────────────────────────────────

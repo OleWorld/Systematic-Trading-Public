@@ -7,7 +7,7 @@ Submodules (internal):
                            configured sizing mode)
     _vol_targeting         CarverVolTargetingRiskManager (vol-targeting
                            Carver framework — target notional scales with
-                           annualized_target_vol / sigma and forecast
+                           annual_target_vol / sigma and forecast
                            magnitude; execution-mode agnostic — same
                            class for backtest and live)
 """

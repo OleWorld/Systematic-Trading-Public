@@ -137,7 +137,7 @@ class RollingStdevVolEstimator(VolEstimator):
         price_change = forming_close - prev_close
         self._stdev[symbol].update(forming_ts, price_change)
 
-    def get_annualized_vol(self, symbol: str) -> Optional[float]:
+    def get_annual_vol(self, symbol: str) -> Optional[float]:
         """Return ``stdev.latest['stdev'] * sqrt(bars_per_year)``, or
         ``None`` if no finalized non-NaN stdev is available yet (warmup).
 
