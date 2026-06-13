@@ -46,20 +46,23 @@ _symbols = list(str(x) for x in _grouped.keys())
 # annualization regardless of the futures-style sizing knobs.
 config = BacktestConfig(
     symbols=_symbols,
-    instrument_weight_mode='min_variance',
-    corr_mode='absolute_price_chg',         # futures default: .diff() correlations
-    corr_lookback  = 60,
-    corr_timeframe = '1d',
     start_date='2021-01-01',
     end_date='2026-04-23',
     base_timeframe='1d',
     days_convention='calendar',             # data-driven: crypto is 24/7 → 365 d/y
     timeframes={'1d': 5000},
+
+    instrument_weight_mode='min_variance',
+    corr_mode='absolute_price_chg',         # futures default: .diff() correlations
+    corr_lookback  = 60,
+    corr_timeframe = '1d',
+
     initial_capital=10_000_000,
     leverage=10.0,
     vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
     annualized_target_vol=1_000_000,        # $1M annual vol
     position_buffer=0.25,
+    
     slippage_mode='absolute',               # futures default: $ per unit
     slippage_value=0.0,                     # default 0.0 — one fixed tick can't fit BTC & DOGE scales
     commission_mode='per_contract',         # futures default: $ per contract
@@ -266,9 +269,17 @@ if not riskmanager_records.empty:
 # fig.show(renderer='browser')
 
 # list_weights = []
-# for x in config.symbols:
+# for x in bt.risk_manager.get_live_symbols():
 #     weight = bt.risk_manager.get_records(x)['instrument_weight'].astype(float)
 #     weight.name = x
 #     list_weights.append( weight )
 # df_weight = pd.concat(list_weights, axis=1)
 # px.line(df_weight)
+
+# list_close = []
+# for x in bt.risk_manager.get_live_symbols():
+#     close = bt.strategy.get_records(x)['close'].astype(float)
+#     close.name = x
+#     list_close.append( close )
+# df_close = pd.concat(list_close, axis=1)
+# correlation_matrix(df_close.diff().dropna(), lookback=60)

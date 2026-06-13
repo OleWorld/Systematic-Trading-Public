@@ -10,12 +10,15 @@ use cases:
   return series for one trading rule. Output feeds top-level allocation.
 
 Optionally applies Ledoit-Wolf shrinkage (``shrinkage='ledoit_wolf'``):
-the sample covariance is shrunk toward scaled identity with the
-closed-form optimal intensity (Ledoit & Wolf 2004) before conversion to
-a correlation matrix. Shrinkage keeps the estimate well-conditioned and
-positive-definite even when the column count approaches or exceeds the
-row count — the high-dimensional regime where the raw sample estimator
-degrades into noise.
+columns are standardized to unit variance and the resulting correlation
+matrix is shrunk toward the identity with the closed-form optimal
+intensity (Ledoit & Wolf 2004). Standardizing first makes the shrunk
+estimate **scale-invariant** — like the unshrunk path — so feeding
+absolute price changes of differently-priced instruments does not
+collapse cross-correlations toward 0. Shrinkage keeps the estimate
+well-conditioned and positive-definite even when the column count
+approaches or exceeds the row count — the high-dimensional regime where
+the raw sample estimator degrades into noise.
 
 This is a research/setup-time helper, not a per-bar indicator: compute
 once from a historical or backtest-derived DataFrame, then hold the
@@ -65,11 +68,14 @@ def correlation_matrix(
         variation forecasts and instrument returns.
     shrinkage
         ``None`` (default — raw sample estimator) or ``'ledoit_wolf'``:
-        fit ``sklearn.covariance.LedoitWolf`` on the (lookback-sliced,
-        listwise-complete) window and convert the shrunk covariance to a
+        standardize each column to unit variance, fit
+        ``sklearn.covariance.LedoitWolf`` on the (lookback-sliced,
+        listwise-complete) window, and convert the shrunk covariance to a
         correlation matrix via ``D⁻¹ Σ D⁻¹`` with ``D = sqrt(diag(Σ))``.
-        Requires ``method='pearson'`` (shrinkage is covariance-based).
-        The fitted shrinkage intensity is attached to the result as
+        Standardizing first shrinks the *correlation* structure toward the
+        identity, making the result scale-invariant (matching the unshrunk
+        path). Requires ``method='pearson'``. The fitted shrinkage intensity
+        (in correlation space) is attached to the result as
         ``result.attrs['lw_shrinkage']`` (a float in ``(0, 1]``) for
         diagnostics. Requires scikit-learn (imported lazily — only this
         code path needs it).
@@ -137,11 +143,15 @@ def correlation_matrix(
 def _ledoit_wolf_corr(window: pd.DataFrame) -> pd.DataFrame:
     """Ledoit-Wolf shrunk correlation matrix of ``window``'s columns.
 
-    Fits ``sklearn.covariance.LedoitWolf`` (2004 scaled-identity-target
-    estimator) on the listwise-complete rows, converts the shrunk
-    covariance to a correlation matrix, clips entries to ``[-1, 1]``
-    (numerical hygiene), and restores an exact ``1.0`` diagonal. The
-    fitted intensity goes into ``result.attrs['lw_shrinkage']``.
+    Standardizes each column to unit variance, then fits
+    ``sklearn.covariance.LedoitWolf`` (2004 scaled-identity-target
+    estimator) on the listwise-complete rows — so shrinkage acts on the
+    *correlation* structure (scale-invariant), not the raw-scale
+    covariance. Converts the shrunk covariance to a correlation matrix,
+    clips entries to ``[-1, 1]`` (numerical hygiene), and restores an
+    exact ``1.0`` diagonal. Constant (zero-variance) columns get NaN
+    off-diagonals (correlation undefined), mirroring the unshrunk path.
+    The fitted intensity goes into ``result.attrs['lw_shrinkage']``.
 
     Raises ``ValueError`` when fewer than 2 complete rows survive NaN
     removal, ``ImportError`` when scikit-learn is missing.
@@ -160,11 +170,32 @@ def _ledoit_wolf_corr(window: pd.DataFrame) -> pd.DataFrame:
             f"shrinkage='ledoit_wolf' needs >= 2 complete rows after "
             f"listwise NaN removal, got {len(complete)}"
         )
-    lw = LedoitWolf().fit(complete.to_numpy(dtype=float))
+    arr = complete.to_numpy(dtype=float)
+    # Standardize columns to unit variance before the fit, so Ledoit-Wolf
+    # shrinks the *correlation* structure toward the identity rather than the
+    # raw-scale covariance toward a scaled identity. Without this the target
+    # μI is dominated by the largest-variance column; the shrunk diagonal of
+    # every small-scale column is inflated by orders of magnitude and the
+    # cov→corr step collapses their cross-correlations toward 0. z-scores are
+    # invariant to per-column scaling, so the result is scale-invariant — the
+    # same contract the unshrunk .corr() path already honors.
+    std = arr.std(axis=0, ddof=0)
+    nonzero = std > 0.0
+    z = np.zeros_like(arr)
+    z[:, nonzero] = (arr[:, nonzero] - arr[:, nonzero].mean(axis=0)) / std[nonzero]
+    lw = LedoitWolf().fit(z)
     cov = lw.covariance_
     d = np.sqrt(np.diag(cov))
-    corr = cov / np.outer(d, d)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        corr = cov / np.outer(d, d)
     corr = np.clip(corr, -1.0, 1.0)
+    # Constant (zero-variance) columns have undefined correlation; mirror the
+    # unshrunk .corr() path and report NaN off-diagonals rather than a spurious
+    # 0, while preserving the documented unit diagonal.
+    if not nonzero.all():
+        const = ~nonzero
+        corr[const, :] = np.nan
+        corr[:, const] = np.nan
     np.fill_diagonal(corr, 1.0)
     result = pd.DataFrame(corr, index=window.columns, columns=window.columns)
     result.attrs['lw_shrinkage'] = float(lw.shrinkage_)

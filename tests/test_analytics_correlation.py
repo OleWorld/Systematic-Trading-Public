@@ -187,10 +187,17 @@ def _noisy_frame(n_rows: int = 60, n_cols: int = 4, seed: int = 5) -> pd.DataFra
     return pd.DataFrame(cols)
 
 
+def _standardize(values: pd.DataFrame) -> np.ndarray:
+    """Column-wise z-scores (population std, ddof=0) — the scale-invariant
+    pre-step the shrinkage estimator applies before fitting."""
+    arr = values.to_numpy(dtype=float)
+    return (arr - arr.mean(axis=0)) / arr.std(axis=0, ddof=0)
+
+
 def _sklearn_lw_corr(values: pd.DataFrame) -> np.ndarray:
-    """Reference: direct sklearn LedoitWolf fit + cov→corr conversion."""
+    """Reference: standardize, then direct sklearn LedoitWolf fit + cov→corr."""
     from sklearn.covariance import LedoitWolf
-    cov = LedoitWolf().fit(values.to_numpy(dtype=float)).covariance_
+    cov = LedoitWolf().fit(_standardize(values)).covariance_
     d = np.sqrt(np.diag(cov))
     corr = cov / np.outer(d, d)
     np.fill_diagonal(corr, 1.0)
@@ -226,6 +233,27 @@ def test_ledoit_wolf_pulls_off_diagonals_toward_zero():
     assert np.all(np.abs(shrunk[off]) < np.abs(sample[off]))
 
 
+def test_ledoit_wolf_is_scale_invariant():
+    """A correlation estimator must be scale-invariant: rescaling a column
+    by any positive constant leaves the shrunk correlation matrix unchanged.
+
+    Regression for the bug where LW shrank the *raw-scale* covariance toward
+    μI — on inputs spanning orders of magnitude (e.g. absolute price changes
+    of BTC ~$60k vs DOGE ~$0.10) the scaled-identity target inflated the
+    low-variance columns' shrunk diagonal, collapsing every off-diagonal
+    toward 0. Standardizing columns before the fit makes the result match the
+    scale-invariant unshrunk path.
+    """
+    df = _noisy_frame()
+    base = correlation_matrix(df, shrinkage='ledoit_wolf')
+    scaled = df.copy()
+    scaled['c0'] *= 1e6
+    scaled['c1'] *= 1e-6
+    rescaled = correlation_matrix(scaled, shrinkage='ledoit_wolf')
+    np.testing.assert_allclose(rescaled.to_numpy(), base.to_numpy(), atol=1e-9)
+    assert np.isclose(rescaled.attrs['lw_shrinkage'], base.attrs['lw_shrinkage'])
+
+
 def test_ledoit_wolf_attrs_expose_intensity():
     """Fitted shrinkage coefficient is attached as attrs['lw_shrinkage']."""
     df = _noisy_frame()
@@ -233,7 +261,7 @@ def test_ledoit_wolf_attrs_expose_intensity():
     delta = m.attrs['lw_shrinkage']
     assert 0.0 < delta <= 1.0
     from sklearn.covariance import LedoitWolf
-    expected = LedoitWolf().fit(df.to_numpy(dtype=float)).shrinkage_
+    expected = LedoitWolf().fit(_standardize(df)).shrinkage_
     assert np.isclose(delta, expected)
 
 
