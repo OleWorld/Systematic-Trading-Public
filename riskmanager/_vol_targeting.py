@@ -224,7 +224,7 @@ class VolTargetingRiskManager(RiskManager):
         corr_step_size: int = 30,
         corr_timeframe: str = '1d',
         corr_mode: str = 'absolute_price_chg',
-        corr_floor: Optional[float] = 0.0,
+        corr_floor: Optional[float] = None,
         corr_shrinkage: Optional[str] = 'ledoit_wolf',
     ):
         """

@@ -71,6 +71,14 @@ _PSD_TOL = 1e-8
 # labels a flat one 'zero_weight') rather than emitting a 1e-12-contract
 # order off the dust.
 _ZERO_SNAP = 1e-10
+# Post-polish ERC acceptance bound: the coefficient of variation of the
+# risk contributions RC_i = w_i (Σw)_i — scale-free, 0 at perfect equal
+# risk. A converged Newton polish lands at ~1e-15; a genuinely failed
+# solve (polish unable to recover) leaves it O(0.1–1). The 1e-4 bound
+# sits orders of magnitude clear of both, so it never false-rejects a
+# converged solution yet still catches real divergence — the safety net
+# that lets risk_parity tolerate an OPTIMAL_INACCURATE solver status.
+_ERC_RC_CV_TOL = 1e-4
 
 
 def equal_weight(labels: Sequence[str]) -> Dict[str, float]:
@@ -253,8 +261,13 @@ def risk_parity(
         a mapping/Series.
     ValueError
         On invalid ``corr_matrix`` / ``vols`` / ``tol`` / ``max_iter``,
-        a materially non-PSD matrix, or if the solver fails to reach an
-        OPTIMAL status.
+        a materially non-PSD matrix, a hard solver failure
+        (``SolverError`` or a terminal status other than ``OPTIMAL`` /
+        ``OPTIMAL_INACCURATE``), or a polished solution that fails the
+        ERC validation (see ``_validate_erc_solution``). Note that
+        ``OPTIMAL_INACCURATE`` is *tolerated* here — unlike
+        ``min_variance`` — because the Newton polish refines the solver
+        output and the ERC check re-validates it.
     """
     _validate_solver_params(tol, max_iter)
     sigma = _build_sigma(corr_matrix, vols)
@@ -265,11 +278,44 @@ def risk_parity(
             0.5 * cp.quad_form(w, cp.psd_wrap(sigma)) - cp.sum(cp.log(w))
         ),
     )
-    _solve(problem, 'risk_parity', tol, max_iter)
+    # allow_inaccurate=True: on ill-conditioned, high-dimensional ρ the
+    # exp-cone solve can stop at OPTIMAL_INACCURATE; the Newton polish below
+    # refines it to machine precision, so the solver only needs to land in
+    # the polish basin. The post-polish ERC check (below) is the safety net.
+    _solve(problem, 'risk_parity', tol, max_iter, allow_inaccurate=True)
     w_opt = np.asarray(w.value, dtype=float)
     w_opt = _newton_polish_erc(sigma, w_opt)
+    _validate_erc_solution(sigma, w_opt)
     w_opt = w_opt / w_opt.sum()
     return {label: float(wi) for label, wi in zip(corr_matrix.index, w_opt)}
+
+
+def _validate_erc_solution(sigma: np.ndarray, w: np.ndarray) -> None:
+    """Raise ``ValueError`` unless ``w`` is a valid ERC solution for ``sigma``.
+
+    The guarantee that lets ``risk_parity`` accept an OPTIMAL_INACCURATE
+    solver status: instead of trusting the solver's self-reported status,
+    verify the *polished* weights directly. Checks that every weight is
+    finite and strictly positive (the ERC log domain requires ``w > 0``)
+    and that the risk contributions ``RC_i = w_i (Σw)_i`` are equal to
+    within ``_ERC_RC_CV_TOL`` (their coefficient of variation — scale-free,
+    zero at perfect equal risk). A converged polish clears this by orders
+    of magnitude; a solve the polish could not rescue fails it.
+    """
+    if not np.all(np.isfinite(w)) or np.any(w <= 0.0):
+        raise ValueError(
+            "risk_parity solver failed: polished weights are not all "
+            "finite and strictly positive"
+        )
+    rc = w * (sigma @ w)
+    rc_mean = float(rc.mean())
+    rc_cv = float(rc.std() / rc_mean) if rc_mean > 0 else float('inf')
+    if rc_cv > _ERC_RC_CV_TOL:
+        raise ValueError(
+            f"risk_parity solver failed: risk contributions not equalized "
+            f"(coefficient of variation {rc_cv:.3e} > {_ERC_RC_CV_TOL:.0e}) "
+            f"after polish"
+        )
 
 
 def _newton_polish_erc(sigma: np.ndarray, w: np.ndarray) -> np.ndarray:
@@ -303,14 +349,28 @@ def _newton_polish_erc(sigma: np.ndarray, w: np.ndarray) -> np.ndarray:
 
 def _solve(
     problem: cp.Problem, name: str, tol: float, max_iter: int,
+    *, allow_inaccurate: bool = False,
 ) -> None:
-    """Solve ``problem`` with CLARABEL; ``ValueError`` on anything non-OPTIMAL.
+    """Solve ``problem`` with CLARABEL; ``ValueError`` on a non-accepted status.
 
     ``cp.SolverError`` (canonicalization or solver-level failure,
-    including iteration-limit exhaustion) and any terminal status other
-    than ``OPTIMAL`` — including ``OPTIMAL_INACCURATE`` — surface as
-    ``ValueError(f"{name} solver failed: ...")``, preserving the strict
-    failure contract callers rely on.
+    including iteration-limit exhaustion) and any terminal status outside
+    the accepted set surface as ``ValueError(f"{name} solver failed:
+    ...")``, preserving the strict failure contract callers rely on.
+
+    The accepted set is ``{OPTIMAL}`` by default. With
+    ``allow_inaccurate=True`` it widens to ``{OPTIMAL, OPTIMAL_INACCURATE}``
+    — and *only* those two; every other status (``USER_LIMIT``,
+    ``INFEASIBLE``, ``UNBOUNDED``, …) still raises. This is for callers
+    that refine and validate the solver output downstream and so can
+    tolerate the interior-point method stopping just short of the
+    requested tolerance: on ill-conditioned, high-dimensional correlation
+    matrices CLARABEL legitimately converges to ``OPTIMAL_INACCURATE``,
+    and the strict OPTIMAL-only contract would reject an otherwise-usable
+    solution. ``risk_parity`` opts in (its Newton polish refines the
+    result to machine precision and then re-validates the ERC
+    conditions); ``min_variance``, which consumes the solver output
+    directly, keeps the strict default.
     """
     try:
         problem.solve(
@@ -322,7 +382,10 @@ def _solve(
         )
     except cp.SolverError as exc:
         raise ValueError(f"{name} solver failed: {exc}") from exc
-    if problem.status != cp.OPTIMAL:
+    accepted = {cp.OPTIMAL}
+    if allow_inaccurate:
+        accepted.add(cp.OPTIMAL_INACCURATE)
+    if problem.status not in accepted:
         raise ValueError(
             f"{name} solver failed: status {problem.status!r}"
         )

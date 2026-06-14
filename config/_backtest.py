@@ -40,7 +40,7 @@ class BacktestConfig:
     corr_step_size: int = 30              # auto-recalc cadence in completed bars; 0 disables
     corr_timeframe: str = '1d'            # data-handler timeframe to read closes from
     corr_mode: str = 'absolute_price_chg' # 'absolute_price_chg' (futures-safe: negative/zero prices) or 'simple_return' (positive-price assets)
-    corr_floor: Optional[float] = 0.0    # element-wise floor on the inline-derived rho; None disables (Carver: zero out spurious negative correlations)
+    corr_floor: Optional[float] = None    # element-wise floor on the inline-derived rho; None disables (Carver: zero out spurious negative correlations)
     corr_shrinkage: Optional[str] = 'ledoit_wolf'  # shrinkage on the inline-derived rho ('ledoit_wolf' — well-conditioned at high N); None disables (raw sample corr)
     idm_cap: Optional[float] = 2.5       # cap on the auto-updated IDM; None disables (Carver's 2.5; >= 1.0 since DM >= 1 for long-only sum-to-1 weights)
 

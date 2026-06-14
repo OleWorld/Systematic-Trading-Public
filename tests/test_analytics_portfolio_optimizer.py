@@ -9,6 +9,7 @@ Run from the repo root:  python -m pytest tests/test_analytics_portfolio_optimiz
 
 import math
 
+import cvxpy as cp
 import numpy as np
 import pandas as pd
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from analytics import (
     diversification_multiplier, equal_weight, min_variance, risk_parity,
 )
+from analytics._portfolio_optimizer import _solve
 
 
 def _corr(labels, off_diag=0.0):
@@ -372,6 +374,64 @@ def test_risk_parity_solver_failure_raises():
     rho = _random_pd_corr(['A', 'B', 'C', 'D', 'E'], seed=3)
     with pytest.raises(ValueError, match="solver failed"):
         risk_parity(rho, max_iter=1)
+
+
+# ──────────────────────────────────────────────
+# _solve failure contract — OPTIMAL_INACCURATE handling
+#
+# On ill-conditioned, high-dimensional correlation matrices (e.g. a large
+# highly-correlated book), CLARABEL's interior-point solve can stop at
+# OPTIMAL_INACCURATE — just short of the requested tolerance — rather than
+# OPTIMAL. risk_parity has a downstream Newton polish that refines such a
+# solution to machine precision, so it opts in via allow_inaccurate=True;
+# min_variance (no polish) keeps the strict OPTIMAL-only contract. These
+# status branches are awkward to induce deterministically through the real
+# solver, so a lightweight stub problem exercises the contract directly.
+# ──────────────────────────────────────────────
+
+class _StubProblem:
+    """Minimal cp.Problem stand-in for _solve: a no-op solve() and a fixed
+    terminal status, so the status-handling branch is tested deterministically
+    without depending on CLARABEL's internal convergence behaviour."""
+
+    def __init__(self, status):
+        self._status = status
+        self.solve_kwargs = None
+
+    def solve(self, **kwargs):
+        self.solve_kwargs = kwargs
+
+    @property
+    def status(self):
+        return self._status
+
+
+def test_solve_accepts_optimal():
+    # OPTIMAL passes under both contracts.
+    _solve(_StubProblem(cp.OPTIMAL), 'min_variance', 1e-9, 1000)
+    _solve(_StubProblem(cp.OPTIMAL), 'risk_parity', 1e-9, 1000,
+           allow_inaccurate=True)
+
+
+def test_solve_rejects_optimal_inaccurate_by_default():
+    # Strict default (min_variance path): inaccurate is a failure.
+    with pytest.raises(ValueError, match="status 'optimal_inaccurate'"):
+        _solve(_StubProblem(cp.OPTIMAL_INACCURATE), 'min_variance', 1e-9, 1000)
+
+
+def test_solve_accepts_optimal_inaccurate_when_allowed():
+    # risk_parity path: inaccurate is tolerated (refined + validated downstream).
+    _solve(_StubProblem(cp.OPTIMAL_INACCURATE), 'risk_parity', 1e-9, 1000,
+           allow_inaccurate=True)
+
+
+def test_solve_allow_inaccurate_still_rejects_genuine_failures():
+    # allow_inaccurate widens acceptance to OPTIMAL_INACCURATE only — every
+    # other non-OPTIMAL terminal status still raises.
+    for status in (cp.USER_LIMIT, cp.INFEASIBLE, cp.UNBOUNDED):
+        with pytest.raises(ValueError, match="solver failed"):
+            _solve(_StubProblem(status), 'risk_parity', 1e-9, 1000,
+                   allow_inaccurate=True)
 
 
 # ──────────────────────────────────────────────
