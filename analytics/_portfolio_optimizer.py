@@ -200,7 +200,7 @@ def risk_parity(
     corr_matrix: pd.DataFrame,
     vols: Optional[_VolsLike] = None,
     *,
-    tol: float = 1e-9,
+    tol: float = 1e-7,
     max_iter: int = 1_000,
 ) -> Dict[str, float]:
     """Equal-risk-contribution (ERC) weights.
@@ -242,9 +242,18 @@ def risk_parity(
     tol
         Solver convergence tolerance, forwarded to CLARABEL as
         ``tol_gap_abs`` / ``tol_gap_rel`` / ``tol_feas``. Must be > 0.
-        Default ``1e-9`` — the CVXPY stage only needs to land inside the
-        Newton-polish basin; pushing exp-cone solves to 1e-12 trips
-        CLARABEL's reduced-accuracy fallback on some instances.
+        Default ``1e-7``. The CVXPY stage only needs to land inside the
+        Newton-polish basin — the polish then refines to ~machine
+        precision regardless — so this requests only what CLARABEL can
+        reliably *certify* on a high-dimensional exp-cone program. On a
+        large book (≳100 assets ⇒ ≳100 exponential cones) the
+        interior-point primal/dual residuals reach ~1e-10 but the
+        duality-gap certificate stalls around ~1e-8, so a tighter ask
+        (1e-9, let alone 1e-12) returns ``OPTIMAL_INACCURATE`` (CLARABEL
+        ``AlmostSolved``) on an otherwise-converged solve; 1e-7 clears
+        that stall with margin and yields a clean ``OPTIMAL``. The
+        ``allow_inaccurate`` path in ``_solve`` plus the post-polish ERC
+        validation still backstop any case that stalls even at 1e-7.
     max_iter
         Solver iteration cap, forwarded to CLARABEL. Must be >= 1.
 

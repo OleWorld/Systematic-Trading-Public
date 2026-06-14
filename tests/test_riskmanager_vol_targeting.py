@@ -1373,10 +1373,11 @@ def test_constructor_rejects_corr_lookback_above_deque_maxlen():
 # negative correlations) — constructor validation
 # ──────────────────────────────────────────────
 
-def test_constructor_corr_floor_defaults_to_zero():
-    """Futures-first default: floor the inline-derived ρ at 0 (Carver)."""
+def test_constructor_corr_floor_defaults_to_none():
+    """Default: no floor on the inline-derived ρ (raw correlations flow
+    through). An explicit corr_floor=0.0 opts into Carver's zero-floor."""
     rm = _build_rm(['BTC'])
-    assert rm.corr_floor == 0.0
+    assert rm.corr_floor is None
 
 
 def test_constructor_rejects_corr_floor_outside_minus_one_one():
@@ -1465,20 +1466,19 @@ def _floor_rm(closes, **kwargs):
     )
 
 
-def test_derived_corr_matrix_is_floored_at_zero_by_default():
-    """The inline derivation clips ρ at corr_floor; with corr_floor=None
-    the raw (verifiably negative) matrix flows through."""
+def test_derived_corr_matrix_unfloored_by_default_floored_when_set():
+    """corr_floor=None (default): the raw (verifiably negative) matrix
+    flows through unchanged. An explicit corr_floor=0.0 clips ρ at zero."""
     closes = _anti_correlated_closes()
-    rm = _floor_rm(closes)
     symbols = list(closes)
-    floored = rm._derive_corr_matrix('min_variance', symbols)
-    off_diag = floored.values[~np.eye(len(floored), dtype=bool)]
-    assert off_diag.min() >= 0.0
-    # Sanity: the raw matrix really is negative somewhere, otherwise
-    # this test proves nothing.
-    rm.corr_floor = None
+    # Default (None) — raw negatives survive.
+    rm = _floor_rm(closes)
     raw = rm._derive_corr_matrix('min_variance', symbols)
     assert raw.values[~np.eye(len(raw), dtype=bool)].min() < -0.5
+    # Explicit zero floor — negatives clipped away.
+    rm.corr_floor = 0.0
+    floored = rm._derive_corr_matrix('min_variance', symbols)
+    assert floored.values[~np.eye(len(floored), dtype=bool)].min() >= 0.0
 
 
 def test_corr_floor_prevents_overweighting_of_anti_correlated_pair():
@@ -1487,8 +1487,8 @@ def test_corr_floor_prevents_overweighting_of_anti_correlated_pair():
     removes the spurious credit. Floored IDM respects the sqrt(N) bound;
     the raw IDM exceeds the floored one (idm_cap disabled to expose it)."""
     closes = _anti_correlated_closes()
-    floored = _floor_rm(closes)                          # corr_floor=0.0 default
-    raw = _floor_rm(closes, corr_floor=None, idm_cap=None)
+    floored = _floor_rm(closes, corr_floor=0.0)          # explicit zero floor
+    raw = _floor_rm(closes, corr_floor=None, idm_cap=None)  # default: no floor
     assert raw.instrument_weight['C'] < floored.instrument_weight['C']
     assert floored.idm <= math.sqrt(3.0) + 1e-9
     assert raw.idm > floored.idm
@@ -1542,10 +1542,10 @@ def test_corr_shrinkage_none_reproduces_raw_sample_corr():
 
 
 def test_corr_floor_applies_after_shrinkage():
-    """Pipeline order is estimate → shrink → floor: the default floor
+    """Pipeline order is estimate → shrink → floor: an explicit floor
     clips the LW-shrunk matrix, not the raw one."""
     closes = _anti_correlated_closes()
-    rm = _floor_rm(closes, corr_shrinkage='ledoit_wolf')  # default floor 0.0
+    rm = _floor_rm(closes, corr_shrinkage='ledoit_wolf', corr_floor=0.0)
     derived = rm._derive_corr_matrix('min_variance', list(closes))
     expected = correlation_matrix(
         pd.DataFrame(closes).diff().dropna(), shrinkage='ledoit_wolf',

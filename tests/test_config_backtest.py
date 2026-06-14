@@ -165,9 +165,9 @@ def test_unknown_corr_mode_rejected():
 
 
 def test_default_corr_floor_and_idm_cap():
-    """Futures-first defaults: floor rho at 0, cap IDM at Carver's 2.5."""
+    """Defaults: no rho floor (None), cap IDM at Carver's 2.5."""
     cfg = BacktestConfig(**_kwargs())
-    assert cfg.corr_floor == 0.0
+    assert cfg.corr_floor is None
     assert cfg.idm_cap == 2.5
 
 
