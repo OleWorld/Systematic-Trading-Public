@@ -597,9 +597,9 @@ def test_cached_forecast_matches_last_recorded_non_nan_forecast():
     assert strat.get_forecast(symbol) == pytest.approx(last_valid, abs=1e-9)
 
 
-def test_cached_forecast_starts_at_zero_during_warmup():
+def test_cached_forecast_is_none_during_warmup():
     """Before any non-NaN forecast is computed, the cached forecast stays
-    at the initial 0.0 (NaN forecasts don't update the cache)."""
+    at the initial None (NaN forecasts don't update the cache)."""
     symbol = 'BTC'
     start = datetime(2026, 1, 1)
     # Short series — can't fill the SMA window, so all forecasts remain NaN.
@@ -615,4 +615,4 @@ def test_cached_forecast_starts_at_zero_during_warmup():
         forecast_scalar_lookback=20,
     )
     _drive(strat, dh, frame, symbol)
-    assert strat.get_forecast(symbol) == 0.0
+    assert strat.get_forecast(symbol) is None

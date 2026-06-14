@@ -4,7 +4,7 @@ Per-symbol price-change series ``close - prior_close`` at the configured
 ``timeframe`` (default ``'1d'``), fed into the existing
 ``Stdev(length=lookback)`` indicator. Annualized vol =
 ``stdev * sqrt(bars_per_year)``. Used by
-``CarverVolTargetingRiskManager`` to derive the dollar-volatility divisor
+``VolTargetingRiskManager`` to derive the dollar-volatility divisor
 in the cash-vol position-sizing formula.
 
 Closes are sourced from a ``DataHandler`` via
@@ -137,7 +137,7 @@ class RollingStdevVolEstimator(VolEstimator):
         price_change = forming_close - prev_close
         self._stdev[symbol].update(forming_ts, price_change)
 
-    def get_annualized_vol(self, symbol: str) -> Optional[float]:
+    def get_annual_vol(self, symbol: str) -> Optional[float]:
         """Return ``stdev.latest['stdev'] * sqrt(bars_per_year)``, or
         ``None`` if no finalized non-NaN stdev is available yet (warmup).
 

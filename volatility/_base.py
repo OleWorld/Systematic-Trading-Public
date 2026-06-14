@@ -1,7 +1,7 @@
 """VolEstimator ABC for the forecast-aware risk manager.
 
 Concrete estimators (rolling stdev, EWMA, Yang-Zhang, GARCH, …) implement
-``update`` to observe each completed bar and ``get_annualized_vol`` to
+``update`` to observe each completed bar and ``get_annual_vol`` to
 return the current annualized volatility per symbol. The risk manager
 calls these on every completed bar to derive the dollar-volatility
 divisor in the cash-vol position-sizing formula.
@@ -23,7 +23,7 @@ at the configured timeframe and feed that price change into their
 underlying stdev indicator (which upserts on the forming timestamp, so
 sigma only advances at HTF period boundaries).
 
-``get_annualized_vol`` returns an annualized stdev of whatever input
+``get_annual_vol`` returns an annualized stdev of whatever input
 series the implementation feeds in. The standard estimators here feed in
 price changes (``close - prior_close``), so the returned value is in
 price units — used by the Carver risk manager as the annualized $-vol of
@@ -58,7 +58,7 @@ def bars_per_year(timeframe: str, days_convention: str) -> float:
     """Return bars-per-year for a timeframe under the chosen days convention.
 
     Used as the annualization factor for ``VolEstimator`` subclasses:
-    ``annualized_vol = stdev * sqrt(bars_per_year(timeframe, days_convention))``.
+    ``annual_vol = stdev * sqrt(bars_per_year(timeframe, days_convention))``.
 
     The two supported conventions:
 
@@ -114,7 +114,7 @@ class VolEstimator(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_annualized_vol(self, symbol: str) -> Optional[float]:
+    def get_annual_vol(self, symbol: str) -> Optional[float]:
         """Return the current annualized volatility for ``symbol``.
 
         Output carries the units of the input series the implementation

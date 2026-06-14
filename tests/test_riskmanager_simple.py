@@ -139,6 +139,23 @@ def test_get_records_no_price_skip():
     assert pf.submitted == []
 
 
+def test_get_records_warmup_forecast_skip():
+    # get_forecast returns None (strategy warming up) → skip before the
+    # sign logic, which would raise on None (``None > 0`` is a TypeError).
+    pf, _, rm = _make(forecast=None, positions={'BTC': 0.0})
+    rm.update_bar(_bar())
+    df = rm.get_records('BTC')
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row['skip_reason'] == 'warmup_forecast'
+    assert not row['submitted']
+    assert row['target_qty'] is None
+    assert row['trade_qty'] is None
+    # price is resolved before the forecast check, so it's recorded.
+    assert row['price'] == 100.0
+    assert pf.submitted == []
+
+
 def test_get_records_at_target_skip():
     # fixed_notional=10_000, price=100 → target_qty = 100 (sign +1)
     pf, _, rm = _make(positions={'BTC': 100.0})
