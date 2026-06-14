@@ -8,7 +8,7 @@ A trader only needs to care about **3 things**. The system handles everything el
 from config import BacktestConfig
 
 config = BacktestConfig(
-    symbols=['BTC_USDT', 'BNB_USDT'],
+    symbols=['BTC_USDT:USDT', 'BNB_USDT:USDT'],   # CCXT perp naming, as in the bundled sample data
     start_date='2026-01-01',
     end_date='2026-04-04',
     base_timeframe='4h',
@@ -170,5 +170,5 @@ bt.run()
 # Access results
 equity_df = portfolio.get_equity_curve()
 trade_df  = portfolio.get_trade_log()
-records   = bt.strategy.get_records('BTC_USDT')
+records   = bt.strategy.get_records('BTC_USDT:USDT')
 ```

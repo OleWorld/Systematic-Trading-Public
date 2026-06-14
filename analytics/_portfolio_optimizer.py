@@ -66,9 +66,10 @@ _PSD_TOL = 1e-8
 # Weights below this are interior-point dust at an active w >= 0 bound
 # (the solver approaches the bound asymptotically, never reaching exact
 # 0.0) — far below any economic weight. Snapped to exact zero so
-# downstream zero-weight semantics (e.g. the risk manager's
-# skip_reason='zero_weight' short-circuit) fire instead of producing
-# 1e-12-contract orders.
+# downstream zero-weight semantics fire cleanly: in the risk manager a
+# zero weight yields target_qty == 0, which flattens a held position (and
+# labels a flat one 'zero_weight') rather than emitting a 1e-12-contract
+# order off the dust.
 _ZERO_SNAP = 1e-10
 
 

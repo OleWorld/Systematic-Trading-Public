@@ -52,9 +52,9 @@ config = BacktestConfig(
     days_convention='calendar',             # data-driven: crypto is 24/7 → 365 d/y
     timeframes={'1d': 500},
 
-    instrument_weight_mode='min_variance',
+    instrument_weight_mode='risk_parity',  # recommended default: 1/N weights, IDM still derived from rho
     corr_mode='absolute_price_chg',         # futures default: .diff() correlations
-    corr_lookback  = 60,
+    corr_lookback  = 256,
     corr_timeframe = '1d',
 
     initial_capital=10_000_000,

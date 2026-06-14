@@ -688,6 +688,90 @@ def test_skip_when_strategy_weight_is_zero():
 
 
 # ──────────────────────────────────────────────
+# A skip must never orphan a HELD position
+# ──────────────────────────────────────────────
+
+def test_held_position_zero_instrument_weight_is_flattened():
+    """The orphaned-position bug: a zero instrument weight on a HELD
+    position must FLATTEN it (target_qty=0 → close), not silently skip it.
+    Mirrors the forecast=0 flatten path exactly."""
+    pf, _, _, rm = _make(weight=0.0, positions={'BTC': 3.0})
+    rm.update_bar(_bar())
+    assert len(pf.submitted) == 1
+    order = pf.submitted[0]
+    assert order['direction'] == Direction.SELL
+    assert math.isclose(order['quantity'], 3.0)
+    assert order['order_type'] == OrderType.MKT
+    row = rm.get_records('BTC').iloc[0]
+    assert row['submitted']
+    assert row['skip_reason'] is None
+    assert row['target_qty'] == 0.0
+
+
+def test_held_position_zero_strategy_weight_is_flattened():
+    """Same invariant via a zero *strategy* weight on a held short — the
+    diff back to flat is a BUY of the (absolute) position size."""
+    pf, _, _, rm = _make(positions={'BTC': -2.0})
+    rm.strategy_weight = {'FakeStrategy': 0.0}
+    rm.update_bar(_bar())
+    assert len(pf.submitted) == 1
+    order = pf.submitted[0]
+    assert order['direction'] == Direction.BUY
+    assert math.isclose(order['quantity'], 2.0)
+
+
+def test_flat_position_zero_weight_still_labelled_zero_weight():
+    """Regression guard for the flat case: a zero weight with no open
+    position submits nothing and keeps the informative 'zero_weight'
+    label (not the generic 'at_target')."""
+    pf, _, _, rm = _make(weight=0.0, positions={'BTC': 0.0})
+    rm.update_bar(_bar())
+    assert pf.submitted == []
+    assert rm.get_records('BTC').iloc[0]['skip_reason'] == 'zero_weight'
+
+
+@pytest.mark.parametrize('sigma,expected_reason', [
+    (None, 'warmup_volatility'),
+    (0.0, 'zero_vol'),
+])
+def test_held_position_no_target_skip_warns(caplog, sigma, expected_reason):
+    """When the target is undefined (no sigma / zero vol) we cannot size,
+    but a HELD position being skipped must surface a WARNING — the risk
+    manager is never silently blind to an open position."""
+    pf, _, _, rm = _make(sigma=sigma, positions={'BTC': 4.0})
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.update_bar(_bar())
+    assert pf.submitted == []
+    assert any('unmanaged' in rec.getMessage() for rec in caplog.records)
+    assert rm.get_records('BTC').iloc[0]['skip_reason'] == expected_reason
+
+
+def test_flat_position_no_target_skip_does_not_warn(caplog):
+    """The WARNING is held-position-only: a flat symbol skipping on warmup
+    is routine and must stay quiet (no false alarms)."""
+    pf, _, _, rm = _make(sigma=None, positions={'BTC': 0.0})
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.update_bar(_bar())
+    assert pf.submitted == []
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_held_position_absent_from_universe_warns(caplog):
+    """A held symbol that has dropped out of instrument_weight (e.g. a
+    future delisting or a manual weight wipe) is skipped with a universe
+    warmup reason — and must WARN because a position is still open."""
+    pf, _, _, rm = _make(positions={'BTC': 5.0})
+    rm.instrument_weight = {}                        # BTC no longer in the universe
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.update_bar(_bar())
+    assert pf.submitted == []
+    assert any('unmanaged' in rec.getMessage() for rec in caplog.records)
+    assert rm.get_records('BTC').iloc[0]['skip_reason'] in (
+        'warmup_forecast', 'warmup_correlation', 'warmup_weight',
+    )
+
+
+# ──────────────────────────────────────────────
 # Idempotency on stable forecast
 # ──────────────────────────────────────────────
 
@@ -821,7 +905,11 @@ def test_record_skip_reason_zero_weight_instrument():
     assert row['instrument_weight'] == 0.0
     assert math.isclose(row['strategy_weight'], 1.0)
     assert row['sigma'] == 8000.0                 # was read before the skip
-    assert row['target_qty'] is None
+    # Zero weight is now a target of 0 (flows through), not an early skip —
+    # so the flat row carries target_qty=0.0; nothing is submitted because
+    # the position is already flat, and the label stays the informative
+    # 'zero_weight'.
+    assert row['target_qty'] == 0.0
     assert pf.submitted == []
 
 
@@ -949,13 +1037,59 @@ def test_equal_weight_remains_default_mode():
 
 def test_equal_weight_silently_ignores_corr_matrix():
     """Passing a corr_matrix to mode='equal_weight' must not error and must
-    not change the equal-weight result."""
+    not change the equal-weight *result* (the weights). ρ for the IDM is
+    always derived inline, never from the passed matrix."""
     rm = _build_rm(['BTC', 'ETH'], data_handler=_live_dh(['BTC', 'ETH']),
                    corr_lookback=60)
     corr = _corr_df(['BTC', 'ETH'], off_diag=0.9)
     rm.calculate_instrument_weight(mode='equal_weight', corr_matrix=corr)
     assert math.isclose(rm.instrument_weight['BTC'], 0.5)
     assert math.isclose(rm.instrument_weight['ETH'], 0.5)
+
+
+def test_equal_weight_derives_idm_from_corr():
+    """Under equal_weight the weights are 1/N, but ρ is still derived to
+    size the IDM — so a diversified book earns leverage instead of freezing
+    at the constructor idm. Two roughly-uncorrelated assets give idm in
+    (1, sqrt(2)] (the default floor keeps ρ >= 0, capping idm at sqrt(N))."""
+    rm = _build_rm(['BTC', 'ETH'], data_handler=_live_dh(['BTC', 'ETH']),
+                   corr_lookback=60)
+    rm.idm = 1.0                                     # constructor-default sentinel
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['BTC'], 0.5)
+    assert math.isclose(rm.instrument_weight['ETH'], 0.5)
+    assert 1.0 < rm.idm <= math.sqrt(2.0) + 1e-9
+
+
+def test_equal_weight_singleton_universe_sets_idm_to_one():
+    """A single live symbol earns no diversification credit → idm = 1.0
+    (proves the sentinel is overwritten, matching the min_variance
+    singleton path)."""
+    rm = _build_rm(['BTC'], data_handler=_live_dh(['BTC']), corr_lookback=60)
+    rm.idm = 1.9                                     # sentinel
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert rm.instrument_weight == {'BTC': 1.0}
+    assert rm.idm == 1.0
+
+
+def test_equal_weight_data_gap_leaves_idm_untouched():
+    """Full-lookback rows (passes the data gate) but <30 valid return
+    observations after dropna → ρ derivation returns None → equal-weight
+    fallback keeps 1/N weights and leaves idm untouched (the ρ=1
+    degenerate case), mirroring the corr-based fallback."""
+    idx = pd.date_range('2024-01-01', periods=60, freq='D')
+
+    def _gappy(seed):
+        vals = np.full(60, np.nan)
+        vals[-20:] = _price_series(20, seed=seed).to_numpy()    # <30 valid diffs
+        return pd.Series(vals, index=idx)
+    dh = FakeDataHandler(closes={'BTC': _gappy(0), 'ETH': _gappy(1)})
+    rm = _build_rm(['BTC', 'ETH'], data_handler=dh, corr_lookback=60)
+    rm.idm = 1.7                                     # sentinel
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['BTC'], 0.5)
+    assert math.isclose(rm.instrument_weight['ETH'], 0.5)
+    assert rm.idm == 1.7                             # untouched
 
 
 def test_min_variance_two_uncorrelated_assets_yields_equal_weights():

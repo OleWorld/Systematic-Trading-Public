@@ -83,20 +83,23 @@ non-decreasing during a backtest. Delisting/universe-exit handling is
 future work.
 
 The manager performs **walk-forward** weight estimation in every mode:
-at each recalc point it re-assesses liveness, and — under
-``'min_variance'`` / ``'risk_parity'`` — pulls ``corr_lookback`` bars
-at ``corr_timeframe`` (default ``'1d'``) for every *live* symbol via
-the data handler, computes per-bar price changes per ``corr_mode``
+at each recalc point it re-assesses liveness and derives ρ from a
+trailing window — it pulls ``corr_lookback`` bars at ``corr_timeframe``
+(default ``'1d'``) for every *live* symbol via the data handler,
+computes per-bar price changes per ``corr_mode``
 (``'absolute_price_chg'`` → ``.diff()``, default — futures-safe for
 negative/zero prices; ``'simple_return'`` → ``.pct_change()`` — for
-strictly positive-price assets), and derives ρ → weights via the
-``analytics`` portfolio optimizers (``analytics.min_variance`` — exact
-long-only minimum-variance QP; ``analytics.risk_parity`` — equal risk
-contribution). Both run correlation-only — the equal-vol convention,
+strictly positive-price assets), and feeds ρ to the ``analytics``
+optimizers. Under ``'min_variance'`` (exact long-only minimum-variance
+QP) / ``'risk_parity'`` (equal risk contribution) ρ drives the
+*weights*; under ``'equal_weight'`` the weights are ``1/N`` but ρ is
+still consumed for the IDM — so a large decorrelated book earns its
+leverage instead of freezing at the constructor ``idm``. Both
+corr-based weight modes run correlation-only — the equal-vol convention,
 consistent with sizing already dividing by each instrument's σ. The
 matching IDM (``analytics.diversification_multiplier``) is updated from
 the same ρ on every successful recompute (clamped to ``idm_cap``),
-keeping the two coherent.
+keeping weights and IDM coherent.
 ``update_bar`` auto-recalls the method every ``corr_step_size``
 completed ``corr_timeframe`` periods (default ``30``; multi-symbol bars
 at the same timestamp and sub-period base bars are de-duplicated via
@@ -117,9 +120,12 @@ On every completed bar the manager:
 3. Submits a MKT order for ``target_qty - current_qty`` if the diff is
    above the configured dead-band (``position_buffer``, Carver §10.7).
 
-Skips on warmup (``sigma is None``), zero vol, zero combined weight, or
-forming bars. Idempotent: a stable forecast on consecutive bars produces
-no further orders once the position matches the target.
+Skips on warmup (``sigma is None``), zero vol, or forming bars. A zero
+combined weight is NOT a skip — it is a target of 0, so a held position
+is flattened (a flat one is simply labelled ``'zero_weight'``). Any skip
+that would strand a *held* position emits a WARNING. Idempotent: a
+stable forecast on consecutive bars produces no further orders once the
+position matches the target.
 """
 
 import datetime
@@ -190,7 +196,12 @@ class CarverVolTargetingRiskManager(RiskManager):
     (strategy has no forecast yet), ``'warmup_correlation'`` (fewer than
     ``corr_lookback`` bars), ``'warmup_weight'`` (ready but no weight
     assigned yet — recalc lag); or the substantive skips ``'zero_vol'``,
-    ``'zero_weight'``, ``'dead_band'``, ``'at_target'``. Symbols absent
+    ``'dead_band'``, ``'at_target'``, and ``'zero_weight'`` — the last
+    meaning a zero combined weight with the position *already flat* (a
+    *held* position at zero weight is instead flattened, so it records
+    ``submitted=True`` / ``skip_reason=None``). A skip that strands a
+    held position (``'zero_vol'`` / the ``warmup_*`` family) additionally
+    emits a WARNING. Symbols absent
     from ``instrument_weight`` (outside the tradable universe per the
     liveness gate) carry one of the three universe warmup labels with
     ``instrument_weight`` left ``None``. Read via
@@ -573,7 +584,11 @@ class CarverVolTargetingRiskManager(RiskManager):
             default ``'equal_weight'``). Otherwise one of:
 
             * ``'equal_weight'`` — ``{symbol: 1/N}`` across the live
-              subset. ``corr_matrix`` is ignored if passed.
+              subset (the weights). ρ is still derived inline to update
+              the IDM (so a diversified book earns its leverage rather
+              than freezing the constructor ``idm``); any passed
+              ``corr_matrix`` is ignored — equal_weight owns no
+              estimation hook.
             * ``'min_variance'`` — exact long-only minimum-variance
               weights (``min wᵀρw`` s.t. ``Σw = 1``, ``w ≥ 0``), solved
               numerically by ``analytics.min_variance``.
@@ -611,12 +626,15 @@ class CarverVolTargetingRiskManager(RiskManager):
 
         Notes
         -----
-        Mutates ``self.instrument_weight`` in place and, on successful
-        corr-based computes, also updates ``self.idm`` via
+        Mutates ``self.instrument_weight`` in place and, whenever a ρ is
+        successfully derived (in *every* mode — ``'equal_weight'`` feeds
+        the same ρ to the IDM even though its weights are ``1/N``), also
+        updates ``self.idm`` via
         ``analytics.diversification_multiplier(...)``, clamped to
-        ``idm_cap`` when the cap is enabled, so weights and IDM
-        stay coherent. The equal-weight fallback and empty-universe
-        paths leave ``self.idm`` untouched. Safe to re-call any time
+        ``idm_cap`` when the cap is enabled, so weights and IDM stay
+        coherent. The data-gap equal-weight fallback and the
+        empty-universe path leave ``self.idm`` untouched; a singleton
+        universe sets ``idm = 1.0``. Safe to re-call any time
         (e.g. monthly rebalances, regime-driven scheme switches);
         ``update_bar`` re-calls this method every ``corr_step_size``
         completed ``corr_timeframe`` periods in every mode (the recalc
@@ -630,7 +648,28 @@ class CarverVolTargetingRiskManager(RiskManager):
                 self._log_empty_universe(mode)
                 self.instrument_weight = {}
                 return
+            if len(live) == 1:
+                # Single-instrument universe: full weight, no
+                # diversification credit.
+                self.instrument_weight = {live[0]: 1.0}
+                self.idm = 1.0
+                return
             self.instrument_weight = equal_weight(live)
+            # Equal weights are scheme-final, but the IDM still measures the
+            # book's diversification: derive rho over the live subset and set
+            # idm = 1/sqrt(w'rho w) so a large decorrelated universe earns its
+            # leverage (up to idm_cap) instead of staying frozen at the
+            # constructor value. The IDM scalar is robust to correlation noise
+            # (unlike min_variance corner weights). An explicitly passed
+            # corr_matrix is ignored here (equal_weight owns no estimation
+            # hook); rho is always derived inline.
+            corr_matrix = self._derive_corr_matrix(mode, live)
+            if corr_matrix is None:
+                # Data-gap shortfall — keep the equal weights (already set);
+                # leave self.idm untouched (rho=1 degenerate case), mirroring
+                # the corr-based equal-weight fallback.
+                return
+            self._update_idm_from_corr(corr_matrix)
         elif mode in ('min_variance', 'risk_parity'):
             if corr_matrix is None:
                 live = self.get_live_symbols()
@@ -665,16 +704,9 @@ class CarverVolTargetingRiskManager(RiskManager):
                 self.instrument_weight = risk_parity(corr_matrix)
             else:
                 raise ValueError(f"Unexpected mode: {mode!r}")
-            # Auto-update IDM from the same matrix used for weights so
-            # the two stay coherent across walk-forward recomputes. The
-            # cap is leverage policy: it applies regardless of whether
-            # the matrix was derived inline or passed explicitly.
-            idm = diversification_multiplier(
-                self.instrument_weight, corr_matrix,
-            )
-            if self.idm_cap is not None:
-                idm = min(idm, self.idm_cap)
-            self.idm = idm
+            # Auto-update IDM from the same matrix used for weights so the
+            # two stay coherent across walk-forward recomputes.
+            self._update_idm_from_corr(corr_matrix)
         else:
             raise ValueError(
                 f"Unexpected mode: {mode!r} "
@@ -792,6 +824,23 @@ class CarverVolTargetingRiskManager(RiskManager):
         np.fill_diagonal(repaired, 1.0)
         return pd.DataFrame(repaired, index=corr.index, columns=corr.columns)
 
+    def _update_idm_from_corr(self, corr_matrix: pd.DataFrame) -> None:
+        """Auto-update ``self.idm`` from ``corr_matrix`` and the current
+        ``self.instrument_weight``.
+
+        Carver's ``DM = 1 / sqrt(wᵀρw)`` via
+        ``analytics.diversification_multiplier``, clamped to ``idm_cap`` when
+        the cap is enabled. Shared by every corr-consuming weight mode —
+        ``'equal_weight'`` feeds the same ρ even though its weights are 1/N,
+        so a diversified book still earns its leverage — keeping weights and
+        IDM coherent. The cap is leverage policy: it applies regardless of
+        whether ρ was derived inline or passed explicitly.
+        """
+        idm = diversification_multiplier(self.instrument_weight, corr_matrix)
+        if self.idm_cap is not None:
+            idm = min(idm, self.idm_cap)
+        self.idm = idm
+
     def calculate_strategy_weight(self) -> None:
         """Populate ``self.strategy_weight`` with the single-strategy placeholder.
 
@@ -808,12 +857,16 @@ class CarverVolTargetingRiskManager(RiskManager):
 
         Skips forming bars (one resize per completed bar). Delegates
         target-qty derivation (and *target-derivation* skip reasons —
-        the ``'warmup_*'`` family / ``'zero_vol'`` / ``'zero_weight'``)
-        to ``_compute_target_qty``; owns *post-target* concerns
-        (``'at_target'`` / ``'dead_band'`` / submit). Records one
-        diagnostic row per *completed* bar — including every early-exit
-        branch — into ``self._records[symbol]`` via ``_record_row``,
-        which also emits a DEBUG log line.
+        the ``'warmup_*'`` family / ``'zero_vol'``) to
+        ``_compute_target_qty``; owns *post-target* concerns
+        (``'at_target'`` / ``'dead_band'`` / ``'zero_weight'`` relabel /
+        submit). A target-derivation skip that strands a *held* position
+        emits a WARNING (the RM is never silently blind to an open
+        position). A zero combined weight is not a skip here — it arrives
+        as ``target_qty = 0`` and flattens a held position via the submit
+        path. Records one diagnostic row per *completed* bar — including
+        every early-exit branch — into ``self._records[symbol]`` via
+        ``_record_row``, which also emits a DEBUG log line.
         """
         if event.is_forming:
             return
@@ -871,6 +924,20 @@ class CarverVolTargetingRiskManager(RiskManager):
         row.update(self._compute_target_qty(event))
 
         if row['skip_reason'] is not None:
+            # A target-derivation skip (warmup_volatility / zero_vol /
+            # warmup_forecast|correlation|weight) means we cannot compute a
+            # well-defined target this bar. Harmless when flat, but if we are
+            # HOLDING a position the risk manager is leaving it unmanaged —
+            # surface it loudly so it can never go unnoticed. (zero_weight no
+            # longer lands here: it flows through as target_qty=0 and flattens
+            # via the submit path. Flatten-on-universe-exit is deferred to the
+            # delisting work; here the target is undefined, so we warn.)
+            if current_qty != 0:
+                logger.warning(
+                    "%s: holding %s contracts but skipping resize (%s) — "
+                    "position is unmanaged this bar",
+                    symbol, current_qty, row['skip_reason'],
+                )
             self._record_row(symbol, row)
             return
 
@@ -883,12 +950,21 @@ class CarverVolTargetingRiskManager(RiskManager):
         # Order matters: ``at_target`` (realized position essentially
         # equals target) is checked first so the diagnostic row carries
         # the more informative label. The dead-band check that follows
-        # picks up small-but-nonzero diffs. ``target_qty == 0``
-        # (forecast is 0) lands in ``at_target`` when also flat;
-        # otherwise the dead-band collapses to zero and any nonzero
+        # picks up small-but-nonzero diffs. ``target_qty == 0`` (forecast
+        # is 0, OR a zero instrument/strategy weight) lands here when also
+        # flat; otherwise the dead-band collapses to zero and any nonzero
         # current position triggers a flatten via the submit path.
         if abs(trade_qty) < 1e-12:                # already at target
-            row['skip_reason'] = 'at_target'
+            # When the zero came from a zero weight (rather than a genuine
+            # at-target), surface it as 'zero_weight' — more informative
+            # than 'at_target' (the position is flat *because* it carries
+            # no weight). Both factors are populated floats here: a symbol
+            # absent from instrument_weight returned earlier with a
+            # warmup_* reason.
+            if row['instrument_weight'] == 0 or row['strategy_weight'] == 0:
+                row['skip_reason'] = 'zero_weight'
+            else:
+                row['skip_reason'] = 'at_target'
             self._record_row(symbol, row)
             return
         if target_qty != 0 and abs(trade_qty) <= buffer_threshold:
@@ -918,8 +994,11 @@ class CarverVolTargetingRiskManager(RiskManager):
         Owns the *target-derivation* skip ladder: ``'warmup_volatility'``
         (sigma not ready) / ``'zero_vol'`` / the universe warmup labels
         from ``_classify_warmup_reason`` (``'warmup_forecast'`` /
-        ``'warmup_correlation'`` / ``'warmup_weight'``) / ``'zero_weight'``.
-        The returned dict is
+        ``'warmup_correlation'`` / ``'warmup_weight'``). A zero combined
+        weight (``iw * sw == 0``) is **not** a skip — it returns
+        ``target_qty = 0`` (with ``skip_reason`` left ``None``) so a held
+        position is flattened by ``update_bar``'s submit path and a flat
+        one is relabelled ``'zero_weight'`` there. The returned dict is
         spliced into the diagnostic row by ``update_bar`` via
         ``row.update(...)``; intermediates computed before an
         early-exit fires are populated, those after remain ``None``,
@@ -953,7 +1032,13 @@ class CarverVolTargetingRiskManager(RiskManager):
         out['instrument_weight'] = iw
         out['strategy_weight'] = sw
         if iw * sw == 0:
-            out['skip_reason'] = 'zero_weight'
+            # A zero instrument or strategy weight means a target of 0 —
+            # NOT a reason to skip. Flow through as target_qty=0 so a held
+            # position is flattened by the normal submit path (exactly like
+            # forecast=0), instead of being silently stranded. ``update_bar``
+            # relabels the flat case as 'zero_weight' for diagnostics.
+            out['annual_cash_target'] = 0.0
+            out['target_qty'] = 0.0
             return out
 
         forecast = self.strategy.get_forecast(symbol)
