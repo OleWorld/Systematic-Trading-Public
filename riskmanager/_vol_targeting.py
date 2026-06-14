@@ -1,4 +1,4 @@
-"""CarverVolTargetingRiskManager — forecast-aware Carver vol-targeting sizer.
+"""VolTargetingRiskManager — forecast-aware Carver vol-targeting sizer.
 
 Implements Carver's vol-targeting framework (Systematic Trading, Ch. 10)
 in **cash-vol** form. The risk target is a dollar amount of vol per
@@ -156,7 +156,7 @@ logger = logging.getLogger(__name__)
 _MIN_CORR_OBS = 30
 
 
-class CarverVolTargetingRiskManager(RiskManager):
+class VolTargetingRiskManager(RiskManager):
     """Forecast-aware cash-vol-targeting sizer (Carver's framework).
 
     Owns two weight dicts:

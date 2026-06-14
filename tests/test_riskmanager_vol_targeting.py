@@ -1,5 +1,5 @@
 """
-Unit tests for ``CarverVolTargetingRiskManager``.
+Unit tests for ``VolTargetingRiskManager``.
 
 Pin:
 - Golden cash-vol formula:
@@ -30,7 +30,7 @@ import pytest
 
 from analytics import correlation_matrix
 from event import BarEvent, OrderType, Direction
-from riskmanager import CarverVolTargetingRiskManager
+from riskmanager import VolTargetingRiskManager
 
 
 # ──────────────────────────────────────────────
@@ -69,7 +69,7 @@ class FakeStrategy:
     """Forecast oracle + symbol_list source for the risk manager.
 
     ``symbol_list`` is read at construction time by
-    ``CarverVolTargetingRiskManager.calculate_instrument_weight`` to
+    ``VolTargetingRiskManager.calculate_instrument_weight`` to
     populate the equal-weight default. ``warmed_up`` configures the
     per-symbol ``is_warmed_up`` flag consumed by the liveness gate:
     ``None`` (default) reports every symbol as warmed — tests that
@@ -182,7 +182,7 @@ def _make(
     strat = FakeStrategy({'BTC': forecast}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': sigma})
     dh = FakeDataHandler()
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol,
         data_handler=dh,
         idm=idm,
@@ -232,7 +232,7 @@ def test_constructor_position_buffer_default_is_quarter():
     default on the class itself, not the test-helper override.
     """
     pf = FakePortfolio(balance=100_000.0, positions={'BTC': 0.0})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, FakeStrategy({'BTC': 0.0}, symbol_list=['BTC']),
         FakeVolEstimator({'BTC': 8000.0}),
         data_handler=FakeDataHandler(),
@@ -247,11 +247,11 @@ def test_constructor_default_instrument_weight_mode_is_equal_weight():
     strat = FakeStrategy({'BTC': 0.0}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': 8000.0})
     dh = FakeDataHandler()
-    rm_default = CarverVolTargetingRiskManager(
+    rm_default = VolTargetingRiskManager(
         pf, strat, vol, data_handler=dh, annual_target_vol=0.25,
     )
     assert rm_default.instrument_weight_mode == 'equal_weight'
-    rm_explicit = CarverVolTargetingRiskManager(
+    rm_explicit = VolTargetingRiskManager(
         pf, strat, vol, data_handler=dh, instrument_weight_mode='equal_weight',
         annual_target_vol=0.25,
     )
@@ -267,7 +267,7 @@ def test_constructor_with_min_variance_mode_and_empty_deques_yields_empty_univer
     vol = FakeVolEstimator({'BTC': 8000.0, 'ETH': 8000.0})
     dh = FakeDataHandler()                                      # empty closes
     with caplog.at_level('INFO'):
-        rm = CarverVolTargetingRiskManager(
+        rm = VolTargetingRiskManager(
             pf, strat, vol, data_handler=dh,
             instrument_weight_mode='min_variance',
             annual_target_vol=0.25,
@@ -286,7 +286,7 @@ def test_constructor_with_risk_parity_mode_and_empty_deques_yields_empty_univers
     vol = FakeVolEstimator({'BTC': 8000.0, 'ETH': 8000.0})
     dh = FakeDataHandler()                                      # empty closes
     with caplog.at_level('INFO'):
-        rm = CarverVolTargetingRiskManager(
+        rm = VolTargetingRiskManager(
             pf, strat, vol, data_handler=dh,
             instrument_weight_mode='risk_parity',
             annual_target_vol=0.25,
@@ -303,7 +303,7 @@ def test_constructor_with_unknown_instrument_weight_mode_raises():
     strat = FakeStrategy({'BTC': 0.0}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': 8000.0})
     with pytest.raises(ValueError, match="mode"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             pf, strat, vol, data_handler=FakeDataHandler(),
             instrument_weight_mode='bogus',
             annual_target_vol=0.25,
@@ -319,7 +319,7 @@ def test_calculate_instrument_weight_with_no_mode_arg_reads_stored_field():
     pf = FakePortfolio(balance=100_000.0, positions={'BTC': 0.0, 'ETH': 0.0})
     strat = FakeStrategy({'BTC': 0.0, 'ETH': 0.0}, symbol_list=['BTC', 'ETH'])
     vol = FakeVolEstimator({'BTC': 8000.0, 'ETH': 8000.0})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol, data_handler=FakeDataHandler(),
         annual_target_vol=0.25,
     )                                                           # default mode
@@ -338,7 +338,7 @@ def test_calculate_instrument_weight_with_no_mode_arg_reads_stored_field():
 
 def test_constructor_rejects_corr_lookback_below_two():
     with pytest.raises(ValueError, match="corr_lookback"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=FakeDataHandler(),
             corr_lookback=1, annual_target_vol=0.25,
@@ -347,7 +347,7 @@ def test_constructor_rejects_corr_lookback_below_two():
 
 def test_constructor_rejects_negative_corr_step_size():
     with pytest.raises(ValueError, match="corr_step_size"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=FakeDataHandler(),
             corr_step_size=-1, annual_target_vol=0.25,
@@ -358,7 +358,7 @@ def test_constructor_rejects_unregistered_corr_timeframe():
     """``corr_timeframe`` must appear in ``data_handler.timeframes``."""
     dh = FakeDataHandler(timeframes={'1d': 500})                # no '4h'
     with pytest.raises(ValueError, match="corr_timeframe"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=dh, corr_timeframe='4h',
             annual_target_vol=0.25,
@@ -377,7 +377,7 @@ def test_instrument_weight_default_is_equal_weight_two_symbols():
     dh = FakeDataHandler(closes={
         'BTC': _price_series(60, seed=0), 'ETH': _price_series(60, seed=1),
     })
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=dh,
         corr_lookback=60, annual_target_vol=0.25,
     )
@@ -393,7 +393,7 @@ def test_instrument_weight_default_is_equal_weight_three_symbols():
         s: _price_series(60, seed=i)
         for i, s in enumerate(['BTC', 'ETH', 'SOL'])
     })
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=dh,
         corr_lookback=60, annual_target_vol=0.25,
     )
@@ -406,7 +406,7 @@ def test_strategy_weight_default_is_one_for_single_strategy():
     """Placeholder: ``{strategy_class_name: 1.0}`` for the one bound strategy."""
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=['BTC'])
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=FakeDataHandler(),
         annual_target_vol=0.25,
     )
@@ -419,7 +419,7 @@ def test_calculate_instrument_weight_is_recallable_after_symbol_list_change():
     dh = FakeDataHandler(closes={
         'BTC': _price_series(60, seed=0), 'ETH': _price_series(60, seed=1),
     })
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=dh,
         corr_lookback=60, annual_target_vol=0.25,
     )
@@ -433,7 +433,7 @@ def test_calculate_instrument_weight_is_recallable_after_symbol_list_change():
 def test_calculate_strategy_weight_is_recallable():
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=['BTC'])
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=FakeDataHandler(),
         annual_target_vol=0.25,
     )
@@ -507,7 +507,7 @@ def _make_dollar(
     pf = FakePortfolio(balance=balance, positions={'BTC': 0.0})
     strat = FakeStrategy({'BTC': forecast}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': sigma})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol,
         data_handler=FakeDataHandler(),
         vol_target_mode='dollar_volatility',
@@ -520,7 +520,7 @@ def _make_dollar(
 
 def test_vol_target_mode_defaults_to_dollar_volatility():
     """Futures-first default: the mode is 'dollar_volatility' unless set."""
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
         FakeVolEstimator(), data_handler=FakeDataHandler(),
         annual_target_vol=0.25,
@@ -569,7 +569,7 @@ def test_percent_mode_target_scales_with_capital():
 def test_constructor_rejects_none_annual_target_vol():
     """tau no longer has a default — it must be supplied explicitly."""
     with pytest.raises(ValueError, match="annual_target_vol"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=FakeDataHandler(),
         )
@@ -578,7 +578,7 @@ def test_constructor_rejects_none_annual_target_vol():
 def test_dollar_mode_rejects_non_positive_tau():
     for bad in (0.0, -1.0, -250_000.0):
         with pytest.raises(ValueError, match="annual_target_vol"):
-            CarverVolTargetingRiskManager(
+            VolTargetingRiskManager(
                 FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
                 FakeVolEstimator(), data_handler=FakeDataHandler(),
                 vol_target_mode='dollar_volatility',
@@ -589,7 +589,7 @@ def test_dollar_mode_rejects_non_positive_tau():
 def test_dollar_mode_accepts_large_dollar_tau():
     """tau >= 1 is valid in dollar mode (it's a dollar amount, not a
     fraction) — would violate the percent-mode (0, 1) range."""
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
         FakeVolEstimator(), data_handler=FakeDataHandler(),
         vol_target_mode='dollar_volatility',
@@ -600,7 +600,7 @@ def test_dollar_mode_accepts_large_dollar_tau():
 
 def test_constructor_rejects_unknown_vol_target_mode():
     with pytest.raises(ValueError, match="vol_target_mode"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=FakeDataHandler(),
             vol_target_mode='notional_volatility',
@@ -1004,7 +1004,7 @@ def _build_rm(symbols, *, data_handler: Optional[FakeDataHandler] = None,
     strat = FakeStrategy(symbol_list=list(symbols))
     dh = data_handler if data_handler is not None else FakeDataHandler()
     kwargs.setdefault('annual_target_vol', 0.25)    # required since the futures-first refactor
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=dh, **kwargs,
     )
     return rm
@@ -1211,7 +1211,7 @@ def _staggered_rm(*, young_bars=10, warmed_up=None, mode='min_variance'):
     strat = FakeStrategy({s: 50.0 for s in symbols}, symbol_list=symbols,
                          warmed_up=warmed_up)
     vol = FakeVolEstimator({s: 8000.0 for s in symbols})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol, data_handler=dh,
         instrument_weight_mode=mode,
         corr_lookback=60, annual_target_vol=0.25,
@@ -1327,7 +1327,7 @@ def test_single_live_symbol_gets_full_weight_and_unit_idm():
     })
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=symbols)
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=dh,
         instrument_weight_mode='min_variance',
         idm=1.7,                                                # overwritten below
@@ -1457,7 +1457,7 @@ def _floor_rm(closes, **kwargs):
     """
     dh = FakeDataHandler(closes=closes)
     kwargs.setdefault('corr_shrinkage', None)
-    return CarverVolTargetingRiskManager(
+    return VolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=list(closes)),
         FakeVolEstimator(), data_handler=dh,
         instrument_weight_mode='min_variance',
@@ -1517,7 +1517,7 @@ def test_derive_corr_matrix_applies_ledoit_wolf_by_default():
     """The inline ρ is the LW-shrunk matrix (floor disabled to isolate)."""
     closes = _anti_correlated_closes()
     dh = FakeDataHandler(closes=closes)
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=list(closes)),
         FakeVolEstimator(), data_handler=dh,
         instrument_weight_mode='min_variance',
@@ -1577,7 +1577,7 @@ def test_nearest_psd_correlation_repairs_non_psd_matrix():
         index=labels, columns=labels,
     )
     assert np.linalg.eigvalsh(bad.to_numpy()).min() < -0.2
-    fixed = CarverVolTargetingRiskManager._nearest_psd_correlation(bad)
+    fixed = VolTargetingRiskManager._nearest_psd_correlation(bad)
     arr = fixed.to_numpy()
     assert np.linalg.eigvalsh(arr).min() >= -1e-12
     np.testing.assert_allclose(np.diag(arr), 1.0)
@@ -1593,7 +1593,7 @@ def test_nearest_psd_correlation_passes_psd_through_unchanged():
     good = pd.DataFrame(
         [[1.0, 0.5], [0.5, 1.0]], index=labels, columns=labels,
     )
-    fixed = CarverVolTargetingRiskManager._nearest_psd_correlation(good)
+    fixed = VolTargetingRiskManager._nearest_psd_correlation(good)
     assert fixed is good
 
 
@@ -1738,7 +1738,7 @@ def test_min_variance_derives_corr_from_filled_deques_and_auto_updates_idm():
     dh = FakeDataHandler(closes=closes)
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=symbols)
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=dh,
         instrument_weight_mode='min_variance', corr_lookback=lookback,
         annual_target_vol=0.25,
@@ -1801,7 +1801,7 @@ def test_returns_used_are_simple_pct_change():
     strat = FakeStrategy(symbol_list=symbols)
     # Use equal-weight construction (no auto-recalc fires from __init__),
     # then capture the derived weights via the explicit min-variance call.
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=dh,
         corr_lookback=100, annual_target_vol=0.25,
         corr_mode='simple_return',          # this test pins the pct_change path
@@ -1835,7 +1835,7 @@ def test_returns_used_are_simple_pct_change():
 
 def test_constructor_rejects_unknown_corr_mode():
     with pytest.raises(ValueError, match="corr_mode"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=FakeDataHandler(),
             corr_mode='log_return', annual_target_vol=0.25,
@@ -1861,7 +1861,7 @@ def test_absolute_price_chg_mode_uses_diff():
     symbols = ['A', 'B']
     closes = {s: _price_series(100, seed=i) for i, s in enumerate(symbols)}
     dh = FakeDataHandler(closes=closes)
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=symbols),
         FakeVolEstimator(), data_handler=dh,
         corr_lookback=100, corr_mode='absolute_price_chg',
@@ -1900,7 +1900,7 @@ def test_absolute_price_chg_handles_negative_and_zero_prices():
         for s in ['SPREAD_A', 'SPREAD_B']
     }
     dh = FakeDataHandler(closes=closes)
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=list(closes)),
         FakeVolEstimator(), data_handler=dh,
         corr_lookback=100, corr_mode='absolute_price_chg',
@@ -1932,7 +1932,7 @@ def _make_min_variance_rm_with_closes(symbols, n_bars, step_size, *,
     pf = FakePortfolio(positions={s: 0.0 for s in symbols})
     strat = FakeStrategy({s: 0.0 for s in symbols}, symbol_list=list(symbols))
     vol = FakeVolEstimator({s: 8000.0 for s in symbols})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol, data_handler=dh,
         instrument_weight_mode=mode,
         corr_lookback=lookback,
@@ -2016,7 +2016,7 @@ def test_auto_recalc_also_fires_under_equal_weight_mode():
     pf = FakePortfolio(positions={'BTC': 0.0})
     strat = FakeStrategy({'BTC': 0.0}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': 8000.0})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol, data_handler=FakeDataHandler(),
         instrument_weight_mode='equal_weight',
         corr_step_size=2,

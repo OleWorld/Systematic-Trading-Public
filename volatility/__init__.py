@@ -7,7 +7,7 @@ Submodules (internal):
     _rolling_stdev   RollingStdevVolEstimator (equal-weight sample stdev of
                      price changes × sqrt(bars_per_year))
 
-Used by ``CarverVolTargetingRiskManager`` to derive
+Used by ``VolTargetingRiskManager`` to derive
 ``annual_target_vol / sigma`` per completed bar. Future estimators
 (Yang-Zhang, GARCH) slot in by implementing the same ``VolEstimator``
 interface.

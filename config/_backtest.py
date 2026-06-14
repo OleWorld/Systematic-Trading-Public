@@ -29,7 +29,7 @@ class BacktestConfig:
     leverage: float = 1.0
 
     # --- Risk / Sizing ---
-    # Carver vol-targeting knobs consumed by `CarverVolTargetingRiskManager`.
+    # Carver vol-targeting knobs consumed by `VolTargetingRiskManager`.
     # ``idm`` is not in config — pass it directly to the risk manager
     # constructor if a non-default value is needed.
     annual_target_vol: Optional[float] = None  # Carver's τ; REQUIRED — $ amount ('dollar_volatility') or fraction in (0,1) ('percent_volatility')
@@ -46,7 +46,7 @@ class BacktestConfig:
 
     # NOTE: size_mode and position_size are consumed only by
     # SimpleRiskManager (sign-of-forecast follower). Ignored when
-    # wiring CarverVolTargetingRiskManager.
+    # wiring VolTargetingRiskManager.
     size_mode: str = 'fixed_quantity'   # 'fixed_quantity' (contracts — futures default), 'fixed_notional', 'fixed_equity_pct'
     position_size: float = 10_000.0
 
@@ -107,7 +107,7 @@ class BacktestConfig:
                 "Must be 'calendar' (365 days/year, 24/7) or "
                 "'business' (252 trading days/year)."
             )
-        # Mirror CarverVolTargetingRiskManager constructor validation so
+        # Mirror VolTargetingRiskManager constructor validation so
         # bad values fail at config construction, not deep in the wiring.
         if self.vol_target_mode not in ('dollar_volatility', 'percent_volatility'):
             raise ValueError(

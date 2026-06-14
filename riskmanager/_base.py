@@ -32,7 +32,7 @@ class _PortfolioLike(Protocol):
 # ──────────────────────────────────────────────
 
 class _DataHandlerLike(Protocol):
-    """Subset of the DataHandler surface that CarverVolTargetingRiskManager reads.
+    """Subset of the DataHandler surface that VolTargetingRiskManager reads.
 
     Used to pull a trailing window of closes for the inline correlation-matrix
     derivation in ``calculate_instrument_weight`` (``mode='min_variance'``,
@@ -63,7 +63,7 @@ class _StrategyLike(Protocol):
 
     ``is_warmed_up(symbol)`` is the strategy's measured end-of-warmup
     signal (True once the first non-NaN forecast has been cached) —
-    consumed by ``CarverVolTargetingRiskManager.get_live_symbols`` as
+    consumed by ``VolTargetingRiskManager.get_live_symbols`` as
     the strategy gate of the universe liveness check.
     """
 

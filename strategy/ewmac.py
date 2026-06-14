@@ -49,7 +49,7 @@ The ``±Strategy.FORECAST_CAP`` scale (vs Carver's ``±20``) is the
 project-wide forecast convention — see ``Strategy.update_bar``. The
 target-average-absolute-forecast magnitude lives on the same class as
 ``Strategy.TARGET_AVG_ABS_FORECAST`` (default ``50.0``); both
-``CarverVolTargetingRiskManager`` and this strategy read it from there.
+``VolTargetingRiskManager`` and this strategy read it from there.
 """
 
 from __future__ import annotations

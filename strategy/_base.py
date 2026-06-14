@@ -68,7 +68,7 @@ class Strategy(ABC):
         ``+FORECAST_CAP`` = max long conviction.
 
     ``TARGET_AVG_ABS_FORECAST`` is the average ``|forecast|`` value each
-    strategy is expected to calibrate toward. ``CarverVolTargetingRiskManager``
+    strategy is expected to calibrate toward. ``VolTargetingRiskManager``
     divides the forecast by ``TARGET_AVG_ABS_FORECAST`` so that
     ``|forecast| = TARGET_AVG_ABS_FORECAST`` reproduces Carver's basic
     vol-target notional and ``|forecast| = FORECAST_CAP`` doubles it.
@@ -78,7 +78,7 @@ class Strategy(ABC):
 
     # Project-wide forecast convention. Treated as constants — do not override
     # in subclasses; both ``Strategy.update_bar`` and
-    # ``CarverVolTargetingRiskManager`` read them via the class.
+    # ``VolTargetingRiskManager`` read them via the class.
     TARGET_AVG_ABS_FORECAST: float = 50.0
     FORECAST_CAP: float = 100.0
 

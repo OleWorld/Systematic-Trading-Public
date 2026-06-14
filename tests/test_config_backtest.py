@@ -1,7 +1,7 @@
 """Unit tests for ``BacktestConfig`` validation.
 
 Focused on the correlation / walk-forward fields added for the inline
-min-variance derivation in ``CarverVolTargetingRiskManager`` —
+min-variance derivation in ``VolTargetingRiskManager`` —
 ``corr_lookback``, ``corr_step_size``, ``corr_timeframe``.
 
 Run from the repo root:  pytest tests/test_config_backtest.py -v

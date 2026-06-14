@@ -2,7 +2,7 @@
 
 Execution-mode agnostic: the same class is used for backtesting and live.
 For calibrated continuous forecasts (e.g. EWMAC) where conviction should
-modulate position size, prefer ``CarverVolTargetingRiskManager``.
+modulate position size, prefer ``VolTargetingRiskManager``.
 """
 
 from typing import Any, Dict
@@ -44,7 +44,7 @@ class SimpleRiskManager(RiskManager):
     ``risk_manager.get_records(symbol)``.
 
     For calibrated continuous forecasts (e.g. EWMAC), use
-    ``CarverVolTargetingRiskManager`` instead — it scales the notional
+    ``VolTargetingRiskManager`` instead — it scales the notional
     by ``forecast / 50`` so conviction translates into position size.
     """
 

@@ -71,7 +71,7 @@ class MyStrategy(Strategy):
 
 ### 3. Position Sizing — Carver vol-targeting (default choice)
 
-`CarverVolTargetingRiskManager` implements Carver's cash-vol framework:
+`VolTargetingRiskManager` implements Carver's cash-vol framework:
 
 ```text
 # vol_target_mode='dollar_volatility' (default — fixed annual $ vol budget):
@@ -108,7 +108,7 @@ risk_manager = SimpleRiskManager(
 ```
 
 `size_mode` and `position_size` on `BacktestConfig` are read only by
-`SimpleRiskManager`; `CarverVolTargetingRiskManager` ignores them.
+`SimpleRiskManager`; `VolTargetingRiskManager` ignores them.
 
 ### Data — supply your own OHLCV
 
@@ -139,7 +139,7 @@ from data import HistoricDataHandler
 from portfolio import BacktestPortfolio
 from execution import BacktestExecution, SlippageModel, CommissionModel
 from volatility import EWMAVolEstimator, bars_per_year
-from riskmanager import CarverVolTargetingRiskManager
+from riskmanager import VolTargetingRiskManager
 from backtester import Backtester
 
 events_queue = queue.Queue()
@@ -153,7 +153,7 @@ portfolio    = BacktestPortfolio(events_queue, data_handler, config.symbols,
 vol_estimator = EWMAVolEstimator(config.symbols, data_handler=data_handler,
                                  bars_per_year=bars_per_year('1d', config.days_convention),
                                  timeframe='1d', span=36)
-risk_manager  = CarverVolTargetingRiskManager(portfolio, strategy, vol_estimator,
+risk_manager  = VolTargetingRiskManager(portfolio, strategy, vol_estimator,
                                               data_handler=data_handler,
                                               annual_target_vol=config.annual_target_vol,
                                               vol_target_mode=config.vol_target_mode,

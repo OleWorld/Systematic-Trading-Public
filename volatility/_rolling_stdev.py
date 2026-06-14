@@ -4,7 +4,7 @@ Per-symbol price-change series ``close - prior_close`` at the configured
 ``timeframe`` (default ``'1d'``), fed into the existing
 ``Stdev(length=lookback)`` indicator. Annualized vol =
 ``stdev * sqrt(bars_per_year)``. Used by
-``CarverVolTargetingRiskManager`` to derive the dollar-volatility divisor
+``VolTargetingRiskManager`` to derive the dollar-volatility divisor
 in the cash-vol position-sizing formula.
 
 Closes are sourced from a ``DataHandler`` via

@@ -16,7 +16,7 @@ from strategy import EWMACStrategy
 from portfolio import BacktestPortfolio
 from execution import BacktestExecution, SlippageModel, CommissionModel
 from volatility import EWMAVolEstimator, bars_per_year
-from riskmanager import CarverVolTargetingRiskManager
+from riskmanager import VolTargetingRiskManager
 from backtester import Backtester
 from plotting import plot_strategy
 
@@ -108,7 +108,7 @@ vol_estimator = EWMAVolEstimator(
     timeframe=vol_timeframe, span=36,
 )
 
-risk_manager = CarverVolTargetingRiskManager(
+risk_manager = VolTargetingRiskManager(
     portfolio, strategy, vol_estimator,
     data_handler=data_handler,
     annual_target_vol=config.annual_target_vol,
