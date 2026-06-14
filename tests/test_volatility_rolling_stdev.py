@@ -7,7 +7,7 @@ Pin the contract:
 - Price-change computation matches ``np.diff(prices)``.
 - Annualization scaling uses ``sqrt(bars_per_year)`` for both daily-equiv
   (365) and 4h-equiv (365 * 6) factors.
-- Warmup: ``get_annualized_vol`` returns ``None`` until the first finalized
+- Warmup: ``get_annual_vol`` returns ``None`` until the first finalized
   non-NaN stdev is available. Because the estimator reads ``stdev.latest``
   (one slot behind the just-pushed forming entry), warmup needs one
   additional change beyond the rolling-window length: 1 seed bar + (lookback
@@ -159,14 +159,14 @@ def test_default_timeframe_is_1d():
 
 def test_warmup_returns_none_before_first_bar():
     est, _ = _make_estimator(['BTC'], bars_per_year=365, lookback=5)
-    assert est.get_annualized_vol('BTC') is None
+    assert est.get_annual_vol('BTC') is None
 
 
 def test_warmup_returns_none_after_only_seed_bar():
     est, stub = _make_estimator(['BTC'], bars_per_year=365, lookback=5)
     _push_series(est, stub, 'BTC', [100.0])
     # First bar just seeds prior_close; no price change computed yet.
-    assert est.get_annualized_vol('BTC') is None
+    assert est.get_annual_vol('BTC') is None
 
 
 def test_warmup_returns_none_until_lookback_changes_observed():
@@ -175,7 +175,7 @@ def test_warmup_returns_none_until_lookback_changes_observed():
     # Bar 1 seeds; bars 2..lookback give lookback-1 price changes → still NaN inside Stdev.
     _push_series(est, stub, 'BTC',
                  [100.0 + i for i in range(lookback)])
-    assert est.get_annualized_vol('BTC') is None
+    assert est.get_annual_vol('BTC') is None
 
 
 def test_warmup_returns_none_at_lookback_plus_one_bars():
@@ -188,7 +188,7 @@ def test_warmup_returns_none_at_lookback_plus_one_bars():
     # `.latest` returns _outputs[-2] → None for a NaN payload.
     _push_series(est, stub, 'BTC',
                  [100.0 + i for i in range(lookback + 1)])
-    assert est.get_annualized_vol('BTC') is None
+    assert est.get_annual_vol('BTC') is None
 
 
 def test_warmup_first_valid_at_lookback_plus_two_bars():
@@ -198,7 +198,7 @@ def test_warmup_first_valid_at_lookback_plus_two_bars():
     # has two finite entries, so `.latest` (= _outputs[-2]) is finite.
     _push_series(est, stub, 'BTC',
                  [100.0 + i for i in range(lookback + 2)])
-    sigma = est.get_annualized_vol('BTC')
+    sigma = est.get_annual_vol('BTC')
     assert sigma is not None
     assert not math.isnan(sigma)
 
@@ -221,7 +221,7 @@ def test_price_change_matches_numpy():
     # `.latest` skips the most recent change: stdev over price_changes[-lookback-1:-1].
     expected_sigma = float(np.std(price_changes[-lookback - 1:-1], ddof=1))
 
-    sigma = est.get_annualized_vol('BTC')
+    sigma = est.get_annual_vol('BTC')
     assert sigma is not None
     # bars_per_year=1 → sqrt(1)=1 → no scaling.
     assert math.isclose(sigma, expected_sigma, rel_tol=1e-9)
@@ -238,8 +238,8 @@ def test_annualization_scaling_365():
     _push_series(est_unscaled, stub_u, 'BTC', closes)
     _push_series(est_daily, stub_d, 'BTC', closes)
 
-    s_unscaled = est_unscaled.get_annualized_vol('BTC')
-    s_daily = est_daily.get_annualized_vol('BTC')
+    s_unscaled = est_unscaled.get_annual_vol('BTC')
+    s_daily = est_daily.get_annual_vol('BTC')
     assert s_unscaled is not None and s_daily is not None
     assert math.isclose(s_daily, s_unscaled * math.sqrt(365.0), rel_tol=1e-9)
 
@@ -255,8 +255,8 @@ def test_annualization_scaling_4h():
     _push_series(est_unscaled, stub_u, 'BTC', closes)
     _push_series(est_4h, stub_4h, 'BTC', closes)
 
-    s_unscaled = est_unscaled.get_annualized_vol('BTC')
-    s_4h = est_4h.get_annualized_vol('BTC')
+    s_unscaled = est_unscaled.get_annual_vol('BTC')
+    s_4h = est_4h.get_annual_vol('BTC')
     assert s_unscaled is not None and s_4h is not None
     assert math.isclose(s_4h, s_unscaled * math.sqrt(365.0 * 6), rel_tol=1e-9)
 
@@ -267,7 +267,7 @@ def test_zero_vol_input_returns_zero_not_nan():
     est, stub = _make_estimator(['BTC'], bars_per_year=365, lookback=lookback)
     # lookback+2 bars to clear `.latest` warmup.
     _push_series(est, stub, 'BTC', [100.0] * (lookback + 2))
-    sigma = est.get_annualized_vol('BTC')
+    sigma = est.get_annual_vol('BTC')
     assert sigma is not None
     assert sigma == 0.0
 
@@ -296,14 +296,14 @@ def test_forming_bars_are_ignored():
     price_changes = np.diff(closes_arr)
     expected = float(np.std(price_changes[-lookback - 1:-1], ddof=1))
 
-    sigma = est.get_annualized_vol('BTC')
+    sigma = est.get_annual_vol('BTC')
     assert sigma is not None
     assert math.isclose(sigma, expected, rel_tol=1e-9)
 
 
 def test_unknown_symbol_returns_none_silently():
     est, _ = _make_estimator(['BTC'], bars_per_year=365, lookback=3)
-    assert est.get_annualized_vol('ETH') is None
+    assert est.get_annual_vol('ETH') is None
 
 
 def test_unknown_symbol_update_is_no_op():
@@ -312,8 +312,8 @@ def test_unknown_symbol_update_is_no_op():
     # No exception, no state change for ETH (not in symbol_list).
     stub.add_close('ETH', t0, 100.0, timeframe='1d')
     est.update(_bar('ETH', t0, 100.0))
-    assert est.get_annualized_vol('ETH') is None
-    assert est.get_annualized_vol('BTC') is None
+    assert est.get_annual_vol('ETH') is None
+    assert est.get_annual_vol('BTC') is None
 
 
 def test_zero_prior_close_is_not_special():
@@ -330,7 +330,7 @@ def test_zero_prior_close_is_not_special():
     price_changes = np.diff(closes_arr)
     expected = float(np.std(price_changes[-lookback - 1:-1], ddof=1))
 
-    sigma = est.get_annualized_vol('BTC')
+    sigma = est.get_annual_vol('BTC')
     assert sigma is not None
     assert math.isclose(sigma, expected, rel_tol=1e-9)
 
@@ -351,8 +351,8 @@ def test_multi_symbol_isolation():
         est.update(_bar('BTC', ts, b))
         est.update(_bar('ETH', ts, e))
 
-    btc_sigma = est.get_annualized_vol('BTC')
-    eth_sigma = est.get_annualized_vol('ETH')
+    btc_sigma = est.get_annual_vol('BTC')
+    eth_sigma = est.get_annual_vol('ETH')
     assert btc_sigma is not None and eth_sigma is not None
 
     btc_arr = np.array(btc_closes, dtype=float)
@@ -395,7 +395,7 @@ def test_sigma_invariant_to_event_cadence():
         ['BTC'], bars_per_year=365, lookback=lookback, timeframe='1d',
     )
     _push_series(est_1d, stub_1d, 'BTC', daily_closes, timeframe='1d')
-    sigma_1d = est_1d.get_annualized_vol('BTC')
+    sigma_1d = est_1d.get_annual_vol('BTC')
 
     # --- (b) 1h-cadence events with same 1d series in the stub ------
     est_1h, stub_1h = _make_estimator(
@@ -408,7 +408,7 @@ def test_sigma_invariant_to_event_cadence():
         for h in range(24):
             hour_ts = day_ts + timedelta(hours=h)
             est_1h.update(_bar('BTC', hour_ts, close))
-    sigma_1h = est_1h.get_annualized_vol('BTC')
+    sigma_1h = est_1h.get_annual_vol('BTC')
 
     assert sigma_1d is not None and sigma_1h is not None
     assert math.isclose(sigma_1d, sigma_1h, rel_tol=1e-12)

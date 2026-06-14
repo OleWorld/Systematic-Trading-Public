@@ -16,40 +16,10 @@ from strategy import EWMACStrategy
 from portfolio import BacktestPortfolio
 from execution import BacktestExecution, SlippageModel, CommissionModel
 from volatility import EWMAVolEstimator, bars_per_year
-from riskmanager import CarverVolTargetingRiskManager
+from riskmanager import VolTargetingRiskManager
 from backtester import Backtester
 from plotting import plot_strategy
 
-# --- Config (validated parameter holder) ---
-# EWMAC defaults need ~756 daily bars of warmup (256-day slow EMA + 500-bar
-# forecast-scalar SMA). The 2021-01 → 2026-04 window gives ~1939 daily bars —
-# plenty for warmup AND post-warmup signal emission.
-#
-# This smoke run exercises the engine's FUTURES-FIRST defaults (dollar vol
-# target, absolute-price-change correlations, absolute slippage, per-contract
-# commission) on the bundled crypto basket. Only days_convention is data-driven:
-# crypto trades 24/7, so 'calendar' (365 d/y) is required for correct vol
-# annualization regardless of the futures-style sizing knobs.
-config = BacktestConfig(
-    symbols=['BTC_USDT:USDT', 'BNB_USDT:USDT', 'SOL_USDT:USDT', 'DOGE_USDT:USDT', 'ETH_USDT:USDT'],
-    instrument_weight_mode='min_variance',
-    corr_mode='absolute_price_chg',         # futures default: .diff() correlations
-    start_date='2021-01-01',
-    end_date='2026-04-23',
-    base_timeframe='1d',
-    days_convention='calendar',             # data-driven: crypto is 24/7 → 365 d/y
-    timeframes={'1d': 500},
-    initial_capital=1_000_000.0,
-    leverage=10.0,
-    vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
-    annualized_target_vol=500_000.0,        # $500k annual vol (≈ the old 0.5 × $1M start)
-    position_buffer=0.25,
-    slippage_mode='absolute',               # futures default: $ per unit
-    slippage_value=0.0,                     # default 0.0 — one fixed tick can't fit BTC & DOGE scales
-    commission_mode='per_contract',         # futures default: $ per contract
-    commission_value=0.0,                   # default 0.0 — per-contract cost isn't uniform across the basket
-    fill_on='signal_close',
-)
 
 # --- Load market data: {symbol: OHLCV DataFrame} ---
 # The user supplies their own data as a {symbol: DataFrame} dict. Here we load a
@@ -59,6 +29,48 @@ sample_csv = os.path.join(os.path.dirname(__file__), 'sample_data', 'crypto_1d.c
 _raw = pd.read_csv(sample_csv)
 _raw['timestamp'] = pd.to_datetime(_raw['timestamp'], utc=True)
 _grouped = {sym: g for sym, g in _raw.groupby('symbol')}
+stables = ['USDC_USDT:USDT', 'USTC_USDT:USDT']
+for sym in stables:
+    del _grouped[sym]
+_symbols = list(str(x) for x in _grouped.keys())
+
+# --- Config (validated parameter holder) ---
+# EWMAC defaults need ~512 daily bars of warmup (256-day slow EMA + 256-bar
+# forecast-scalar SMA). The 2021-01 → 2026-04 window gives ~1939 daily bars —
+# plenty for warmup AND post-warmup signal emission.
+#
+# This smoke run exercises the engine's FUTURES-FIRST defaults (dollar vol
+# target, absolute-price-change correlations, absolute slippage, per-contract
+# commission) on the bundled crypto basket. Only days_convention is data-driven:
+# crypto trades 24/7, so 'calendar' (365 d/y) is required for correct vol
+# annualization regardless of the futures-style sizing knobs.
+config = BacktestConfig(
+    symbols=_symbols,
+    start_date='2021-01-01',
+    end_date='2026-04-23',
+    base_timeframe='1d',
+    days_convention='calendar',             # data-driven: crypto is 24/7 → 365 d/y
+    timeframes={'1d': 500},
+
+    instrument_weight_mode='risk_parity',  # recommended default: 1/N weights, IDM still derived from rho
+    corr_mode='absolute_price_chg',         # futures default: .diff() correlations
+    corr_lookback  = 256,
+    corr_timeframe = '1d',
+
+    initial_capital=10_000_000,
+    leverage=10.0,
+    vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
+    annual_target_vol=1_000_000,        # $1M annual vol
+    position_buffer=0.25,
+
+    slippage_mode='absolute',               # futures default: $ per unit
+    slippage_value=0.0,                     # default 0.0 — one fixed tick can't fit BTC & DOGE scales
+    commission_mode='per_contract',         # futures default: $ per contract
+    commission_value=0.0,                   # default 0.0 — per-contract cost isn't uniform across the basket
+    fill_on='signal_close',
+)
+
+
 data = {
     sym: _grouped[sym].set_index('timestamp')[['Open', 'High', 'Low', 'Close', 'Volume']]
     for sym in config.symbols
@@ -96,10 +108,10 @@ vol_estimator = EWMAVolEstimator(
     timeframe=vol_timeframe, span=36,
 )
 
-risk_manager = CarverVolTargetingRiskManager(
+risk_manager = VolTargetingRiskManager(
     portfolio, strategy, vol_estimator,
     data_handler=data_handler,
-    annualized_target_vol=config.annualized_target_vol,
+    annual_target_vol=config.annual_target_vol,
     vol_target_mode=config.vol_target_mode,
     position_buffer=config.position_buffer,
     instrument_weight_mode=config.instrument_weight_mode,
@@ -107,6 +119,9 @@ risk_manager = CarverVolTargetingRiskManager(
     corr_step_size=config.corr_step_size,
     corr_timeframe=config.corr_timeframe,
     corr_mode=config.corr_mode,
+    corr_floor=config.corr_floor,
+    corr_shrinkage=config.corr_shrinkage,
+    idm_cap=config.idm_cap,
 )
 
 execution = BacktestExecution(
@@ -234,14 +249,41 @@ if not riskmanager_records.empty:
 
 # import plotly.express as px
 # import pandas as pd
-# df = bt.strategy.get_records("BTC_USDT:USDT")
+# symbol = 'DOGE_USDT:USDT'
+# df = bt.strategy.get_records(symbol)
 # fig = plot_strategy(df,
 #                     indicators={'fast_ema_16_64': 1, 'slow_ema_16_64': 1,
-#                                 'forecast_16_64': 2, 'forecast_32_128': 2,
-#                                 'forecast_64_256': 2, 'forecast': 2},
-#                     title='BTC_USDT:USDT EWMAC', timeframe='1d')
-# fig.show(config=dict({'scrollZoom':True}))
-# fig = px.line(equity_df['realized_pnl'].apply(pd.Series) + equity_df['unrealized_pnl'].apply(pd.Series))
-# fig.show()
-# fig = px.line(equity_df[['account_balance', 'available_balance']])
-# fig.show()
+#                                 'forecast': 2},
+#                     title=f'{symbol} EWMAC', timeframe='1d')
+# fig.show(config=dict({'scrollZoom':True}), renderer='browser')
+
+# import plotly.express as px
+# total = (
+#     pd.DataFrame(equity_df['realized_pnl'].tolist(),   index=equity_df.index)
+#     + pd.DataFrame(equity_df['unrealized_pnl'].tolist(), index=equity_df.index)
+# )
+# pnl_by_instrument = total.groupby(level=0).last()   # one row per timestamp
+# fig = px.line(pnl_by_instrument)
+# fig.show(renderer='browser')
+# fig = px.line(equity_df[['account_balance', 'available_balance']].resample('d').last())
+# fig.show(renderer='browser')
+
+# import plotly.express as px
+# list_weights = []
+# for x in bt.risk_manager.get_live_symbols():
+#     weight = bt.risk_manager.get_records(x)['instrument_weight'].astype(float)
+#     weight.name = x
+#     list_weights.append( weight )
+# df_weight = pd.concat(list_weights, axis=1)
+# fig = px.line(df_weight)
+# fig.show(renderer='browser')
+
+# from analytics import correlation_matrix
+# list_close = []
+# for x in bt.risk_manager.get_live_symbols():
+#     close = bt.strategy.get_records(x)['close'].astype(float)
+#     close.name = x
+#     list_close.append( close )
+# df_close = pd.concat(list_close, axis=1)
+# corr_matrix = correlation_matrix(df_close.diff().dropna(), lookback=60)
+# corr_matrix = correlation_matrix(df_close.diff().dropna(), lookback=60, shrinkage='ledoit_wolf')

@@ -5,19 +5,19 @@ Submodules (internal):
     _simple_riskmanager    SimpleRiskManager (simple forecast follower —
                            direction from forecast sign, magnitude from
                            configured sizing mode)
-    _vol_targeting         CarverVolTargetingRiskManager (vol-targeting
+    _vol_targeting         VolTargetingRiskManager (vol-targeting
                            Carver framework — target notional scales with
-                           annualized_target_vol / sigma and forecast
+                           annual_target_vol / sigma and forecast
                            magnitude; execution-mode agnostic — same
                            class for backtest and live)
 """
 
 from riskmanager._base import RiskManager
 from riskmanager._simple_riskmanager import SimpleRiskManager
-from riskmanager._vol_targeting import CarverVolTargetingRiskManager
+from riskmanager._vol_targeting import VolTargetingRiskManager
 
 __all__ = [
     "RiskManager",
     "SimpleRiskManager",
-    "CarverVolTargetingRiskManager",
+    "VolTargetingRiskManager",
 ]

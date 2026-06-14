@@ -68,7 +68,7 @@ class Strategy(ABC):
         ``+FORECAST_CAP`` = max long conviction.
 
     ``TARGET_AVG_ABS_FORECAST`` is the average ``|forecast|`` value each
-    strategy is expected to calibrate toward. ``CarverVolTargetingRiskManager``
+    strategy is expected to calibrate toward. ``VolTargetingRiskManager``
     divides the forecast by ``TARGET_AVG_ABS_FORECAST`` so that
     ``|forecast| = TARGET_AVG_ABS_FORECAST`` reproduces Carver's basic
     vol-target notional and ``|forecast| = FORECAST_CAP`` doubles it.
@@ -78,7 +78,7 @@ class Strategy(ABC):
 
     # Project-wide forecast convention. Treated as constants — do not override
     # in subclasses; both ``Strategy.update_bar`` and
-    # ``CarverVolTargetingRiskManager`` read them via the class.
+    # ``VolTargetingRiskManager`` read them via the class.
     TARGET_AVG_ABS_FORECAST: float = 50.0
     FORECAST_CAP: float = 100.0
 
@@ -97,9 +97,17 @@ class Strategy(ABC):
         """
         self.data_handler = data_handler
         self.symbol_list = symbol_list
-        # Per-symbol cached forecast in [-100, +100], default 0.0 (flat).
-        # The risk manager reads this dict on every completed bar.
-        self.forecasts: Dict[str, float] = {s: 0.0 for s in symbol_list}
+        # Per-symbol cached forecast in [-100, +100]. Default None means
+        # "no forecast cached yet" (warmup) — distinct from a genuine flat
+        # forecast of 0.0. The risk manager reads this dict on every
+        # completed bar via get_forecast().
+        self.forecasts: Dict[str, Optional[float]] = {s: None for s in symbol_list}
+        # Per-symbol warmup flag: False until the first non-NaN forecast
+        # is cached for the symbol, then True forever (monotone). This is
+        # the *measured* end-of-warmup signal the risk manager's universe
+        # liveness gate consumes via ``is_warmed_up`` — no declared
+        # bar-count estimate needed.
+        self._warmed_up: Dict[str, bool] = {s: False for s in symbol_list}
         # Per-symbol list of row dicts, populated by update_bar() on each bar.
         self._records: Dict[str, List[Dict]] = defaultdict(list)
 
@@ -130,6 +138,8 @@ class Strategy(ABC):
                     clamped = max(-cap, min(cap, float(raw)))
                     self.forecasts[event.symbol] = clamped
                     extras['forecast'] = clamped
+                    # First real forecast ⇒ warmup is over for this symbol.
+                    self._warmed_up[event.symbol] = True
             base_row.update(extras)
 
         self._record_row(event.symbol, base_row)
@@ -151,13 +161,30 @@ class Strategy(ABC):
         """
         raise NotImplementedError
 
-    def get_forecast(self, symbol: str) -> float:
-        """Return the cached forecast for ``symbol`` (default ``0.0``).
+    def get_forecast(self, symbol: str) -> Optional[float]:
+        """Return the cached forecast for ``symbol``, or ``None`` if none yet.
 
-        The risk manager calls this on every completed bar to derive the
-        target position. Unknown symbols silently return ``0.0``.
+        ``None`` means no real forecast has been cached (warmup) — distinct
+        from a genuine flat forecast of ``0.0``. The risk manager calls this
+        on every completed bar to derive the target position; its liveness
+        gate keeps weight off un-warmed symbols, so the sizing arithmetic
+        never sees ``None``. Mirrors ``VolEstimator.get_annual_vol`` which
+        likewise returns ``None`` while warming up. Unknown symbols return
+        ``None``.
         """
-        return self.forecasts.get(symbol, 0.0)
+        return self.forecasts.get(symbol)
+
+    def is_warmed_up(self, symbol: str) -> bool:
+        """Return True once ``symbol`` has produced its first non-NaN forecast.
+
+        Measured, not estimated: the flag flips inside ``update_bar`` at
+        the exact moment the first real forecast is written to the cache,
+        and never resets (monotone). The risk manager's universe liveness
+        gate reads this to keep instrument weight away from symbols whose
+        strategy cannot trade yet (e.g. indicator chains still warming
+        up). Unknown symbols return ``False``.
+        """
+        return self._warmed_up.get(symbol, False)
 
     @staticmethod
     def sizing_with_probability(p: float, num_classes: int = 2) -> float:

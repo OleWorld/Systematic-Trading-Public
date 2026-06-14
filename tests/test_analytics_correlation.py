@@ -170,3 +170,141 @@ def test_accepts_all_documented_methods():
     for m in ('pearson', 'spearman', 'kendall'):
         result = correlation_matrix(df, method=m)
         assert result.shape == (2, 2)
+
+
+# ──────────────────────────────────────────────
+# Ledoit-Wolf shrinkage
+# ──────────────────────────────────────────────
+
+def _noisy_frame(n_rows: int = 60, n_cols: int = 4, seed: int = 5) -> pd.DataFrame:
+    """Correlated noisy returns — small sample so LW intensity is > 0."""
+    rng = np.random.default_rng(seed=seed)
+    common = rng.normal(size=n_rows)
+    cols = {
+        f'c{i}': common + rng.normal(scale=1.5, size=n_rows)
+        for i in range(n_cols)
+    }
+    return pd.DataFrame(cols)
+
+
+def _standardize(values: pd.DataFrame) -> np.ndarray:
+    """Column-wise z-scores (population std, ddof=0) — the scale-invariant
+    pre-step the shrinkage estimator applies before fitting."""
+    arr = values.to_numpy(dtype=float)
+    return (arr - arr.mean(axis=0)) / arr.std(axis=0, ddof=0)
+
+
+def _sklearn_lw_corr(values: pd.DataFrame) -> np.ndarray:
+    """Reference: standardize, then direct sklearn LedoitWolf fit + cov→corr."""
+    from sklearn.covariance import LedoitWolf
+    cov = LedoitWolf().fit(_standardize(values)).covariance_
+    d = np.sqrt(np.diag(cov))
+    corr = cov / np.outer(d, d)
+    np.fill_diagonal(corr, 1.0)
+    return corr
+
+
+def test_ledoit_wolf_matches_direct_sklearn_fit():
+    """Golden: shrinkage='ledoit_wolf' equals cov2corr of a direct sklearn fit."""
+    df = _noisy_frame()
+    m = correlation_matrix(df, shrinkage='ledoit_wolf')
+    np.testing.assert_allclose(m.to_numpy(), _sklearn_lw_corr(df), atol=1e-12)
+    assert list(m.index) == list(df.columns)
+    assert list(m.columns) == list(df.columns)
+
+
+def test_ledoit_wolf_output_is_valid_correlation_matrix():
+    """Unit diagonal, symmetric, strictly PD, entries in [-1, 1]."""
+    m = correlation_matrix(_noisy_frame(), shrinkage='ledoit_wolf')
+    arr = m.to_numpy()
+    np.testing.assert_allclose(np.diag(arr), 1.0)
+    np.testing.assert_allclose(arr, arr.T, atol=0.0)
+    assert np.all(arr >= -1.0) and np.all(arr <= 1.0)
+    assert np.linalg.eigvalsh(arr).min() > 0.0  # PD, not just PSD
+
+
+def test_ledoit_wolf_pulls_off_diagonals_toward_zero():
+    """Identity-target shrinkage shrinks every off-diagonal toward 0
+    (|shrunk| <= |sample| holds elementwise; strict on noisy data)."""
+    df = _noisy_frame()
+    sample = correlation_matrix(df).to_numpy()
+    shrunk = correlation_matrix(df, shrinkage='ledoit_wolf').to_numpy()
+    off = ~np.eye(len(df.columns), dtype=bool)
+    assert np.all(np.abs(shrunk[off]) < np.abs(sample[off]))
+
+
+def test_ledoit_wolf_is_scale_invariant():
+    """A correlation estimator must be scale-invariant: rescaling a column
+    by any positive constant leaves the shrunk correlation matrix unchanged.
+
+    Regression for the bug where LW shrank the *raw-scale* covariance toward
+    μI — on inputs spanning orders of magnitude (e.g. absolute price changes
+    of BTC ~$60k vs DOGE ~$0.10) the scaled-identity target inflated the
+    low-variance columns' shrunk diagonal, collapsing every off-diagonal
+    toward 0. Standardizing columns before the fit makes the result match the
+    scale-invariant unshrunk path.
+    """
+    df = _noisy_frame()
+    base = correlation_matrix(df, shrinkage='ledoit_wolf')
+    scaled = df.copy()
+    scaled['c0'] *= 1e6
+    scaled['c1'] *= 1e-6
+    rescaled = correlation_matrix(scaled, shrinkage='ledoit_wolf')
+    np.testing.assert_allclose(rescaled.to_numpy(), base.to_numpy(), atol=1e-9)
+    assert np.isclose(rescaled.attrs['lw_shrinkage'], base.attrs['lw_shrinkage'])
+
+
+def test_ledoit_wolf_attrs_expose_intensity():
+    """Fitted shrinkage coefficient is attached as attrs['lw_shrinkage']."""
+    df = _noisy_frame()
+    m = correlation_matrix(df, shrinkage='ledoit_wolf')
+    delta = m.attrs['lw_shrinkage']
+    assert 0.0 < delta <= 1.0
+    from sklearn.covariance import LedoitWolf
+    expected = LedoitWolf().fit(_standardize(df)).shrinkage_
+    assert np.isclose(delta, expected)
+
+
+def test_ledoit_wolf_respects_lookback():
+    """Shrinkage on lookback=N equals a direct fit on the last N rows."""
+    df = _noisy_frame(n_rows=200)
+    m = correlation_matrix(df, lookback=60, shrinkage='ledoit_wolf')
+    np.testing.assert_allclose(
+        m.to_numpy(), _sklearn_lw_corr(df.iloc[-60:]), atol=1e-12,
+    )
+
+
+def test_ledoit_wolf_uses_listwise_deletion_for_nans():
+    """LW needs complete rows: NaN rows are dropped listwise (unlike the
+    pairwise unshrunk path), so the result equals a fit on df.dropna()."""
+    df = _noisy_frame()
+    df.iloc[3, 0] = np.nan
+    df.iloc[10, 2] = np.nan
+    m = correlation_matrix(df, shrinkage='ledoit_wolf')
+    np.testing.assert_allclose(
+        m.to_numpy(), _sklearn_lw_corr(df.dropna()), atol=1e-12,
+    )
+
+
+def test_ledoit_wolf_too_few_complete_rows_raises():
+    """Fewer than 2 complete rows after listwise deletion → ValueError."""
+    df = _frame(
+        a=np.array([1.0, np.nan, 2.0, np.nan]),
+        b=np.array([np.nan, 1.0, 3.0, np.nan]),
+    )
+    with pytest.raises(ValueError, match="complete rows"):
+        correlation_matrix(df, shrinkage='ledoit_wolf')
+
+
+def test_ledoit_wolf_requires_pearson():
+    """Shrinkage is covariance-based — only valid with method='pearson'."""
+    df = _noisy_frame()
+    for m in ('spearman', 'kendall'):
+        with pytest.raises(ValueError, match="method='pearson'"):
+            correlation_matrix(df, method=m, shrinkage='ledoit_wolf')
+
+
+def test_rejects_unknown_shrinkage():
+    df = _noisy_frame()
+    with pytest.raises(ValueError, match="shrinkage must be"):
+        correlation_matrix(df, shrinkage='bogus')

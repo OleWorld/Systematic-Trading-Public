@@ -32,7 +32,7 @@ class _PortfolioLike(Protocol):
 # ──────────────────────────────────────────────
 
 class _DataHandlerLike(Protocol):
-    """Subset of the DataHandler surface that CarverVolTargetingRiskManager reads.
+    """Subset of the DataHandler surface that VolTargetingRiskManager reads.
 
     Used to pull a trailing window of closes for the inline correlation-matrix
     derivation in ``calculate_instrument_weight`` (``mode='min_variance'``,
@@ -60,11 +60,18 @@ class _StrategyLike(Protocol):
 
     ``symbol_list`` is read at risk-manager construction time to seed
     the equal-weight ``instrument_weight`` dict.
+
+    ``is_warmed_up(symbol)`` is the strategy's measured end-of-warmup
+    signal (True once the first non-NaN forecast has been cached) —
+    consumed by ``VolTargetingRiskManager.get_live_symbols`` as
+    the strategy gate of the universe liveness check.
     """
 
     symbol_list: List[str]
 
-    def get_forecast(self, symbol: str) -> float: ...
+    def get_forecast(self, symbol: str) -> Optional[float]: ...
+
+    def is_warmed_up(self, symbol: str) -> bool: ...
 
 
 # ──────────────────────────────────────────────
@@ -128,9 +135,10 @@ class RiskManager(ABC):
         Owns the entire target-derivation pipeline — fetching sigma /
         price / forecast / weights, building any intermediate values,
         and applying the target formula. Owns *target-derivation* skip
-        reasons (e.g. ``'warmup'`` / ``'zero_vol'`` / ``'zero_weight'``
-        for Carver; ``'no_price'`` for Simple). Has no side effects on
-        the portfolio or the records buffer.
+        reasons (e.g. the ``'warmup_*'`` family / ``'zero_vol'`` /
+        ``'zero_weight'`` for Carver; ``'no_price'`` / ``'warmup_forecast'``
+        for Simple). Has no side effects on the portfolio or the records
+        buffer.
 
         Returns a dict that ``update_bar`` splices into the diagnostic
         row. Required keys (every subclass):

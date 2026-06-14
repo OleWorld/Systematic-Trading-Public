@@ -1,9 +1,9 @@
 """
-Unit tests for ``CarverVolTargetingRiskManager``.
+Unit tests for ``VolTargetingRiskManager``.
 
 Pin:
 - Golden cash-vol formula:
-    target_qty = (capital * idm * sw * iw * annualized_target_vol * (forecast/50)) / sigma
+    target_qty = (capital * idm * sw * iw * annual_target_vol * (forecast/50)) / sigma
   where ``sigma`` is the annualized stdev of price changes ($-vol),
   ``sw`` = strategy_weight, ``iw`` = instrument_weight.
 - Direction sign comes from ``trade_qty``.
@@ -13,12 +13,13 @@ Pin:
 - Idempotency: a stable forecast on consecutive bars submits at most one
   order (the second call sees the realized position at target).
 - Position buffer (Carver §10.7) dead-band.
-- Constructor validation (idm, annualized_target_vol, position_buffer ranges).
+- Constructor validation (idm, annual_target_vol, position_buffer ranges).
 - Built-in instrument / strategy weight defaults + recalc.
 
 Run from the repo root:  pytest tests/test_riskmanager_carver.py -v
 """
 
+import logging
 import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -27,8 +28,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from analytics import correlation_matrix
 from event import BarEvent, OrderType, Direction
-from riskmanager import CarverVolTargetingRiskManager
+from riskmanager import VolTargetingRiskManager
 
 
 # ──────────────────────────────────────────────
@@ -67,21 +69,33 @@ class FakeStrategy:
     """Forecast oracle + symbol_list source for the risk manager.
 
     ``symbol_list`` is read at construction time by
-    ``CarverVolTargetingRiskManager.calculate_instrument_weight`` to
-    populate the equal-weight default.
+    ``VolTargetingRiskManager.calculate_instrument_weight`` to
+    populate the equal-weight default. ``warmed_up`` configures the
+    per-symbol ``is_warmed_up`` flag consumed by the liveness gate:
+    ``None`` (default) reports every symbol as warmed — tests that
+    exercise the strategy gate pass an explicit dict.
     """
 
     def __init__(self, forecasts: Optional[Dict[str, float]] = None,
-                 symbol_list: Optional[List[str]] = None):
+                 symbol_list: Optional[List[str]] = None,
+                 warmed_up: Optional[Dict[str, bool]] = None):
         self._forecasts: Dict[str, float] = (
             dict(forecasts) if forecasts is not None else {}
         )
         self.symbol_list: List[str] = (
             list(symbol_list) if symbol_list is not None else ['BTC']
         )
+        self._warmed_up: Optional[Dict[str, bool]] = (
+            dict(warmed_up) if warmed_up is not None else None
+        )
 
     def get_forecast(self, symbol: str) -> float:
         return self._forecasts.get(symbol, 0.0)
+
+    def is_warmed_up(self, symbol: str) -> bool:
+        if self._warmed_up is None:
+            return True
+        return self._warmed_up.get(symbol, False)
 
 
 class FakeVolEstimator:
@@ -96,7 +110,7 @@ class FakeVolEstimator:
     def update(self, event: BarEvent) -> None:
         self.update_calls.append(event)
 
-    def get_annualized_vol(self, symbol: str) -> Optional[float]:
+    def get_annual_vol(self, symbol: str) -> Optional[float]:
         return self._vols.get(symbol)
 
 
@@ -158,7 +172,7 @@ def _make(
     balance: float = 100_000.0,
     positions: Optional[Dict[str, float]] = None,
     idm: float = 1.0,
-    annualized_target_vol: float = 0.25,
+    annual_target_vol: float = 0.25,
     position_buffer: float = 0.0,
     # Golden-formula tests pin Carver's original percent-of-equity form;
     # the class default is 'dollar_volatility' (futures-first).
@@ -168,11 +182,11 @@ def _make(
     strat = FakeStrategy({'BTC': forecast}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': sigma})
     dh = FakeDataHandler()
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol,
         data_handler=dh,
         idm=idm,
-        annualized_target_vol=annualized_target_vol,
+        annual_target_vol=annual_target_vol,
         vol_target_mode=vol_target_mode,
         position_buffer=position_buffer,
     )
@@ -189,15 +203,19 @@ def _make(
 def test_constructor_rejects_non_positive_idm():
     with pytest.raises(ValueError, match="idm"):
         _make(idm=0)
+    # NaN must be rejected too: every downstream use (target_qty formula,
+    # idm > idm_cap coherence check) would silently swallow it.
+    with pytest.raises(ValueError, match="idm"):
+        _make(idm=float('nan'))
 
 
-def test_constructor_rejects_annualized_target_vol_outside_open_unit_interval():
-    with pytest.raises(ValueError, match="annualized_target_vol"):
-        _make(annualized_target_vol=0.0)
-    with pytest.raises(ValueError, match="annualized_target_vol"):
-        _make(annualized_target_vol=1.0)
-    with pytest.raises(ValueError, match="annualized_target_vol"):
-        _make(annualized_target_vol=-0.1)
+def test_constructor_rejects_annual_target_vol_outside_open_unit_interval():
+    with pytest.raises(ValueError, match="annual_target_vol"):
+        _make(annual_target_vol=0.0)
+    with pytest.raises(ValueError, match="annual_target_vol"):
+        _make(annual_target_vol=1.0)
+    with pytest.raises(ValueError, match="annual_target_vol"):
+        _make(annual_target_vol=-0.1)
 
 
 def test_constructor_rejects_position_buffer_outside_unit_interval():
@@ -214,11 +232,11 @@ def test_constructor_position_buffer_default_is_quarter():
     default on the class itself, not the test-helper override.
     """
     pf = FakePortfolio(balance=100_000.0, positions={'BTC': 0.0})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, FakeStrategy({'BTC': 0.0}, symbol_list=['BTC']),
         FakeVolEstimator({'BTC': 8000.0}),
         data_handler=FakeDataHandler(),
-        annualized_target_vol=0.25,
+        annual_target_vol=0.25,
     )
     assert rm.position_buffer == 0.25
 
@@ -229,34 +247,53 @@ def test_constructor_default_instrument_weight_mode_is_equal_weight():
     strat = FakeStrategy({'BTC': 0.0}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': 8000.0})
     dh = FakeDataHandler()
-    rm_default = CarverVolTargetingRiskManager(
-        pf, strat, vol, data_handler=dh, annualized_target_vol=0.25,
+    rm_default = VolTargetingRiskManager(
+        pf, strat, vol, data_handler=dh, annual_target_vol=0.25,
     )
     assert rm_default.instrument_weight_mode == 'equal_weight'
-    rm_explicit = CarverVolTargetingRiskManager(
+    rm_explicit = VolTargetingRiskManager(
         pf, strat, vol, data_handler=dh, instrument_weight_mode='equal_weight',
-        annualized_target_vol=0.25,
+        annual_target_vol=0.25,
     )
     assert rm_explicit.instrument_weight_mode == 'equal_weight'
 
 
-def test_constructor_with_min_variance_mode_and_empty_deques_falls_back(caplog):
-    """min_variance + empty data handler → WARNING + equal-weight fallback,
-    no exception. ``self.idm`` is left at its constructor default."""
+def test_constructor_with_min_variance_mode_and_empty_deques_yields_empty_universe(caplog):
+    """min_variance + empty data handler → no live symbols: empty weight
+    dict + INFO log, no exception. ``self.idm`` is left at its
+    constructor default."""
     pf = FakePortfolio(balance=100_000.0, positions={'BTC': 0.0, 'ETH': 0.0})
     strat = FakeStrategy({'BTC': 0.0, 'ETH': 0.0}, symbol_list=['BTC', 'ETH'])
     vol = FakeVolEstimator({'BTC': 8000.0, 'ETH': 8000.0})
     dh = FakeDataHandler()                                      # empty closes
-    with caplog.at_level('WARNING'):
-        rm = CarverVolTargetingRiskManager(
+    with caplog.at_level('INFO'):
+        rm = VolTargetingRiskManager(
             pf, strat, vol, data_handler=dh,
             instrument_weight_mode='min_variance',
-            annualized_target_vol=0.25,
+            annual_target_vol=0.25,
         )
-    assert math.isclose(rm.instrument_weight['BTC'], 0.5, rel_tol=1e-12)
-    assert math.isclose(rm.instrument_weight['ETH'], 0.5, rel_tol=1e-12)
+    assert rm.instrument_weight == {}
     assert rm.idm == 1.0                                        # constructor default
-    assert any('min_variance' in r.message and 'falling back' in r.message
+    assert any('min_variance' in r.message and 'no live symbols' in r.message
+               for r in caplog.records)
+
+
+def test_constructor_with_risk_parity_mode_and_empty_deques_yields_empty_universe(caplog):
+    """risk_parity + empty data handler → no live symbols: empty weight
+    dict + INFO log (same degradation contract as min_variance)."""
+    pf = FakePortfolio(balance=100_000.0, positions={'BTC': 0.0, 'ETH': 0.0})
+    strat = FakeStrategy({'BTC': 0.0, 'ETH': 0.0}, symbol_list=['BTC', 'ETH'])
+    vol = FakeVolEstimator({'BTC': 8000.0, 'ETH': 8000.0})
+    dh = FakeDataHandler()                                      # empty closes
+    with caplog.at_level('INFO'):
+        rm = VolTargetingRiskManager(
+            pf, strat, vol, data_handler=dh,
+            instrument_weight_mode='risk_parity',
+            annual_target_vol=0.25,
+        )
+    assert rm.instrument_weight == {}
+    assert rm.idm == 1.0                                        # constructor default
+    assert any('risk_parity' in r.message and 'no live symbols' in r.message
                for r in caplog.records)
 
 
@@ -266,10 +303,10 @@ def test_constructor_with_unknown_instrument_weight_mode_raises():
     strat = FakeStrategy({'BTC': 0.0}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': 8000.0})
     with pytest.raises(ValueError, match="mode"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             pf, strat, vol, data_handler=FakeDataHandler(),
             instrument_weight_mode='bogus',
-            annualized_target_vol=0.25,
+            annual_target_vol=0.25,
         )
 
 
@@ -282,9 +319,9 @@ def test_calculate_instrument_weight_with_no_mode_arg_reads_stored_field():
     pf = FakePortfolio(balance=100_000.0, positions={'BTC': 0.0, 'ETH': 0.0})
     strat = FakeStrategy({'BTC': 0.0, 'ETH': 0.0}, symbol_list=['BTC', 'ETH'])
     vol = FakeVolEstimator({'BTC': 8000.0, 'ETH': 8000.0})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol, data_handler=FakeDataHandler(),
-        annualized_target_vol=0.25,
+        annual_target_vol=0.25,
     )                                                           # default mode
     # Flip the stored mode + provide a corr matrix; the next no-arg call
     # must dispatch on the stored field, not the old literal default.
@@ -301,19 +338,19 @@ def test_calculate_instrument_weight_with_no_mode_arg_reads_stored_field():
 
 def test_constructor_rejects_corr_lookback_below_two():
     with pytest.raises(ValueError, match="corr_lookback"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=FakeDataHandler(),
-            corr_lookback=1, annualized_target_vol=0.25,
+            corr_lookback=1, annual_target_vol=0.25,
         )
 
 
 def test_constructor_rejects_negative_corr_step_size():
     with pytest.raises(ValueError, match="corr_step_size"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=FakeDataHandler(),
-            corr_step_size=-1, annualized_target_vol=0.25,
+            corr_step_size=-1, annual_target_vol=0.25,
         )
 
 
@@ -321,10 +358,10 @@ def test_constructor_rejects_unregistered_corr_timeframe():
     """``corr_timeframe`` must appear in ``data_handler.timeframes``."""
     dh = FakeDataHandler(timeframes={'1d': 500})                # no '4h'
     with pytest.raises(ValueError, match="corr_timeframe"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=dh, corr_timeframe='4h',
-            annualized_target_vol=0.25,
+            annual_target_vol=0.25,
         )
 
 
@@ -333,12 +370,16 @@ def test_constructor_rejects_unregistered_corr_timeframe():
 # ──────────────────────────────────────────────
 
 def test_instrument_weight_default_is_equal_weight_two_symbols():
-    """``calculate_instrument_weight`` runs at __init__ and produces 1/N."""
+    """``calculate_instrument_weight`` runs at __init__ and produces 1/N
+    over the live universe (both symbols carry the full lookback)."""
     pf = FakePortfolio()
     strat = FakeStrategy({'BTC': 0.0, 'ETH': 0.0}, symbol_list=['BTC', 'ETH'])
-    rm = CarverVolTargetingRiskManager(
-        pf, strat, FakeVolEstimator(), data_handler=FakeDataHandler(),
-        annualized_target_vol=0.25,
+    dh = FakeDataHandler(closes={
+        'BTC': _price_series(60, seed=0), 'ETH': _price_series(60, seed=1),
+    })
+    rm = VolTargetingRiskManager(
+        pf, strat, FakeVolEstimator(), data_handler=dh,
+        corr_lookback=60, annual_target_vol=0.25,
     )
     assert math.isclose(rm.instrument_weight['BTC'], 0.5)
     assert math.isclose(rm.instrument_weight['ETH'], 0.5)
@@ -348,9 +389,13 @@ def test_instrument_weight_default_is_equal_weight_two_symbols():
 def test_instrument_weight_default_is_equal_weight_three_symbols():
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=['BTC', 'ETH', 'SOL'])
-    rm = CarverVolTargetingRiskManager(
-        pf, strat, FakeVolEstimator(), data_handler=FakeDataHandler(),
-        annualized_target_vol=0.25,
+    dh = FakeDataHandler(closes={
+        s: _price_series(60, seed=i)
+        for i, s in enumerate(['BTC', 'ETH', 'SOL'])
+    })
+    rm = VolTargetingRiskManager(
+        pf, strat, FakeVolEstimator(), data_handler=dh,
+        corr_lookback=60, annual_target_vol=0.25,
     )
     for s in ['BTC', 'ETH', 'SOL']:
         assert math.isclose(rm.instrument_weight[s], 1.0 / 3.0)
@@ -361,9 +406,9 @@ def test_strategy_weight_default_is_one_for_single_strategy():
     """Placeholder: ``{strategy_class_name: 1.0}`` for the one bound strategy."""
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=['BTC'])
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=FakeDataHandler(),
-        annualized_target_vol=0.25,
+        annual_target_vol=0.25,
     )
     assert rm.strategy_weight == {'FakeStrategy': 1.0}
 
@@ -371,9 +416,12 @@ def test_strategy_weight_default_is_one_for_single_strategy():
 def test_calculate_instrument_weight_is_recallable_after_symbol_list_change():
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=['BTC'])
-    rm = CarverVolTargetingRiskManager(
-        pf, strat, FakeVolEstimator(), data_handler=FakeDataHandler(),
-        annualized_target_vol=0.25,
+    dh = FakeDataHandler(closes={
+        'BTC': _price_series(60, seed=0), 'ETH': _price_series(60, seed=1),
+    })
+    rm = VolTargetingRiskManager(
+        pf, strat, FakeVolEstimator(), data_handler=dh,
+        corr_lookback=60, annual_target_vol=0.25,
     )
     assert rm.instrument_weight == {'BTC': 1.0}
     strat.symbol_list = ['BTC', 'ETH']
@@ -385,9 +433,9 @@ def test_calculate_instrument_weight_is_recallable_after_symbol_list_change():
 def test_calculate_strategy_weight_is_recallable():
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=['BTC'])
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=FakeDataHandler(),
-        annualized_target_vol=0.25,
+        annual_target_vol=0.25,
     )
     rm.strategy_weight = {'OverriddenName': 0.7}
     rm.calculate_strategy_weight()
@@ -399,7 +447,7 @@ def test_calculate_strategy_weight_is_recallable():
 # ──────────────────────────────────────────────
 
 def test_golden_carver_formula():
-    """Capital=100k, idm=1, sw=1.0, iw=0.5, annualized_target_vol=0.25,
+    """Capital=100k, idm=1, sw=1.0, iw=0.5, annual_target_vol=0.25,
     sigma=$8000 ($-vol), forecast=+50 →
        annual_cash_target = 100k * 1 * 1 * 0.5 * 0.25 * (50/50) = 12_500
        target_qty         = 12_500 / 8_000 = 1.5625.
@@ -453,17 +501,17 @@ def _make_dollar(
     sigma: float = 8000.0,
     weight: float = 0.5,
     balance: float = 100_000.0,
-    annualized_target_vol: float = 250_000.0,
+    annual_target_vol: float = 250_000.0,
 ):
     """Dollar-mode twin of ``_make``: fixed annual $ vol budget."""
     pf = FakePortfolio(balance=balance, positions={'BTC': 0.0})
     strat = FakeStrategy({'BTC': forecast}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': sigma})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol,
         data_handler=FakeDataHandler(),
         vol_target_mode='dollar_volatility',
-        annualized_target_vol=annualized_target_vol,
+        annual_target_vol=annual_target_vol,
         position_buffer=0.0,
     )
     rm.instrument_weight = {'BTC': weight}
@@ -472,10 +520,10 @@ def _make_dollar(
 
 def test_vol_target_mode_defaults_to_dollar_volatility():
     """Futures-first default: the mode is 'dollar_volatility' unless set."""
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
         FakeVolEstimator(), data_handler=FakeDataHandler(),
-        annualized_target_vol=0.25,
+        annual_target_vol=0.25,
     )
     assert rm.vol_target_mode == 'dollar_volatility'
 
@@ -518,10 +566,10 @@ def test_percent_mode_target_scales_with_capital():
     )
 
 
-def test_constructor_rejects_none_annualized_target_vol():
+def test_constructor_rejects_none_annual_target_vol():
     """tau no longer has a default — it must be supplied explicitly."""
-    with pytest.raises(ValueError, match="annualized_target_vol"):
-        CarverVolTargetingRiskManager(
+    with pytest.raises(ValueError, match="annual_target_vol"):
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=FakeDataHandler(),
         )
@@ -529,34 +577,34 @@ def test_constructor_rejects_none_annualized_target_vol():
 
 def test_dollar_mode_rejects_non_positive_tau():
     for bad in (0.0, -1.0, -250_000.0):
-        with pytest.raises(ValueError, match="annualized_target_vol"):
-            CarverVolTargetingRiskManager(
+        with pytest.raises(ValueError, match="annual_target_vol"):
+            VolTargetingRiskManager(
                 FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
                 FakeVolEstimator(), data_handler=FakeDataHandler(),
                 vol_target_mode='dollar_volatility',
-                annualized_target_vol=bad,
+                annual_target_vol=bad,
             )
 
 
 def test_dollar_mode_accepts_large_dollar_tau():
     """tau >= 1 is valid in dollar mode (it's a dollar amount, not a
     fraction) — would violate the percent-mode (0, 1) range."""
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
         FakeVolEstimator(), data_handler=FakeDataHandler(),
         vol_target_mode='dollar_volatility',
-        annualized_target_vol=250_000.0,
+        annual_target_vol=250_000.0,
     )
-    assert rm.annualized_target_vol == 250_000.0
+    assert rm.annual_target_vol == 250_000.0
 
 
 def test_constructor_rejects_unknown_vol_target_mode():
     with pytest.raises(ValueError, match="vol_target_mode"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=FakeDataHandler(),
             vol_target_mode='notional_volatility',
-            annualized_target_vol=0.25,
+            annual_target_vol=0.25,
         )
 
 
@@ -637,6 +685,90 @@ def test_skip_when_strategy_weight_is_zero():
     assert pf.submitted == []
     row = rm.get_records('BTC').iloc[0]
     assert row['skip_reason'] == 'zero_weight'
+
+
+# ──────────────────────────────────────────────
+# A skip must never orphan a HELD position
+# ──────────────────────────────────────────────
+
+def test_held_position_zero_instrument_weight_is_flattened():
+    """The orphaned-position bug: a zero instrument weight on a HELD
+    position must FLATTEN it (target_qty=0 → close), not silently skip it.
+    Mirrors the forecast=0 flatten path exactly."""
+    pf, _, _, rm = _make(weight=0.0, positions={'BTC': 3.0})
+    rm.update_bar(_bar())
+    assert len(pf.submitted) == 1
+    order = pf.submitted[0]
+    assert order['direction'] == Direction.SELL
+    assert math.isclose(order['quantity'], 3.0)
+    assert order['order_type'] == OrderType.MKT
+    row = rm.get_records('BTC').iloc[0]
+    assert row['submitted']
+    assert row['skip_reason'] is None
+    assert row['target_qty'] == 0.0
+
+
+def test_held_position_zero_strategy_weight_is_flattened():
+    """Same invariant via a zero *strategy* weight on a held short — the
+    diff back to flat is a BUY of the (absolute) position size."""
+    pf, _, _, rm = _make(positions={'BTC': -2.0})
+    rm.strategy_weight = {'FakeStrategy': 0.0}
+    rm.update_bar(_bar())
+    assert len(pf.submitted) == 1
+    order = pf.submitted[0]
+    assert order['direction'] == Direction.BUY
+    assert math.isclose(order['quantity'], 2.0)
+
+
+def test_flat_position_zero_weight_still_labelled_zero_weight():
+    """Regression guard for the flat case: a zero weight with no open
+    position submits nothing and keeps the informative 'zero_weight'
+    label (not the generic 'at_target')."""
+    pf, _, _, rm = _make(weight=0.0, positions={'BTC': 0.0})
+    rm.update_bar(_bar())
+    assert pf.submitted == []
+    assert rm.get_records('BTC').iloc[0]['skip_reason'] == 'zero_weight'
+
+
+@pytest.mark.parametrize('sigma,expected_reason', [
+    (None, 'warmup_volatility'),
+    (0.0, 'zero_vol'),
+])
+def test_held_position_no_target_skip_warns(caplog, sigma, expected_reason):
+    """When the target is undefined (no sigma / zero vol) we cannot size,
+    but a HELD position being skipped must surface a WARNING — the risk
+    manager is never silently blind to an open position."""
+    pf, _, _, rm = _make(sigma=sigma, positions={'BTC': 4.0})
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.update_bar(_bar())
+    assert pf.submitted == []
+    assert any('unmanaged' in rec.getMessage() for rec in caplog.records)
+    assert rm.get_records('BTC').iloc[0]['skip_reason'] == expected_reason
+
+
+def test_flat_position_no_target_skip_does_not_warn(caplog):
+    """The WARNING is held-position-only: a flat symbol skipping on warmup
+    is routine and must stay quiet (no false alarms)."""
+    pf, _, _, rm = _make(sigma=None, positions={'BTC': 0.0})
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.update_bar(_bar())
+    assert pf.submitted == []
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+def test_held_position_absent_from_universe_warns(caplog):
+    """A held symbol that has dropped out of instrument_weight (e.g. a
+    future delisting or a manual weight wipe) is skipped with a universe
+    warmup reason — and must WARN because a position is still open."""
+    pf, _, _, rm = _make(positions={'BTC': 5.0})
+    rm.instrument_weight = {}                        # BTC no longer in the universe
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.update_bar(_bar())
+    assert pf.submitted == []
+    assert any('unmanaged' in rec.getMessage() for rec in caplog.records)
+    assert rm.get_records('BTC').iloc[0]['skip_reason'] in (
+        'warmup_forecast', 'warmup_correlation', 'warmup_weight',
+    )
 
 
 # ──────────────────────────────────────────────
@@ -735,13 +867,13 @@ def test_one_row_per_completed_bar_none_for_forming():
     assert list(df.index) == [datetime(2026, 1, 2), datetime(2026, 1, 3)]
 
 
-def test_record_skip_reason_warmup():
+def test_record_skip_reason_warmup_volatility():
     pf, _, _, rm = _make(sigma=None)
     rm.update_bar(_bar())
     df = rm.get_records('BTC')
     assert len(df) == 1
     row = df.iloc[0]
-    assert row['skip_reason'] == 'warmup'
+    assert row['skip_reason'] == 'warmup_volatility'
     assert not row['submitted']
     assert row['sigma'] is None
     assert row['instrument_weight'] is None       # not read on warmup
@@ -773,7 +905,11 @@ def test_record_skip_reason_zero_weight_instrument():
     assert row['instrument_weight'] == 0.0
     assert math.isclose(row['strategy_weight'], 1.0)
     assert row['sigma'] == 8000.0                 # was read before the skip
-    assert row['target_qty'] is None
+    # Zero weight is now a target of 0 (flows through), not an early skip —
+    # so the flat row carries target_qty=0.0; nothing is submitted because
+    # the position is already flat, and the label stays the informative
+    # 'zero_weight'.
+    assert row['target_qty'] == 0.0
     assert pf.submitted == []
 
 
@@ -817,7 +953,7 @@ def test_record_skip_reason_at_target():
 def test_record_submitted_row_matches_golden_formula():
     """Happy path: every numeric field matches the analytical formula."""
     pf, _, _, rm = _make(
-        balance=1_000_000.0, idm=1.5, annualized_target_vol=0.2, weight=0.5,
+        balance=1_000_000.0, idm=1.5, annual_target_vol=0.2, weight=0.5,
         forecast=50.0, sigma=10_000.0,
     )
     rm.update_bar(_bar())
@@ -832,7 +968,7 @@ def test_record_submitted_row_matches_golden_formula():
     assert math.isclose(row['strategy_weight'], 1.0)
     assert row['capital'] == 1_000_000.0
     assert row['idm'] == 1.5
-    assert row['annualized_target_vol'] == 0.2
+    assert row['annual_target_vol'] == 0.2
     assert math.isclose(row['annual_cash_target'], 150_000.0, rel_tol=1e-12)
     assert math.isclose(row['target_qty'], 15.0, rel_tol=1e-12)
     assert row['current_qty'] == 0.0
@@ -867,8 +1003,8 @@ def _build_rm(symbols, *, data_handler: Optional[FakeDataHandler] = None,
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=list(symbols))
     dh = data_handler if data_handler is not None else FakeDataHandler()
-    kwargs.setdefault('annualized_target_vol', 0.25)    # required since the futures-first refactor
-    rm = CarverVolTargetingRiskManager(
+    kwargs.setdefault('annual_target_vol', 0.25)    # required since the futures-first refactor
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=dh, **kwargs,
     )
     return rm
@@ -882,10 +1018,18 @@ def _corr_df(labels, off_diag):
     return pd.DataFrame(m, index=labels, columns=labels)
 
 
+def _live_dh(symbols, n_bars=60):
+    """FakeDataHandler with full-lookback closes — every symbol live."""
+    return FakeDataHandler(closes={
+        s: _price_series(n_bars, seed=i) for i, s in enumerate(symbols)
+    })
+
+
 def test_equal_weight_remains_default_mode():
     """Calling ``calculate_instrument_weight()`` with no args keeps the
-    historical equal-weight behavior (regression guard)."""
-    rm = _build_rm(['BTC', 'ETH'])
+    equal-weight behavior over the live universe (regression guard)."""
+    rm = _build_rm(['BTC', 'ETH'], data_handler=_live_dh(['BTC', 'ETH']),
+                   corr_lookback=60)
     rm.calculate_instrument_weight()
     assert math.isclose(rm.instrument_weight['BTC'], 0.5)
     assert math.isclose(rm.instrument_weight['ETH'], 0.5)
@@ -893,12 +1037,59 @@ def test_equal_weight_remains_default_mode():
 
 def test_equal_weight_silently_ignores_corr_matrix():
     """Passing a corr_matrix to mode='equal_weight' must not error and must
-    not change the equal-weight result."""
-    rm = _build_rm(['BTC', 'ETH'])
+    not change the equal-weight *result* (the weights). ρ for the IDM is
+    always derived inline, never from the passed matrix."""
+    rm = _build_rm(['BTC', 'ETH'], data_handler=_live_dh(['BTC', 'ETH']),
+                   corr_lookback=60)
     corr = _corr_df(['BTC', 'ETH'], off_diag=0.9)
     rm.calculate_instrument_weight(mode='equal_weight', corr_matrix=corr)
     assert math.isclose(rm.instrument_weight['BTC'], 0.5)
     assert math.isclose(rm.instrument_weight['ETH'], 0.5)
+
+
+def test_equal_weight_derives_idm_from_corr():
+    """Under equal_weight the weights are 1/N, but ρ is still derived to
+    size the IDM — so a diversified book earns leverage instead of freezing
+    at the constructor idm. Two roughly-uncorrelated assets give idm in
+    (1, sqrt(2)] (the default floor keeps ρ >= 0, capping idm at sqrt(N))."""
+    rm = _build_rm(['BTC', 'ETH'], data_handler=_live_dh(['BTC', 'ETH']),
+                   corr_lookback=60)
+    rm.idm = 1.0                                     # constructor-default sentinel
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['BTC'], 0.5)
+    assert math.isclose(rm.instrument_weight['ETH'], 0.5)
+    assert 1.0 < rm.idm <= math.sqrt(2.0) + 1e-9
+
+
+def test_equal_weight_singleton_universe_sets_idm_to_one():
+    """A single live symbol earns no diversification credit → idm = 1.0
+    (proves the sentinel is overwritten, matching the min_variance
+    singleton path)."""
+    rm = _build_rm(['BTC'], data_handler=_live_dh(['BTC']), corr_lookback=60)
+    rm.idm = 1.9                                     # sentinel
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert rm.instrument_weight == {'BTC': 1.0}
+    assert rm.idm == 1.0
+
+
+def test_equal_weight_data_gap_leaves_idm_untouched():
+    """Full-lookback rows (passes the data gate) but <30 valid return
+    observations after dropna → ρ derivation returns None → equal-weight
+    fallback keeps 1/N weights and leaves idm untouched (the ρ=1
+    degenerate case), mirroring the corr-based fallback."""
+    idx = pd.date_range('2024-01-01', periods=60, freq='D')
+
+    def _gappy(seed):
+        vals = np.full(60, np.nan)
+        vals[-20:] = _price_series(20, seed=seed).to_numpy()    # <30 valid diffs
+        return pd.Series(vals, index=idx)
+    dh = FakeDataHandler(closes={'BTC': _gappy(0), 'ETH': _gappy(1)})
+    rm = _build_rm(['BTC', 'ETH'], data_handler=dh, corr_lookback=60)
+    rm.idm = 1.7                                     # sentinel
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['BTC'], 0.5)
+    assert math.isclose(rm.instrument_weight['ETH'], 0.5)
+    assert rm.idm == 1.7                             # untouched
 
 
 def test_min_variance_two_uncorrelated_assets_yields_equal_weights():
@@ -933,12 +1124,12 @@ def test_min_variance_downweights_correlated_pair_against_uncorrelated_solo():
     assert math.isclose(w_a + w_b + w_c, 1.0, abs_tol=1e-12)
 
 
-def test_min_variance_clips_negative_weight_and_renormalizes():
-    """Construct a corr matrix where the raw inverse-corr formula produces a
-    negative weight for one symbol: A is highly correlated with both B and
-    C, while B and C are only mildly correlated with each other. The
-    risk-manager must clip A's weight to 0 and renormalize the survivors
-    to sum to 1."""
+def test_min_variance_pins_negative_weight_to_long_only_bound():
+    """Construct a corr matrix where the unconstrained min-variance weight
+    is negative for one symbol: A is highly correlated with both B and C,
+    while B and C are only mildly correlated with each other (raw closed
+    form = (-0.2, 0.6, 0.6)). The long-only QP pins A at the ``w >= 0``
+    bound and re-optimizes the survivors → (0, 0.5, 0.5)."""
     rm = _build_rm(['A', 'B', 'C'])
     rho = pd.DataFrame(
         [[1.0, 0.7, 0.7],
@@ -947,9 +1138,9 @@ def test_min_variance_clips_negative_weight_and_renormalizes():
         index=['A', 'B', 'C'], columns=['A', 'B', 'C'],
     )
     rm.calculate_instrument_weight(mode='min_variance', corr_matrix=rho)
-    assert rm.instrument_weight['A'] == 0.0
-    assert math.isclose(rm.instrument_weight['B'], 0.5, rel_tol=1e-12)
-    assert math.isclose(rm.instrument_weight['C'], 0.5, rel_tol=1e-12)
+    assert abs(rm.instrument_weight['A']) < 1e-9
+    assert math.isclose(rm.instrument_weight['B'], 0.5, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['C'], 0.5, abs_tol=1e-9)
     assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-12)
 
 
@@ -965,6 +1156,522 @@ def test_min_variance_accepts_corr_matrix_with_scrambled_symbol_order():
 
 
 # ──────────────────────────────────────────────
+# calculate_instrument_weight — mode='risk_parity'
+# ──────────────────────────────────────────────
+
+def test_risk_parity_two_uncorrelated_assets_yields_equal_weights_and_idm():
+    """ERC on ρ=0, equal vols → 1/N weights; the IDM auto-update fires
+    from the same matrix → sqrt(2)."""
+    rm = _build_rm(['BTC', 'ETH'])
+    corr = _corr_df(['BTC', 'ETH'], off_diag=0.0)
+    rm.calculate_instrument_weight(mode='risk_parity', corr_matrix=corr)
+    assert math.isclose(rm.instrument_weight['BTC'], 0.5, abs_tol=1e-8)
+    assert math.isclose(rm.instrument_weight['ETH'], 0.5, abs_tol=1e-8)
+    assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
+    assert math.isclose(rm.idm, math.sqrt(2.0), rel_tol=1e-6)
+
+
+def test_risk_parity_overweights_uncorrelated_solo_without_zeroing_pair():
+    """ERC on the A/B-correlated, C-uncorrelated matrix: C gets the largest
+    weight, but — unlike min-variance — every weight stays strictly
+    positive (the ERC log barrier forbids zero allocations)."""
+    rm = _build_rm(['A', 'B', 'C'])
+    rho = pd.DataFrame(
+        [[1.0, 0.7, 0.0],
+         [0.7, 1.0, 0.0],
+         [0.0, 0.0, 1.0]],
+        index=['A', 'B', 'C'], columns=['A', 'B', 'C'],
+    )
+    rm.calculate_instrument_weight(mode='risk_parity', corr_matrix=rho)
+    w = rm.instrument_weight
+    assert math.isclose(w['A'], w['B'], abs_tol=1e-8)           # symmetry
+    assert w['C'] > w['A']                                      # uncorrelated dominates
+    assert all(wi > 0 for wi in w.values())                     # strictly positive
+    assert math.isclose(sum(w.values()), 1.0, abs_tol=1e-9)
+
+
+# ──────────────────────────────────────────────
+# Universe liveness gating
+# ──────────────────────────────────────────────
+
+def _staggered_rm(*, young_bars=10, warmed_up=None, mode='min_variance'):
+    """RM over BTC/ETH (full 60-bar history) + NEW (young_bars of history).
+
+    Returns ``(rm, dh, strat)``. ``corr_lookback=60`` so BTC/ETH pass the
+    data gate and NEW does not (unless ``young_bars >= 60``).
+    """
+    symbols = ['BTC', 'ETH', 'NEW']
+    closes = {
+        'BTC': _price_series(60, seed=0),
+        'ETH': _price_series(60, seed=1),
+        'NEW': _price_series(young_bars, seed=2),
+    }
+    dh = FakeDataHandler(closes=closes)
+    pf = FakePortfolio(positions={s: 0.0 for s in symbols})
+    strat = FakeStrategy({s: 50.0 for s in symbols}, symbol_list=symbols,
+                         warmed_up=warmed_up)
+    vol = FakeVolEstimator({s: 8000.0 for s in symbols})
+    rm = VolTargetingRiskManager(
+        pf, strat, vol, data_handler=dh,
+        instrument_weight_mode=mode,
+        corr_lookback=60, annual_target_vol=0.25,
+    )
+    return rm, dh, strat
+
+
+def test_get_live_symbols_data_gate_excludes_short_history():
+    """A symbol with fewer than corr_lookback bars is not live; one with
+    exactly corr_lookback bars is."""
+    rm, _, _ = _staggered_rm(young_bars=59)
+    assert rm.get_live_symbols() == ['BTC', 'ETH']
+    rm2, _, _ = _staggered_rm(young_bars=60)
+    assert rm2.get_live_symbols() == ['BTC', 'ETH', 'NEW']
+
+
+def test_get_live_symbols_strategy_gate_excludes_unwarmed():
+    """Full data but un-warmed strategy → not live."""
+    rm, _, _ = _staggered_rm(
+        young_bars=60,
+        warmed_up={'BTC': True, 'ETH': True, 'NEW': False},
+    )
+    assert rm.get_live_symbols() == ['BTC', 'ETH']
+
+
+def test_staggered_universe_weights_cover_live_subset_only():
+    """The young symbol is absent from the weight dict; live weights sum
+    to 1; the corr derivation queries the data handler for live symbols
+    only."""
+    rm, dh, _ = _staggered_rm(young_bars=10)
+    assert set(rm.instrument_weight) == {'BTC', 'ETH'}
+    assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
+    # One recalc ran (at __init__): the liveness probe queries every
+    # symbol once (n=corr_lookback each), then the corr-matrix closes
+    # pull queries the LIVE symbols once more. NEW must appear exactly
+    # once (probe only — excluded from the closes pull).
+    per_symbol_counts = {
+        s: sum(1 for c in dh.calls if c['symbol'] == s and c['n'] == 60)
+        for s in ['BTC', 'ETH', 'NEW']
+    }
+    assert per_symbol_counts == {'BTC': 2, 'ETH': 2, 'NEW': 1}
+
+
+def test_warmup_correlation_symbol_skips_sizing():
+    """A warmed-up symbol lacking the full corr_lookback history (data gate
+    unmet) records skip_reason='warmup_correlation', leaves
+    instrument_weight None, and submits nothing."""
+    rm, _, _ = _staggered_rm(young_bars=10)
+    rm.corr_step_size = 0                                       # freeze weights for the test
+    rm.update_bar(_bar(symbol='NEW', ts=datetime(2026, 1, 1)))
+    row = rm._records['NEW'][-1]
+    assert row['skip_reason'] == 'warmup_correlation'
+    assert row['instrument_weight'] is None
+    assert row['submitted'] is False
+    assert rm.portfolio.submitted == []
+
+
+def test_warmup_forecast_symbol_skips_sizing():
+    """A symbol with full history but no cached forecast yet (strategy gate
+    unmet) records skip_reason='warmup_forecast' — forecast precedence over
+    the already-met correlation gate."""
+    rm, _, _ = _staggered_rm(
+        young_bars=60,
+        warmed_up={'BTC': True, 'ETH': True, 'NEW': False},
+    )
+    rm.corr_step_size = 0                                       # freeze weights for the test
+    rm.update_bar(_bar(symbol='NEW', ts=datetime(2026, 1, 1)))
+    row = rm._records['NEW'][-1]
+    assert row['skip_reason'] == 'warmup_forecast'
+    assert row['instrument_weight'] is None
+    assert row['submitted'] is False
+    assert rm.portfolio.submitted == []
+
+
+def test_warmup_weight_symbol_skips_sizing():
+    """A fully-ready symbol (both gates pass) that the periodic recalc has
+    not yet assigned a weight records skip_reason='warmup_weight'."""
+    rm, _, _ = _staggered_rm(young_bars=60)        # NEW is live: 60 bars + warmed up
+    rm.corr_step_size = 0                                       # freeze weights for the test
+    # Simulate recalc lag: NEW is live but not yet in the weight dict.
+    rm.instrument_weight = {'BTC': 0.5, 'ETH': 0.5}
+    rm.update_bar(_bar(symbol='NEW', ts=datetime(2026, 1, 1)))
+    row = rm._records['NEW'][-1]
+    assert row['skip_reason'] == 'warmup_weight'
+    assert row['instrument_weight'] is None
+    assert row['submitted'] is False
+    assert rm.portfolio.submitted == []
+
+
+def test_newly_live_symbol_enters_universe_on_recalc():
+    """Once the young symbol crosses the threshold (data + warmup), the
+    next recalc includes it."""
+    rm, dh, strat = _staggered_rm(
+        young_bars=10,
+        warmed_up={'BTC': True, 'ETH': True, 'NEW': False},
+    )
+    assert set(rm.instrument_weight) == {'BTC', 'ETH'}
+    # NEW crosses both gates...
+    dh._closes['NEW'] = _price_series(60, seed=2)
+    strat._warmed_up['NEW'] = True
+    # ...and enters at the next recalc.
+    rm.calculate_instrument_weight()
+    assert set(rm.instrument_weight) == {'BTC', 'ETH', 'NEW'}
+    assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
+
+
+def test_single_live_symbol_gets_full_weight_and_unit_idm():
+    """n_live == 1 → {symbol: 1.0} and idm = 1.0 (no diversification)."""
+    symbols = ['BTC', 'NEW']
+    dh = FakeDataHandler(closes={
+        'BTC': _price_series(60, seed=0),
+        'NEW': _price_series(5, seed=1),
+    })
+    pf = FakePortfolio()
+    strat = FakeStrategy(symbol_list=symbols)
+    rm = VolTargetingRiskManager(
+        pf, strat, FakeVolEstimator(), data_handler=dh,
+        instrument_weight_mode='min_variance',
+        idm=1.7,                                                # overwritten below
+        corr_lookback=60, annual_target_vol=0.25,
+    )
+    assert rm.instrument_weight == {'BTC': 1.0}
+    assert rm.idm == 1.0
+
+
+def test_explicit_corr_matrix_over_subset_is_accepted():
+    """The manual hook owns the universe: a matrix over a strict subset
+    of symbol_list weights just that subset (liveness not applied)."""
+    rm = _build_rm(['BTC', 'ETH', 'SOL'])                       # empty data handler
+    corr = _corr_df(['BTC', 'ETH'], off_diag=0.0)
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert set(rm.instrument_weight) == {'BTC', 'ETH'}
+    assert math.isclose(rm.instrument_weight['BTC'], 0.5, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['ETH'], 0.5, abs_tol=1e-9)
+
+
+def test_explicit_corr_matrix_with_label_outside_symbol_list_raises():
+    rm = _build_rm(['BTC', 'ETH'])
+    bad = _corr_df(['BTC', 'SOL'], off_diag=0.0)
+    with pytest.raises(ValueError, match="subset"):
+        rm.calculate_instrument_weight(mode='min_variance', corr_matrix=bad)
+
+
+def test_constructor_rejects_corr_lookback_below_31():
+    with pytest.raises(ValueError, match="corr_lookback"):
+        _build_rm(['BTC'], corr_lookback=30)
+
+
+def test_constructor_rejects_corr_lookback_above_deque_maxlen():
+    """corr_lookback > the corr_timeframe deque maxlen → nothing could
+    ever go live; fail loudly at construction."""
+    dh = FakeDataHandler(timeframes={'1d': 100})
+    with pytest.raises(ValueError, match="maxlen"):
+        _build_rm(['BTC'], data_handler=dh, corr_lookback=101)
+
+
+# ──────────────────────────────────────────────
+# corr_floor (element-wise ρ floor, Carver: zero out spurious
+# negative correlations) — constructor validation
+# ──────────────────────────────────────────────
+
+def test_constructor_corr_floor_defaults_to_zero():
+    """Futures-first default: floor the inline-derived ρ at 0 (Carver)."""
+    rm = _build_rm(['BTC'])
+    assert rm.corr_floor == 0.0
+
+
+def test_constructor_rejects_corr_floor_outside_minus_one_one():
+    for bad in (1.5, -1.5, 2.0, float('nan')):
+        with pytest.raises(ValueError, match="corr_floor"):
+            _build_rm(['BTC'], corr_floor=bad)
+
+
+def test_constructor_corr_floor_accepts_none_and_bounds():
+    """None disables flooring; the closed interval ends are valid."""
+    assert _build_rm(['BTC'], corr_floor=None).corr_floor is None
+    assert _build_rm(['BTC'], corr_floor=-1.0).corr_floor == -1.0
+    assert _build_rm(['BTC'], corr_floor=1.0).corr_floor == 1.0
+
+
+# ──────────────────────────────────────────────
+# idm_cap (Carver's 2.5 leverage-policy cap) — constructor validation
+# ──────────────────────────────────────────────
+
+def test_constructor_idm_cap_defaults_to_two_point_five():
+    rm = _build_rm(['BTC'])
+    assert rm.idm_cap == 2.5
+
+
+def test_constructor_rejects_idm_cap_below_one():
+    """DM = 1/sqrt(w'ρw) >= 1 for sum-to-1 non-negative weights, so a
+    sub-1 cap would always bind — a config error worth failing on.
+    NaN must also be rejected: min(idm, nan) silently never caps."""
+    for bad in (0.99, 0.5, 0.0, -1.0, float('nan')):
+        with pytest.raises(ValueError, match="idm_cap"):
+            _build_rm(['BTC'], idm_cap=bad)
+
+
+def test_constructor_idm_cap_accepts_one_and_none():
+    assert _build_rm(['BTC'], idm_cap=1.0).idm_cap == 1.0
+    assert _build_rm(['BTC'], idm_cap=None).idm_cap is None
+
+
+def test_constructor_rejects_idm_above_idm_cap():
+    """A starting idm above the cap is a contradiction → raise, never
+    silently clamp. Lifting or disabling the cap makes the same idm valid."""
+    with pytest.raises(ValueError, match="idm_cap"):
+        _build_rm(['BTC'], idm=3.0)                 # default cap 2.5
+    assert _build_rm(['BTC'], idm=3.0, idm_cap=None).idm == 3.0
+    assert _build_rm(['BTC'], idm=3.0, idm_cap=3.5).idm == 3.0
+    # Boundary: idm exactly equal to the cap is coherent (strict > check).
+    assert _build_rm(['BTC'], idm=2.5, idm_cap=2.5).idm == 2.5
+
+
+# ──────────────────────────────────────────────
+# corr_floor — behavioral (inline derivation path)
+# ──────────────────────────────────────────────
+
+def _anti_correlated_closes():
+    """Three 61-bar series: A and B with strongly negative
+    absolute-price-change correlation (ρ ≈ -0.8 by construction), C
+    independent of both. Deterministic (seeded)."""
+    rng = np.random.default_rng(seed=7)
+    idx = pd.date_range('2024-01-01', periods=61, freq='D')
+    chg_a = rng.normal(0.0, 1.0, 60)
+    chg_b = -0.8 * chg_a + 0.6 * rng.normal(0.0, 1.0, 60)
+    chg_c = rng.normal(0.0, 1.0, 60)
+
+    def prices(chg):
+        return pd.Series(
+            100.0 + np.concatenate([[0.0], np.cumsum(chg)]), index=idx,
+        )
+
+    return {'A': prices(chg_a), 'B': prices(chg_b), 'C': prices(chg_c)}
+
+
+def _floor_rm(closes, **kwargs):
+    """Min-variance RM over ``closes`` with corr_lookback=61 (all live).
+
+    Shrinkage defaults OFF here so the floor tests pin floor semantics
+    in isolation; the corr_shrinkage section overrides explicitly where
+    the shrink→floor interplay is the subject.
+    """
+    dh = FakeDataHandler(closes=closes)
+    kwargs.setdefault('corr_shrinkage', None)
+    return VolTargetingRiskManager(
+        FakePortfolio(), FakeStrategy(symbol_list=list(closes)),
+        FakeVolEstimator(), data_handler=dh,
+        instrument_weight_mode='min_variance',
+        corr_lookback=61, annual_target_vol=0.25, **kwargs,
+    )
+
+
+def test_derived_corr_matrix_is_floored_at_zero_by_default():
+    """The inline derivation clips ρ at corr_floor; with corr_floor=None
+    the raw (verifiably negative) matrix flows through."""
+    closes = _anti_correlated_closes()
+    rm = _floor_rm(closes)
+    symbols = list(closes)
+    floored = rm._derive_corr_matrix('min_variance', symbols)
+    off_diag = floored.values[~np.eye(len(floored), dtype=bool)]
+    assert off_diag.min() >= 0.0
+    # Sanity: the raw matrix really is negative somewhere, otherwise
+    # this test proves nothing.
+    rm.corr_floor = None
+    raw = rm._derive_corr_matrix('min_variance', symbols)
+    assert raw.values[~np.eye(len(raw), dtype=bool)].min() < -0.5
+
+
+def test_corr_floor_prevents_overweighting_of_anti_correlated_pair():
+    """min_variance on the raw matrix (corr_floor=None) treats the A/B
+    anti-correlation as a free hedge and starves C; the default floor
+    removes the spurious credit. Floored IDM respects the sqrt(N) bound;
+    the raw IDM exceeds the floored one (idm_cap disabled to expose it)."""
+    closes = _anti_correlated_closes()
+    floored = _floor_rm(closes)                          # corr_floor=0.0 default
+    raw = _floor_rm(closes, corr_floor=None, idm_cap=None)
+    assert raw.instrument_weight['C'] < floored.instrument_weight['C']
+    assert floored.idm <= math.sqrt(3.0) + 1e-9
+    assert raw.idm > floored.idm
+
+
+# ──────────────────────────────────────────────
+# corr_shrinkage (Ledoit-Wolf on the inline ρ) — constructor + behavior
+# ──────────────────────────────────────────────
+
+def test_constructor_corr_shrinkage_defaults_to_ledoit_wolf():
+    """Estimation hygiene on by default — like corr_floor."""
+    rm = _build_rm(['BTC'])
+    assert rm.corr_shrinkage == 'ledoit_wolf'
+
+
+def test_constructor_corr_shrinkage_accepts_none():
+    assert _build_rm(['BTC'], corr_shrinkage=None).corr_shrinkage is None
+
+
+def test_constructor_rejects_unknown_corr_shrinkage():
+    with pytest.raises(ValueError, match="corr_shrinkage"):
+        _build_rm(['BTC'], corr_shrinkage='oas')
+
+
+def test_derive_corr_matrix_applies_ledoit_wolf_by_default():
+    """The inline ρ is the LW-shrunk matrix (floor disabled to isolate)."""
+    closes = _anti_correlated_closes()
+    dh = FakeDataHandler(closes=closes)
+    rm = VolTargetingRiskManager(
+        FakePortfolio(), FakeStrategy(symbol_list=list(closes)),
+        FakeVolEstimator(), data_handler=dh,
+        instrument_weight_mode='min_variance',
+        corr_lookback=61, annual_target_vol=0.25,
+        corr_floor=None,    # isolate shrinkage from the floor
+    )
+    derived = rm._derive_corr_matrix('min_variance', list(closes))
+    expected = correlation_matrix(
+        pd.DataFrame(closes).diff().dropna(), shrinkage='ledoit_wolf',
+    )
+    pd.testing.assert_frame_equal(derived, expected)
+
+
+def test_corr_shrinkage_none_reproduces_raw_sample_corr():
+    """OFF path is a true no-op: bit-identical to the pre-shrinkage
+    pipeline (raw pandas sample correlation)."""
+    closes = _anti_correlated_closes()
+    rm = _floor_rm(closes, corr_shrinkage=None, corr_floor=None)
+    derived = rm._derive_corr_matrix('min_variance', list(closes))
+    expected = pd.DataFrame(closes).diff().dropna().corr()
+    pd.testing.assert_frame_equal(derived, expected)
+
+
+def test_corr_floor_applies_after_shrinkage():
+    """Pipeline order is estimate → shrink → floor: the default floor
+    clips the LW-shrunk matrix, not the raw one."""
+    closes = _anti_correlated_closes()
+    rm = _floor_rm(closes, corr_shrinkage='ledoit_wolf')  # default floor 0.0
+    derived = rm._derive_corr_matrix('min_variance', list(closes))
+    expected = correlation_matrix(
+        pd.DataFrame(closes).diff().dropna(), shrinkage='ledoit_wolf',
+    ).clip(lower=0.0)
+    pd.testing.assert_frame_equal(derived, expected)
+
+
+def test_derive_corr_matrix_logs_lw_intensity(caplog):
+    """One DEBUG line per derivation reports the fitted LW intensity."""
+    closes = _anti_correlated_closes()
+    rm = _floor_rm(closes, corr_shrinkage='ledoit_wolf')
+    with caplog.at_level(logging.DEBUG, logger='riskmanager._vol_targeting'):
+        rm._derive_corr_matrix('min_variance', list(closes))
+    assert any('shrinkage intensity' in r.message for r in caplog.records)
+
+
+# ──────────────────────────────────────────────
+# _nearest_psd_correlation (post-floor repair)
+# ──────────────────────────────────────────────
+
+def test_nearest_psd_correlation_repairs_non_psd_matrix():
+    """A unit-diagonal non-PSD matrix (λ_min ≈ -0.27) comes back as a
+    valid correlation matrix close to the input."""
+    labels = ['A', 'B', 'C']
+    bad = pd.DataFrame(
+        [[1.0, 0.9, 0.9],
+         [0.9, 1.0, 0.0],
+         [0.9, 0.0, 1.0]],
+        index=labels, columns=labels,
+    )
+    assert np.linalg.eigvalsh(bad.to_numpy()).min() < -0.2
+    fixed = VolTargetingRiskManager._nearest_psd_correlation(bad)
+    arr = fixed.to_numpy()
+    assert np.linalg.eigvalsh(arr).min() >= -1e-12
+    np.testing.assert_allclose(np.diag(arr), 1.0)
+    np.testing.assert_allclose(arr, arr.T, atol=1e-12)
+    assert list(fixed.index) == labels and list(fixed.columns) == labels
+    # Eigenvalue clipping is a small perturbation, not a rebuild.
+    assert np.abs(arr - bad.to_numpy()).max() < 0.25
+
+
+def test_nearest_psd_correlation_passes_psd_through_unchanged():
+    """PSD input short-circuits — returned as-is (cheap eig check only)."""
+    labels = ['A', 'B']
+    good = pd.DataFrame(
+        [[1.0, 0.5], [0.5, 1.0]], index=labels, columns=labels,
+    )
+    fixed = VolTargetingRiskManager._nearest_psd_correlation(good)
+    assert fixed is good
+
+
+def test_derived_corr_matrix_is_always_psd_across_floors():
+    """End-to-end invariant: whatever the floor/shrinkage combination,
+    the matrix handed to the optimizer and the IDM is PSD within dust."""
+    closes = _anti_correlated_closes()
+    for shrink in (None, 'ledoit_wolf'):
+        for floor in (None, 0.0, 0.3, 0.6):
+            rm = _floor_rm(closes, corr_shrinkage=shrink, corr_floor=floor)
+            derived = rm._derive_corr_matrix('min_variance', list(closes))
+            lam_min = np.linalg.eigvalsh(derived.to_numpy()).min()
+            assert lam_min >= -1e-12, (shrink, floor, lam_min)
+
+
+# ──────────────────────────────────────────────
+# idm_cap — behavioral (auto-update site)
+# ──────────────────────────────────────────────
+
+def test_idm_capped_at_default_two_point_five():
+    """7 uncorrelated instruments → raw DM = sqrt(7) ≈ 2.6458; the stored
+    idm is clamped to the default 2.5. Exercised via the explicit
+    corr_matrix path: the cap is leverage policy and applies regardless
+    of where the matrix came from."""
+    labels = [f'S{i}' for i in range(7)]
+    rm = _build_rm(labels)
+    corr = _corr_df(labels, off_diag=0.0)
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert rm.idm == 2.5
+
+
+def test_idm_cap_none_disables_capping():
+    labels = [f'S{i}' for i in range(7)]
+    rm = _build_rm(labels, idm_cap=None)
+    corr = _corr_df(labels, off_diag=0.0)
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert math.isclose(rm.idm, math.sqrt(7.0), rel_tol=1e-6)
+
+
+def test_idm_cap_applies_under_risk_parity_too():
+    """The cap sits at the shared assignment site, after the mode dispatch."""
+    labels = [f'S{i}' for i in range(7)]
+    rm = _build_rm(labels)
+    corr = _corr_df(labels, off_diag=0.0)
+    rm.calculate_instrument_weight(mode='risk_parity', corr_matrix=corr)
+    assert rm.idm == 2.5
+
+
+def test_explicit_corr_matrix_is_not_floored():
+    """The research hook owns the matrix: negative entries reach the
+    optimizer raw. A/B at ρ=-0.5 with C uncorrelated → exact long-only
+    min-variance is (0.4, 0.4, 0.2): the 'hedged' pair out-weights C.
+    A (wrongly) floored matrix would yield w_C >= w_A instead."""
+    rm = _build_rm(['A', 'B', 'C'])
+    rho = pd.DataFrame(
+        [[1.0, -0.5, 0.0],
+         [-0.5, 1.0, 0.0],
+         [0.0, 0.0, 1.0]],
+        index=['A', 'B', 'C'], columns=['A', 'B', 'C'],
+    )
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=rho)
+    w = rm.instrument_weight
+    assert math.isclose(w['A'], 0.4, abs_tol=1e-6)
+    assert math.isclose(w['B'], 0.4, abs_tol=1e-6)
+    assert math.isclose(w['C'], 0.2, abs_tol=1e-6)
+    # IDM auto-update passes through uncapped when below the cap.
+    assert math.isclose(rm.idm, 1.0 / math.sqrt(0.2), rel_tol=1e-6)
+
+
+def test_idm_cap_binds_on_inline_derivation_path_too():
+    """corr_floor=None lets the anti-correlated fixture's inline DM run to
+    ≈3.3; the default cap clamps it — pins capping for the inline ρ source
+    (the other cap tests all use the explicit corr_matrix hook)."""
+    rm = _floor_rm(_anti_correlated_closes(), corr_floor=None)   # default idm_cap
+    assert rm.idm == 2.5
+
+
+# ──────────────────────────────────────────────
 # calculate_instrument_weight — validation
 # ──────────────────────────────────────────────
 
@@ -974,14 +1681,14 @@ def test_rejects_unknown_mode():
         rm.calculate_instrument_weight(mode='bogus')
 
 
-def test_min_variance_without_corr_matrix_and_empty_deques_falls_back(caplog):
-    """No corr_matrix + empty data handler → WARNING + equal-weight, no raise."""
+def test_min_variance_without_corr_matrix_and_empty_deques_yields_empty_universe(caplog):
+    """No corr_matrix + empty data handler → no live symbols: empty weight
+    dict + INFO log, no raise."""
     rm = _build_rm(['BTC', 'ETH'])
-    with caplog.at_level('WARNING'):
+    with caplog.at_level('INFO'):
         rm.calculate_instrument_weight(mode='min_variance')
-    assert math.isclose(rm.instrument_weight['BTC'], 0.5, rel_tol=1e-12)
-    assert math.isclose(rm.instrument_weight['ETH'], 0.5, rel_tol=1e-12)
-    assert any('min_variance' in r.message and 'falling back' in r.message
+    assert rm.instrument_weight == {}
+    assert any('min_variance' in r.message and 'no live symbols' in r.message
                for r in caplog.records)
 
 
@@ -1031,11 +1738,13 @@ def test_min_variance_derives_corr_from_filled_deques_and_auto_updates_idm():
     dh = FakeDataHandler(closes=closes)
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=symbols)
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=dh,
         instrument_weight_mode='min_variance', corr_lookback=lookback,
-        annualized_target_vol=0.25,
+        annual_target_vol=0.25,
         corr_mode='simple_return',          # this test pins the pct_change path
+        corr_floor=None,    # raw-path test: pins the trailing-window sourcing, not the floor
+        corr_shrinkage=None,    # raw-path test: shrinkage off for the same reason
     )
     # Weights sum to 1, non-negative.
     assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
@@ -1092,10 +1801,12 @@ def test_returns_used_are_simple_pct_change():
     strat = FakeStrategy(symbol_list=symbols)
     # Use equal-weight construction (no auto-recalc fires from __init__),
     # then capture the derived weights via the explicit min-variance call.
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, FakeVolEstimator(), data_handler=dh,
-        corr_lookback=100, annualized_target_vol=0.25,
+        corr_lookback=100, annual_target_vol=0.25,
         corr_mode='simple_return',          # this test pins the pct_change path
+        corr_floor=None,    # raw-path test: pins the pct_change dispatch, not the floor
+        corr_shrinkage=None,    # raw-path test: shrinkage off for the same reason
     )
     rm.calculate_instrument_weight(mode='min_variance')
 
@@ -1124,10 +1835,10 @@ def test_returns_used_are_simple_pct_change():
 
 def test_constructor_rejects_unknown_corr_mode():
     with pytest.raises(ValueError, match="corr_mode"):
-        CarverVolTargetingRiskManager(
+        VolTargetingRiskManager(
             FakePortfolio(), FakeStrategy(symbol_list=['BTC']),
             FakeVolEstimator(), data_handler=FakeDataHandler(),
-            corr_mode='log_return', annualized_target_vol=0.25,
+            corr_mode='log_return', annual_target_vol=0.25,
         )
 
 
@@ -1150,11 +1861,13 @@ def test_absolute_price_chg_mode_uses_diff():
     symbols = ['A', 'B']
     closes = {s: _price_series(100, seed=i) for i, s in enumerate(symbols)}
     dh = FakeDataHandler(closes=closes)
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=symbols),
         FakeVolEstimator(), data_handler=dh,
         corr_lookback=100, corr_mode='absolute_price_chg',
-        annualized_target_vol=0.25,
+        annual_target_vol=0.25,
+        corr_floor=None,    # raw-path test: pins the .diff() dispatch, not the floor
+        corr_shrinkage=None,    # raw-path test: shrinkage off for the same reason
     )
     rm.calculate_instrument_weight(mode='min_variance')
 
@@ -1187,11 +1900,11 @@ def test_absolute_price_chg_handles_negative_and_zero_prices():
         for s in ['SPREAD_A', 'SPREAD_B']
     }
     dh = FakeDataHandler(closes=closes)
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         FakePortfolio(), FakeStrategy(symbol_list=list(closes)),
         FakeVolEstimator(), data_handler=dh,
         corr_lookback=100, corr_mode='absolute_price_chg',
-        annualized_target_vol=0.25,
+        annual_target_vol=0.25,
     )
     rm.calculate_instrument_weight(mode='min_variance')
 
@@ -1205,23 +1918,26 @@ def test_absolute_price_chg_handles_negative_and_zero_prices():
 # Auto-recalc cadence in update_bar
 # ──────────────────────────────────────────────
 
-def _make_min_variance_rm_with_closes(symbols, n_bars, step_size, *, lookback=100):
-    """Build a min-variance risk manager with pre-loaded closes for ``symbols``.
+def _make_min_variance_rm_with_closes(symbols, n_bars, step_size, *,
+                                      lookback=100, mode='min_variance'):
+    """Build a corr-based risk manager with pre-loaded closes for ``symbols``.
 
     Returns ``(rm, dh, vol, pf)`` — the data handler is non-empty so the
-    initial __init__ recompute succeeds (not a fallback).
+    initial __init__ recompute succeeds (not a fallback). ``mode``
+    defaults to ``'min_variance'``; pass ``'risk_parity'`` to exercise
+    the other corr-based scheme.
     """
     closes = {s: _price_series(n_bars, seed=i) for i, s in enumerate(symbols)}
     dh = FakeDataHandler(closes=closes)
     pf = FakePortfolio(positions={s: 0.0 for s in symbols})
     strat = FakeStrategy({s: 0.0 for s in symbols}, symbol_list=list(symbols))
     vol = FakeVolEstimator({s: 8000.0 for s in symbols})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol, data_handler=dh,
-        instrument_weight_mode='min_variance',
+        instrument_weight_mode=mode,
         corr_lookback=lookback,
         corr_step_size=step_size,
-        annualized_target_vol=0.25,
+        annual_target_vol=0.25,
     )
     return rm, dh, vol, pf
 
@@ -1293,17 +2009,18 @@ def test_corr_step_size_zero_disables_auto_recalc():
     assert calls == []
 
 
-def test_auto_recalc_only_active_under_min_variance_mode():
-    """``equal_weight`` mode must NOT auto-recall (the counter is short-circuited
-    by the mode check in update_bar)."""
+def test_auto_recalc_also_fires_under_equal_weight_mode():
+    """The walk-forward recalc runs in EVERY weight mode — equal_weight
+    needs the periodic liveness re-assessment too (newly-live symbols
+    must be able to enter the universe)."""
     pf = FakePortfolio(positions={'BTC': 0.0})
     strat = FakeStrategy({'BTC': 0.0}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': 8000.0})
-    rm = CarverVolTargetingRiskManager(
+    rm = VolTargetingRiskManager(
         pf, strat, vol, data_handler=FakeDataHandler(),
         instrument_weight_mode='equal_weight',
-        corr_step_size=2,                                       # non-zero, but mode short-circuits
-        annualized_target_vol=0.25,
+        corr_step_size=2,
+        annual_target_vol=0.25,
     )
     calls: List[int] = []
     original = rm.calculate_instrument_weight
@@ -1315,7 +2032,28 @@ def test_auto_recalc_only_active_under_min_variance_mode():
 
     for i in range(10):
         rm.update_bar(_bar(ts=datetime(2026, 1, 1 + i)))
-    assert calls == []
+    assert len(calls) == 5                                      # bars 2, 4, 6, 8, 10
+
+
+def test_auto_recalc_also_active_under_risk_parity_mode():
+    """risk_parity is a corr-based mode, so the walk-forward auto-recalc
+    fires on the same cadence as under min_variance."""
+    rm, _, _, _ = _make_min_variance_rm_with_closes(
+        ['BTC', 'ETH'], n_bars=120, step_size=3, mode='risk_parity',
+    )
+    calls: List[int] = []
+    original = rm.calculate_instrument_weight
+
+    def spy(*args, **kwargs):
+        calls.append(len(calls))
+        return original(*args, **kwargs)
+    rm.calculate_instrument_weight = spy                        # type: ignore[assignment]
+
+    symbols_cycle = ['BTC', 'ETH']
+    for i in range(10):
+        sym = symbols_cycle[i % 2]
+        rm.update_bar(_bar(symbol=sym, ts=datetime(2026, 1, 1 + i)))
+    assert len(calls) == 3                                      # bars 3, 6, 9
 
 
 def test_auto_recalc_does_not_multi_increment_within_same_period():

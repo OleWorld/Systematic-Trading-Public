@@ -4,7 +4,7 @@ Per-symbol price-change series ``close - prior_close`` at the configured
 ``timeframe`` (default ``'1d'``), fed into the ``EWMStdev(span)`` indicator
 (zero-mean RiskMetrics convention, ``alpha = 2/(span+1)``). Annualized
 vol = ``stdev * sqrt(bars_per_year)``. Used by
-``CarverVolTargetingRiskManager`` to derive the dollar-volatility divisor
+``VolTargetingRiskManager`` to derive the dollar-volatility divisor
 in the cash-vol position-sizing formula.
 
 Closes are sourced from a ``DataHandler`` via
@@ -136,7 +136,7 @@ class EWMAVolEstimator(VolEstimator):
         price_change = forming_close - prev_close
         self._ewmstdev[symbol].update(forming_ts, price_change)
 
-    def get_annualized_vol(self, symbol: str) -> Optional[float]:
+    def get_annual_vol(self, symbol: str) -> Optional[float]:
         """Return ``ewmstdev.latest['stdev'] * sqrt(bars_per_year)``, or
         ``None`` if no finalized non-NaN stdev is available yet (warmup).
 
