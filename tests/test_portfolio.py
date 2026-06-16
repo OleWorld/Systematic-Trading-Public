@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import pytest
 
+from data._bar import Bar
 from event import (
     BarEvent,
     Direction,
@@ -42,16 +43,21 @@ class FakeQueue:
 
 
 class FakeDataHandler:
-    """Minimal data handler — get_latest_bars returns a canned frame per symbol."""
+    """Minimal data handler — get_latest_bars returns canned ``Bar`` objects.
+
+    Backs ``BacktestPortfolio.get_price``'s cold-start fallback, which reads
+    ``get_latest_bars(symbol, 1)[-1].close`` (a list of ``Bar``, no DataFrame).
+    """
 
     def __init__(self, frames: Optional[Dict[str, pd.DataFrame]] = None):
         self._frames = frames if frames is not None else {}
 
-    def get_latest_bars(self, symbol: str, n: int) -> pd.DataFrame:
+    def get_latest_bars(self, symbol: str, n: int = 1) -> List[Bar]:
         frame = self._frames.get(symbol)
-        if frame is None:
-            return pd.DataFrame()
-        return frame.tail(n)
+        if frame is None or frame.empty:
+            return []
+        tail = frame.tail(n)
+        return [Bar(ts, c, c, c, c, 0.0) for ts, c in zip(tail.index, tail['Close'])]
 
 
 # ──────────────────────────────────────────────
@@ -172,24 +178,29 @@ def test_update_bar_appends_equity_curve_row():
     pf, _, _ = _new_portfolio()
     pf.update_bar(_bar(close=123.0))
     assert len(pf.equity_curve) == 1
+    # Account-level scalars live on the lightweight per-event row.
     row = pf.equity_curve[0]
     assert row['timestamp'] == DEFAULT_TS
     assert row['symbol'] == 'BTC'
     assert row['cash'] == 100_000.0
     assert row['account_balance'] == 100_000.0
     assert row['available_balance'] == 100_000.0
-    assert row['positions'] == {'BTC': 0.0}
-    assert row['margin_requirements'] == {'BTC': 0.0}
-    assert row['unrealized_pnl'] == {'BTC': 0.0}
-    assert row['realized_pnl'] == {'BTC': 0.0}
+    # The per-symbol dicts are re-attached by get_equity_curve() from the
+    # per-timestamp snapshot (one per timestamp, last-event-wins).
+    eq = pf.get_equity_curve()
+    assert eq.iloc[0]['positions'] == {'BTC': 0.0}
+    assert eq.iloc[0]['margin_requirements'] == {'BTC': 0.0}
+    assert eq.iloc[0]['unrealized_pnl'] == {'BTC': 0.0}
+    assert eq.iloc[0]['realized_pnl'] == {'BTC': 0.0}
 
 
 def test_update_bar_snapshots_cumulative_realized_pnl_per_symbol():
-    """Each equity_curve row freezes the cumulative realized_pnl dict at that bar.
+    """Each timestamp's snapshot freezes the cumulative realized_pnl dict.
 
     After a profitable round trip on BTC, the next bar's snapshot carries
     the booked amount; a subsequent fill-less bar leaves the snapshot
-    unchanged (cumulative, not per-bar delta).
+    unchanged (cumulative, not per-bar delta). The per-symbol dicts are
+    re-attached per timestamp by get_equity_curve().
     """
     pf, _, _ = _new_portfolio()
     pf.update_fill(_fill(qty=1.0, direction=Direction.BUY, fill_price=100.0))
@@ -197,11 +208,12 @@ def test_update_bar_snapshots_cumulative_realized_pnl_per_symbol():
     pf.update_bar(_bar(close=110.0))
     pf.update_bar(_bar(close=115.0, ts=datetime(2026, 1, 1, 13, 0, 0)))
     assert pf.realized_pnl['BTC'] == 10.0
-    assert pf.equity_curve[0]['realized_pnl'] == {'BTC': 10.0}
-    assert pf.equity_curve[1]['realized_pnl'] == {'BTC': 10.0}
+    eq = pf.get_equity_curve()
+    assert eq.iloc[0]['realized_pnl'] == {'BTC': 10.0}
+    assert eq.iloc[1]['realized_pnl'] == {'BTC': 10.0}
     # Snapshot is a copy — mutating realized_pnl later doesn't rewrite history.
     pf.realized_pnl['BTC'] = 999.0
-    assert pf.equity_curve[0]['realized_pnl'] == {'BTC': 10.0}
+    assert pf.get_equity_curve().iloc[0]['realized_pnl'] == {'BTC': 10.0}
 
 
 def test_update_bar_recalculates_margin_from_open_position():

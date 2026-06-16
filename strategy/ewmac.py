@@ -223,15 +223,17 @@ class EWMACStrategy(Strategy):
         symbol = event.symbol
 
         # ── Latest 1d bars: forming close + previous finalized close. ───
+        # List[Bar] straight from the deque (no DataFrame) — this is the
+        # per-bar hot path; ``bar.close`` is already a float.
         daily_lookback = self.data_handler.get_latest_bars(
             symbol, 2, timeframe=self.execution_timeframe,
         )
         if len(daily_lookback) < 2:
             return None
 
-        forming_ts = daily_lookback.index[-1]
-        forming_close = float(daily_lookback['Close'].iloc[-1])
-        prev_close = float(daily_lookback['Close'].iloc[-2])
+        forming_ts = daily_lookback[-1].timestamp
+        forming_close = daily_lookback[-1].close
+        prev_close = daily_lookback[-2].close
         price_change = forming_close - prev_close
 
         # ── Update shared price-change Stdev. ───────────────────────────

@@ -50,21 +50,14 @@ class _StepwiseDataHandler:
         self._end = end
 
     def get_latest_bars(self, symbol: str, n: int,
-                        timeframe: Optional[str] = None) -> pd.DataFrame:
+                        timeframe: Optional[str] = None) -> list:
         if symbol != self._symbol:
-            return pd.DataFrame()
+            return []
         if timeframe is not None and timeframe != self._exec_tf:
-            return pd.DataFrame()
-        slice_ = self._frame.iloc[: self._end]
-        return slice_.tail(n)
-
-    def get_latest_bar(self, symbol: str,
-                       timeframe: Optional[str] = None) -> Optional[Any]:
-        df = self.get_latest_bars(symbol, 1, timeframe)
-        if df.empty:
-            return None
-        row = df.iloc[-1]
-        return _BarRow(timestamp=df.index[-1], close=float(row['Close']))
+            return []
+        slice_ = self._frame.iloc[: self._end].tail(n)
+        return [_BarRow(timestamp=ts, close=float(row['Close']))
+                for ts, row in slice_.iterrows()]
 
 
 class _BarRow:

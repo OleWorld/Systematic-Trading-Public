@@ -131,9 +131,9 @@ class RollingStdevVolEstimator(VolEstimator):
         )
         if len(bars) < 2:
             return
-        forming_ts = bars.index[-1]
-        forming_close = float(bars['Close'].iloc[-1])
-        prev_close = float(bars['Close'].iloc[-2])
+        forming_ts = bars[-1].timestamp
+        forming_close = bars[-1].close
+        prev_close = bars[-2].close
         price_change = forming_close - prev_close
         self._stdev[symbol].update(forming_ts, price_change)
 

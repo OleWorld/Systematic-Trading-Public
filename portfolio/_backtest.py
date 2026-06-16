@@ -102,8 +102,16 @@ class BacktestPortfolio(Portfolio):
         # Cumulative commission paid across all fills (account-level)
         self.total_commission: float = 0.0
 
-        # Record keeping
+        # Record keeping. ``equity_curve`` holds one LIGHTWEIGHT row per
+        # BarEvent (account-level scalars only). The heavy per-symbol dicts
+        # (positions / unrealized_pnl / realized_pnl / margin_requirements)
+        # are NOT copied per event — they would cost O(N) per event and
+        # O(N²×T) overall with multi-symbol bars. Instead one snapshot per
+        # timestamp is kept in ``_pnl_snapshots`` (overwritten on each event,
+        # so it retains that timestamp's last-event state) and re-attached by
+        # ``get_equity_curve``. Net memory: O(N×T).
         self.equity_curve: List[Dict] = []
+        self._pnl_snapshots: Dict[Any, Dict[str, Dict[str, float]]] = {}
         self.trade_log: List[Dict] = []
         self.order_log: List[Dict] = []
 
@@ -112,9 +120,9 @@ class BacktestPortfolio(Portfolio):
     def update_bar(self, event: BarEvent) -> None:
         """
         Refresh per-symbol margin and account snapshots from the new bar,
-        append the equity curve entry, then run a solvency check (which may
-        cancel pending orders and submit liquidation orders if
-        account_balance < 0).
+        append the lightweight per-event equity row, update the per-timestamp
+        per-symbol snapshot, then run a solvency check (which may cancel
+        pending orders and submit liquidation orders if account_balance < 0).
 
         OHLC fields are guaranteed non-NaN by the ``DataHandler`` gate;
         no defensive check is needed here.
@@ -144,21 +152,28 @@ class BacktestPortfolio(Portfolio):
             simple_return = float('nan')
             log_return = float('nan')
 
+        # Lightweight per-event row: account-level scalars only.
         self.equity_curve.append({
             'timestamp': event.timestamp,
             'symbol': event.symbol,
             'cash': self.cash,
-            'unrealized_pnl': dict(self.unrealized_pnl),
-            'realized_pnl': dict(self.realized_pnl),
             'account_balance': self.account_balance,
             'simple_return': simple_return,
             'log_return': log_return,
             'position_margin': self._position_margin(),
-            'margin_requirements': dict(self.margin_requirements),
             'available_balance': self.available_balance,
-            'positions': dict(self.positions),
             'total_commission': self.total_commission,
         })
+        # Per-timestamp per-symbol snapshot, overwritten on each event so it
+        # retains this timestamp's last-event state (the value that
+        # last-row-per-timestamp consumers read). One snapshot per timestamp,
+        # not per event — get_equity_curve re-attaches it as object columns.
+        self._pnl_snapshots[event.timestamp] = {
+            'positions': dict(self.positions),
+            'unrealized_pnl': dict(self.unrealized_pnl),
+            'realized_pnl': dict(self.realized_pnl),
+            'margin_requirements': dict(self.margin_requirements),
+        }
 
         self.check_solvency(event.timestamp)
 
@@ -637,8 +652,8 @@ class BacktestPortfolio(Portfolio):
         if symbol in self._latest_prices:
             return self._latest_prices[symbol]
         bars = self.data_handler.get_latest_bars(symbol, 1)
-        if len(bars) > 0:
-            price = bars['Close'].iloc[-1]
+        if bars:
+            price = bars[-1].close
             self._latest_prices[symbol] = price
             return price
         return None
@@ -656,11 +671,25 @@ class BacktestPortfolio(Portfolio):
         """
         Return the per-bar equity snapshot history as a DataFrame indexed by
         timestamp. Empty DataFrame if no bars have been processed yet.
+
+        Account-level columns (``cash``, ``account_balance``, ``simple_return``,
+        ``log_return``, ``position_margin``, ``available_balance``,
+        ``total_commission``) are recorded once per BarEvent. The per-symbol
+        dict columns (``positions``, ``unrealized_pnl``, ``realized_pnl``,
+        ``margin_requirements``) are re-attached from the per-timestamp
+        snapshot (one per timestamp, last-event-wins): every event row of a
+        given timestamp therefore carries that timestamp's *final* snapshot,
+        matching the documented "collapse to one row per timestamp (last
+        wins)" consumption. The attached dicts are shared references (the
+        snapshots live once per timestamp), so this does not re-bloat memory.
         """
         if not self.equity_curve:
             return pd.DataFrame()
         df = pd.DataFrame(self.equity_curve)
         df.set_index('timestamp', inplace=True)
+        for col in ('positions', 'unrealized_pnl', 'realized_pnl',
+                    'margin_requirements'):
+            df[col] = [self._pnl_snapshots[ts][col] for ts in df.index]
         return df
 
     def get_trade_log(self) -> pd.DataFrame:

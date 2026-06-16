@@ -34,16 +34,22 @@ class _PortfolioLike(Protocol):
 class _DataHandlerLike(Protocol):
     """Subset of the DataHandler surface that VolTargetingRiskManager reads.
 
-    Used to pull a trailing window of closes for the inline correlation-matrix
-    derivation in ``calculate_instrument_weight`` (``mode='min_variance'``,
-    ``corr_matrix=None``). ``timeframes`` is read at construction time to
-    validate that the configured ``corr_timeframe`` is registered.
+    ``get_latest_bars_df`` pulls a trailing window of closes (as a DataFrame)
+    for the inline correlation-matrix derivation in
+    ``calculate_instrument_weight`` (``mode='min_variance'`` / ``'risk_parity'``,
+    ``corr_matrix=None``); ``count_bars`` is the O(1) data-availability gate
+    used by ``_data_gate_met`` / ``get_live_symbols``. ``timeframes`` is read
+    at construction time to validate that the configured ``corr_timeframe`` is
+    registered.
     """
 
     timeframes: Dict[str, int]
 
-    def get_latest_bars(self, symbol: str, n: int = 1,
-                        timeframe: Optional[str] = None) -> pd.DataFrame: ...
+    def get_latest_bars_df(self, symbol: str, n: int = 1,
+                           timeframe: Optional[str] = None) -> pd.DataFrame: ...
+
+    def count_bars(self, symbol: str,
+                   timeframe: Optional[str] = None) -> int: ...
 
 
 # ──────────────────────────────────────────────

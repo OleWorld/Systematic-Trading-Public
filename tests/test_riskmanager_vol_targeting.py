@@ -115,7 +115,8 @@ class FakeVolEstimator:
 
 
 class FakeDataHandler:
-    """Returns a configurable per-symbol close series via ``get_latest_bars``.
+    """Returns a configurable per-symbol close series via ``get_latest_bars_df``
+    (DataFrame, for the corr derivation) and ``count_bars`` (the O(1) gate).
 
     ``closes`` maps symbol → pd.Series of Close prices (datetime-indexed
     is recommended for realism but not enforced; the risk manager only
@@ -137,8 +138,8 @@ class FakeDataHandler:
         )
         self.calls: List[Dict[str, Any]] = []
 
-    def get_latest_bars(self, symbol: str, n: int = 1,
-                        timeframe: Optional[str] = None) -> pd.DataFrame:
+    def get_latest_bars_df(self, symbol: str, n: int = 1,
+                           timeframe: Optional[str] = None) -> pd.DataFrame:
         self.calls.append({'symbol': symbol, 'n': n, 'timeframe': timeframe})
         s = self._closes.get(symbol)
         if s is None or len(s) == 0:
@@ -148,6 +149,12 @@ class FakeDataHandler:
             'Open': tail.values, 'High': tail.values, 'Low': tail.values,
             'Close': tail.values, 'Volume': 1.0,
         }, index=tail.index)
+
+    def count_bars(self, symbol: str,
+                   timeframe: Optional[str] = None) -> int:
+        """O(1) availability gate (no DataFrame); NOT tracked in ``calls``."""
+        s = self._closes.get(symbol)
+        return 0 if s is None else len(s)
 
 
 def _bar(symbol: str = 'BTC', is_forming: bool = False,
@@ -1244,15 +1251,15 @@ def test_staggered_universe_weights_cover_live_subset_only():
     rm, dh, _ = _staggered_rm(young_bars=10)
     assert set(rm.instrument_weight) == {'BTC', 'ETH'}
     assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
-    # One recalc ran (at __init__): the liveness probe queries every
-    # symbol once (n=corr_lookback each), then the corr-matrix closes
-    # pull queries the LIVE symbols once more. NEW must appear exactly
-    # once (probe only — excluded from the closes pull).
+    # One recalc ran (at __init__). The liveness probe now uses the O(1)
+    # ``count_bars`` gate (no DataFrame, untracked), so ``dh.calls`` records
+    # only the corr-matrix closes pull (``get_latest_bars_df``), which queries
+    # the LIVE symbols once each. NEW (not live) is never pulled.
     per_symbol_counts = {
         s: sum(1 for c in dh.calls if c['symbol'] == s and c['n'] == 60)
         for s in ['BTC', 'ETH', 'NEW']
     }
-    assert per_symbol_counts == {'BTC': 2, 'ETH': 2, 'NEW': 1}
+    assert per_symbol_counts == {'BTC': 1, 'ETH': 1, 'NEW': 0}
 
 
 def test_warmup_correlation_symbol_skips_sizing():
