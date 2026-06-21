@@ -16,7 +16,7 @@ Pin:
 - Constructor validation (idm, annual_target_vol, position_buffer ranges).
 - Built-in instrument / strategy weight defaults + recalc.
 
-Run from the repo root:  pytest tests/test_riskmanager_carver.py -v
+Run from the repo root:  pytest tests/test_riskmanager_vol_targeting.py -v
 """
 
 import logging
