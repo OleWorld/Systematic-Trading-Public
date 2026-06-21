@@ -23,12 +23,18 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections import deque
 from datetime import datetime
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 
-_DequeEntry = Tuple[datetime, Dict[str, float]]
+# ``_inputs`` entries: ``(timestamp, input_dict)``.
+_InputEntry = Tuple[datetime, Dict[str, float]]
+# ``_outputs`` entries: ``(timestamp, full_output_dict, public_output_dict, has_nan)``.
+# The full dict feeds recursive ``_compute``; the cached public dict (leading
+# ``_`` keys filtered) and ``has_nan`` flag back the per-bar hot-path queries
+# (``latest`` / ``forming`` / ``is_*_ready``) with zero pandas allocation.
+_OutputEntry = Tuple[datetime, Dict[str, float], Dict[str, float], bool]
 
 
 class Indicator(ABC):
@@ -39,9 +45,13 @@ class Indicator(ABC):
     - ``_inputs``: deque of ``(ts, input_dict)``. Window-based subclasses
       (SMA, Stdev, PercentRank, BBW) read the trailing window from here.
       Recursive-only subclasses leave it at the default maxlen=2.
-    - ``_outputs``: deque of ``(ts, output_dict)``. Last entry is the
-      forming output; the entry one slot back is the last finalized output.
-      ``get_latest_indicators(n)`` materializes a DataFrame from this deque.
+    - ``_outputs``: deque of ``(ts, output_dict, public_dict, has_nan)``. Last
+      entry is the forming output; the entry one slot back is the last
+      finalized output. The cached ``public_dict`` (``_``-keys filtered) and
+      ``has_nan`` flag back the zero-allocation hot-path queries; the full
+      ``output_dict`` feeds recursive ``_compute``. ``get_latest_indicators(n)``
+      returns the public dicts as a list; ``get_latest_indicators_df(n)``
+      materializes a DataFrame.
 
     Subclasses implement ``_compute(prev_output, **inputs) -> dict``. The base
     class handles upsert and ``prev_output`` selection. Subclasses also
@@ -53,8 +63,8 @@ class Indicator(ABC):
             raise ValueError(f"outputs_maxlen must be >= 2, got {outputs_maxlen}")
         if inputs_maxlen < 1:
             raise ValueError(f"inputs_maxlen must be >= 1, got {inputs_maxlen}")
-        self._outputs: Deque[_DequeEntry] = deque(maxlen=outputs_maxlen)
-        self._inputs: Deque[_DequeEntry] = deque(maxlen=inputs_maxlen)
+        self._outputs: Deque[_OutputEntry] = deque(maxlen=outputs_maxlen)
+        self._inputs: Deque[_InputEntry] = deque(maxlen=inputs_maxlen)
 
     # ── core engine ──────────────────────────────
 
@@ -78,11 +88,18 @@ class Indicator(ABC):
             prev = self._outputs[-2][1] if len(self._outputs) >= 2 else None
 
         value = self._compute(prev, **inputs)
+        # Cache the public view (leading-``_`` keys filtered) and a scalar
+        # NaN flag once per push, so the per-bar hot-path queries
+        # (latest / forming / is_*_ready) are plain reads — no pandas, no
+        # re-filtering. ``v != v`` is the float-NaN test (outputs are floats).
+        public = self._public(value)
+        has_nan = any(v != v for v in public.values())
+        entry: _OutputEntry = (ts, value, public, has_nan)
 
         if is_new_bar:
-            self._outputs.append((ts, value))
+            self._outputs.append(entry)
         else:
-            self._outputs[-1] = (ts, value)
+            self._outputs[-1] = entry
 
     @abstractmethod
     def _compute(self, prev_output: Optional[Dict[str, float]],
@@ -108,63 +125,79 @@ class Indicator(ABC):
         """
         return {k: v for k, v in vals.items() if not k.startswith('_')}
 
-    def get_latest_indicators(self, n: int) -> pd.DataFrame:
+    def get_latest_indicators(self, n: int) -> List[Dict[str, float]]:
+        """Return the last ``n`` public output dicts, oldest→newest.
+
+        Each element is the cached public view of one tick's output (leading
+        ``_`` keys filtered). Plain Python, no pandas — the fast counterpart
+        to ``get_latest_indicators_df``. Empty list if no outputs yet. The
+        dicts are the indicator's own cached objects; treat them as read-only.
+        """
+        if not self._outputs:
+            return []
+        start = max(0, len(self._outputs) - n)
+        return [pub for _, _, pub, _ in list(self._outputs)[start:]]
+
+    def get_latest_indicators_df(self, n: int) -> pd.DataFrame:
         """Return the last ``n`` output rows as a DataFrame indexed by timestamp.
 
         Columns are the public keys of the per-tick output dict (leading
-        ``_`` keys are filtered). Empty DataFrame if no outputs yet.
+        ``_`` keys are filtered). Empty DataFrame if no outputs yet. The
+        DataFrame-materializing counterpart to ``get_latest_indicators`` —
+        for research, golden tests, and warmup, not the per-bar hot path.
         """
         if not self._outputs:
             return pd.DataFrame()
         n_avail = len(self._outputs)
         start = max(0, n_avail - n)
         subset = list(self._outputs)[start:]
-        timestamps = [ts for ts, _ in subset]
-        rows = [self._public(vals) for _, vals in subset]
+        timestamps = [ts for ts, _, _, _ in subset]
+        rows = [pub for _, _, pub, _ in subset]
         return pd.DataFrame(rows, index=pd.Index(timestamps))
 
     @property
-    def latest(self) -> Optional[pd.Series]:
+    def latest(self) -> Optional[Dict[str, float]]:
         """Most-recently finalized output values (``iloc[-2]`` of outputs).
 
-        Returns ``None`` until at least 2 outputs exist (one finalized + one
-        forming). Strategies use this for signal logic — by convention, the
-        last entry is always treated as forming and only the prior is read.
-        ``_``-prefixed keys are filtered from the returned Series.
+        Returns the cached **public** output dict (leading ``_`` keys
+        filtered), or ``None`` until at least 2 outputs exist (one finalized +
+        one forming). Strategies use this for signal logic — by convention,
+        the last entry is always treated as forming and only the prior is
+        read. The returned dict is the indicator's own cached object; treat
+        it as read-only.
         """
         if len(self._outputs) < 2:
             return None
-        ts, vals = self._outputs[-2]
-        return pd.Series(self._public(vals), name=ts)
+        return self._outputs[-2][2]
 
     @property
-    def forming(self) -> Optional[pd.Series]:
+    def forming(self) -> Optional[Dict[str, float]]:
         """Current forming output values (``iloc[-1]`` of outputs).
 
-        Returns ``None`` until at least 1 output exists. Used when one
+        Returns the cached **public** output dict (leading ``_`` keys
+        filtered), or ``None`` until at least 1 output exists. Used when one
         indicator's forming output is fed into another (e.g. KAMA's forming
-        value into ``TrailingVolatilityStop``). ``_``-prefixed keys filtered.
+        value into ``TrailingVolatilityStop``). Read-only (shared cached object).
         """
         if not self._outputs:
             return None
-        ts, vals = self._outputs[-1]
-        return pd.Series(self._public(vals), name=ts)
+        return self._outputs[-1][2]
 
     @property
     def is_latest_ready(self) -> bool:
-        """True iff ``latest`` is non-None and contains no NaNs (public keys only)."""
-        latest = self.latest
-        if latest is None:
-            return False
-        return not latest.isna().any()
+        """True iff ``latest`` exists and has no NaN public value.
+
+        Reads the precomputed ``has_nan`` flag — no pandas, no allocation.
+        """
+        return len(self._outputs) >= 2 and not self._outputs[-2][3]
 
     @property
     def is_forming_ready(self) -> bool:
-        """True iff ``forming`` is non-None and contains no NaNs (public keys only)."""
-        forming = self.forming
-        if forming is None:
-            return False
-        return not forming.isna().any()
+        """True iff ``forming`` exists and has no NaN public value.
+
+        Reads the precomputed ``has_nan`` flag — no pandas, no allocation.
+        """
+        return bool(self._outputs) and not self._outputs[-1][3]
 
     # ── lifecycle ────────────────────────────────
 

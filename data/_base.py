@@ -168,17 +168,47 @@ class DataHandler(abc.ABC):
         return pd.DataFrame(ohlcv, index=timestamps,
                             columns=['Open', 'High', 'Low', 'Close', 'Volume'])
 
+    def _select_deque(self, symbol: str,
+                      timeframe: Optional[str]) -> "deque[Bar]":
+        """Resolve and return the bar deque for ``symbol`` at ``timeframe``.
+
+        ``timeframe`` ``None`` or equal to ``base_timeframe`` selects the
+        base-TF deque; otherwise the registered HTF deque. Shared by
+        ``get_latest_bars`` / ``get_latest_bars_df`` / ``count_bars``.
+
+        Raises
+        ------
+        ValueError
+            If ``symbol`` was not registered via ``symbol_list``, or if
+            ``timeframe`` was not registered via ``timeframes``.
+        """
+        if symbol not in self._base_bar_data:
+            raise ValueError(
+                f"Unknown symbol '{symbol}'. Registered: {self.symbol_list}"
+            )
+        if timeframe is None or timeframe == self.base_timeframe:
+            return self._base_bar_data[symbol]
+        if timeframe not in self.timeframes:
+            available = list(self.timeframes.keys())
+            raise ValueError(
+                f"Timeframe '{timeframe}' not registered. "
+                f"Available: {available}"
+            )
+        return self._htf_bar_data[(symbol, timeframe)]
+
     def get_latest_bars(self, symbol: str, n: int = 1,
-                        timeframe: Optional[str] = None) -> pd.DataFrame:
-        """Returns the last *n* bars as a DataFrame with datetime index.
+                        timeframe: Optional[str] = None) -> List[Bar]:
+        """Return the last *n* bars as a list of ``Bar`` objects (oldest→newest).
 
-        Columns: Open, High, Low, Close, Volume (float64).
-
-        The last row (``iloc[-1]``) is the current **forming** bar — it can
-        still mutate (in live, as new ticks arrive for the same timestamp;
-        at HTF, as more base bars close within the current period). Use
-        ``iloc[-2]`` and earlier rows for signal logic that must only see
-        completed bars.
+        Reads straight from the deque — **no DataFrame construction** — so it
+        is the cheap per-bar accessor for hot paths (strategies, vol
+        estimators picking off ``bar.close`` / ``bar.timestamp``). The last
+        element (``[-1]``) is the current **forming** bar — it can still
+        mutate (in live, as new ticks arrive for the same timestamp; at HTF,
+        as more base bars close within the current period). Use ``[-2]`` and
+        earlier for signal logic that must only see completed bars. Returns up
+        to *n* bars (fewer if the deque is shorter), empty list if none yet.
+        For a DataFrame view, use ``get_latest_bars_df``.
 
         Parameters
         ----------
@@ -193,38 +223,28 @@ class DataHandler(abc.ABC):
             If ``symbol`` was not registered via ``symbol_list``, or if
             ``timeframe`` was not registered via ``timeframes``.
         """
-        if symbol not in self._base_bar_data:
-            raise ValueError(
-                f"Unknown symbol '{symbol}'. Registered: {self.symbol_list}"
-            )
+        deq = self._select_deque(symbol, timeframe)
+        if n <= 0 or not deq:
+            return []
+        start = max(0, len(deq) - n)
+        return list(deq)[start:]
 
-        if timeframe is None or timeframe == self.base_timeframe:
-            return self._deque_to_df(self._base_bar_data[symbol], n)
+    def get_latest_bars_df(self, symbol: str, n: int = 1,
+                           timeframe: Optional[str] = None) -> pd.DataFrame:
+        """Returns the last *n* bars as a DataFrame with datetime index.
 
-        if timeframe not in self.timeframes:
-            available = list(self.timeframes.keys())
-            raise ValueError(
-                f"Timeframe '{timeframe}' not registered. "
-                f"Available: {available}"
-            )
-
-        return self._deque_to_df(self._htf_bar_data[(symbol, timeframe)], n)
-
-    def get_latest_bar(self, symbol: str,
-                       timeframe: Optional[str] = None) -> Optional[Bar]:
-        """Return the last (forming) ``Bar`` directly from the deque, or ``None``.
-
-        Thin convenience that skips the ``DataFrame`` round-trip in
-        ``get_latest_bars(symbol, 1, timeframe)``. Useful when picking off
-        scalar fields (e.g. ``bar.close``, ``bar.high``) to feed a stateful
-        indicator's ``update(ts, ...)``.
+        Columns: Open, High, Low, Close, Volume (float64). The
+        DataFrame-materializing counterpart to ``get_latest_bars`` — for
+        research, plotting, correlation windows, and other non-hot callers
+        that want a frame. The last row (``iloc[-1]``) is the current
+        **forming** bar (see ``get_latest_bars``).
 
         Parameters
         ----------
         timeframe : str, optional
-            If None or equal to ``base_timeframe``, returns the latest base
-            bar. Otherwise returns the latest bar from the requested HTF
-            deque. Must have been registered in ``timeframes``.
+            If None or equal to base_timeframe, returns base-TF bars.
+            Otherwise returns bars from the requested HTF deque.
+            The timeframe must have been registered in the ``timeframes`` dict.
 
         Raises
         ------
@@ -232,21 +252,20 @@ class DataHandler(abc.ABC):
             If ``symbol`` was not registered via ``symbol_list``, or if
             ``timeframe`` was not registered via ``timeframes``.
         """
-        if symbol not in self._base_bar_data:
-            raise ValueError(
-                f"Unknown symbol '{symbol}'. Registered: {self.symbol_list}"
-            )
+        return self._deque_to_df(self._select_deque(symbol, timeframe), n)
 
-        if timeframe is None or timeframe == self.base_timeframe:
-            deq = self._base_bar_data[symbol]
-            return deq[-1] if deq else None
+    def count_bars(self, symbol: str,
+                   timeframe: Optional[str] = None) -> int:
+        """Number of bars currently stored for ``symbol`` at ``timeframe``.
 
-        if timeframe not in self.timeframes:
-            available = list(self.timeframes.keys())
-            raise ValueError(
-                f"Timeframe '{timeframe}' not registered. "
-                f"Available: {available}"
-            )
+        O(1) deque length — the cheap way to test data-availability gates
+        (e.g. "are there at least ``corr_lookback`` bars yet?") without
+        materializing a DataFrame. The count includes the current forming bar.
 
-        deq = self._htf_bar_data[(symbol, timeframe)]
-        return deq[-1] if deq else None
+        Raises
+        ------
+        ValueError
+            If ``symbol`` was not registered via ``symbol_list``, or if
+            ``timeframe`` was not registered via ``timeframes``.
+        """
+        return len(self._select_deque(symbol, timeframe))

@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 import pandas as pd
 import pytest
 
+from data._bar import Bar
 from event import BarEvent
 from strategy import Strategy
 
@@ -25,18 +26,18 @@ from strategy import Strategy
 # ──────────────────────────────────────────────
 
 class FakeDataHandler:
-    """Minimal data handler — get_latest_bars returns a canned DataFrame."""
+    """Minimal data handler — get_latest_bars returns canned ``Bar`` objects."""
 
     def __init__(self, frame: Optional[pd.DataFrame] = None):
         self._frame = frame if frame is not None else pd.DataFrame()
 
     def get_latest_bars(self, symbol: str, n: int,
-                        timeframe: Optional[str] = None) -> pd.DataFrame:
-        return self._frame.tail(n)
-
-    def get_latest_bar(self, symbol: str,
-                       timeframe: Optional[str] = None) -> Optional[Any]:
-        return None
+                        timeframe: Optional[str] = None) -> List[Bar]:
+        if self._frame.empty:
+            return []
+        tail = self._frame.tail(n)
+        return [Bar(ts, c, c, c, c, 0.0)
+                for ts, c in zip(tail.index, tail['Close'])]
 
 
 class DummyStrategy(Strategy):

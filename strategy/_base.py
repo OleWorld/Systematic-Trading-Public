@@ -36,11 +36,14 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 
 class _DataHandlerLike(Protocol):
-    """Minimal interface ``Strategy`` subclasses need from the data handler."""
+    """Minimal interface ``Strategy`` subclasses need from the data handler.
+
+    Only ``get_latest_bars`` is consumed — the last *n* ``Bar`` objects at the
+    execution timeframe (a plain list, no DataFrame; see
+    ``DataHandler.get_latest_bars`` / ``get_latest_bars_df``).
+    """
     def get_latest_bars(self, symbol: str, n: int,
-                        timeframe: Optional[str] = None) -> pd.DataFrame: ...
-    def get_latest_bar(self, symbol: str,
-                       timeframe: Optional[str] = None) -> Optional[Any]: ...
+                        timeframe: Optional[str] = None) -> List[Any]: ...
 
 
 # ──────────────────────────────────────────────

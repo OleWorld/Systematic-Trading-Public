@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from data._bar import Bar
 from event import BarEvent
 from volatility import RollingStdevVolEstimator
 
@@ -48,9 +49,9 @@ class _StubDataHandler:
     ``get_latest_bars`` — the one method the vol estimator consumes.
 
     Closes are registered per (symbol, timeframe) via ``add_close``;
-    ``get_latest_bars`` returns the last ``n`` as a DataFrame with the
-    standard OHLCV columns (only ``Close`` is read by the estimator,
-    but matching the real return type matters for the contract).
+    ``get_latest_bars`` returns the last ``n`` as a list of ``Bar`` objects
+    (only ``.close`` / ``.timestamp`` are read by the estimator, but matching
+    the real ``List[Bar]`` return type matters for the contract).
     """
 
     def __init__(self) -> None:
@@ -62,26 +63,12 @@ class _StubDataHandler:
         self._bars.setdefault(key, []).append((ts, close))
 
     def get_latest_bars(self, symbol: str, n: int,
-                        timeframe: Optional[str] = None) -> pd.DataFrame:
+                        timeframe: Optional[str] = None) -> List[Bar]:
         tf = timeframe if timeframe is not None else '1d'
         rows = self._bars.get((symbol, tf), [])
         if not rows:
-            return pd.DataFrame(
-                columns=['Open', 'High', 'Low', 'Close', 'Volume']
-            )
-        subset = rows[-n:]
-        timestamps = [t for t, _ in subset]
-        closes = [c for _, c in subset]
-        return pd.DataFrame(
-            {
-                'Open': closes,
-                'High': closes,
-                'Low': closes,
-                'Close': closes,
-                'Volume': [10.0] * len(closes),
-            },
-            index=timestamps,
-        )
+            return []
+        return [Bar(ts, c, c, c, c, 10.0) for ts, c in rows[-n:]]
 
 
 # ──────────────────────────────────────────────

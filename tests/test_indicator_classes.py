@@ -192,12 +192,28 @@ def test_trailing_stop_from_series_flips_on_breach():
 
 def _drive_single(ind, series: pd.Series) -> pd.Series:
     """Push ``series`` into a single-input stateful indicator and return the
-    primary output column from ``get_latest_indicators``."""
+    primary output column from ``get_latest_indicators_df``."""
     for ts, v in series.items():
         ind.update(ts, float(v))
-    df = ind.get_latest_indicators(len(series))
+    df = ind.get_latest_indicators_df(len(series))
     # First (only) public column is the primary output.
     return df.iloc[:, 0]
+
+
+def test_get_latest_indicators_returns_list_of_public_dicts():
+    """The list form mirrors get_latest_indicators_df row-for-row (oldest→newest),
+    same public keys, no pandas materialization."""
+    sma = SMA(window=3)
+    times = [dt.datetime(2024, 1, 1, h) for h in range(4)]
+    for ts, v in zip(times, [1.0, 2.0, 3.0, 4.0]):
+        sma.update(ts, v)
+    rows = sma.get_latest_indicators(4)
+    df = sma.get_latest_indicators_df(4)
+    assert isinstance(rows, list) and all(isinstance(r, dict) for r in rows)
+    assert [list(r.keys()) for r in rows] == [['sma']] * 4
+    np.testing.assert_allclose(
+        [r['sma'] for r in rows], df['sma'].values, equal_nan=True, rtol=1e-12,
+    )
 
 
 def test_sma_stateful_matches_vectorized(random_close):
@@ -223,7 +239,7 @@ def test_rsi_stateful_matches_vectorized(random_close):
     ind = RSI(window=14)
     for ts, v in random_close.items():
         ind.update(ts, float(v))
-    rsi_col = ind.get_latest_indicators(len(random_close))['rsi']
+    rsi_col = ind.get_latest_indicators_df(len(random_close))['rsi']
     np.testing.assert_allclose(rsi_col.values, vec.values, equal_nan=True, rtol=1e-12)
 
 
@@ -254,7 +270,7 @@ def test_atr_stateful_matches_vectorized(random_ohlc):
     ind = ATR(length=14)
     for ts in random_ohlc.index:
         ind.update(ts, h.loc[ts], l.loc[ts], c.loc[ts])
-    atr_col = ind.get_latest_indicators(len(random_ohlc))['atr']
+    atr_col = ind.get_latest_indicators_df(len(random_ohlc))['atr']
     np.testing.assert_allclose(atr_col.values, vec.values, equal_nan=True, rtol=1e-12)
 
 
@@ -275,7 +291,7 @@ def test_trailing_stop_stateful_matches_vectorized(random_ohlc):
     for ts in random_ohlc.index:
         tvs.update(ts, price=kama_vec.loc[ts], trigger=kama_vec.loc[ts],
                    atr=atr_vec.loc[ts])
-    tvs_df = tvs.get_latest_indicators(len(random_ohlc))
+    tvs_df = tvs.get_latest_indicators_df(len(random_ohlc))
     np.testing.assert_allclose(tvs_df['stop'].values, stop_vec.values,
                                equal_nan=True, rtol=1e-12)
     np.testing.assert_array_equal(tvs_df['direction'].values, dir_vec.values)
@@ -308,14 +324,14 @@ def test_kama_upsert_does_not_corrupt_recursion():
         b.update(ts, v)
 
     np.testing.assert_allclose(
-        a.get_latest_indicators(10)['kama'].values,
-        b.get_latest_indicators(10)['kama'].values,
+        a.get_latest_indicators_df(10)['kama'].values,
+        b.get_latest_indicators_df(10)['kama'].values,
         equal_nan=True, rtol=1e-12,
     )
     # Re-ticked deque has exactly 3 entries (one per distinct timestamp).
     assert len(a._outputs) == 3
     # And the last output is finite — i.e. the mask actually unmasks.
-    assert np.isfinite(a.get_latest_indicators(10)['kama'].iloc[-1])
+    assert np.isfinite(a.get_latest_indicators_df(10)['kama'].iloc[-1])
 
 
 def test_ema_upsert_does_not_corrupt_recursion():
@@ -330,8 +346,8 @@ def test_ema_upsert_does_not_corrupt_recursion():
         b.update(ts, v)
 
     np.testing.assert_allclose(
-        a.get_latest_indicators(10)['ema'].values,
-        b.get_latest_indicators(10)['ema'].values,
+        a.get_latest_indicators_df(10)['ema'].values,
+        b.get_latest_indicators_df(10)['ema'].values,
         equal_nan=True, rtol=1e-12,
     )
 
@@ -359,8 +375,8 @@ def test_atr_upsert_does_not_corrupt_recursion():
         b.update(ts, h, l, c)
 
     np.testing.assert_allclose(
-        a.get_latest_indicators(10)['atr'].values,
-        b.get_latest_indicators(10)['atr'].values,
+        a.get_latest_indicators_df(10)['atr'].values,
+        b.get_latest_indicators_df(10)['atr'].values,
         equal_nan=True, rtol=1e-12,
     )
 
@@ -421,7 +437,7 @@ def test_reset_clears_state(random_close):
     for ts, v in random_close.iloc[:50].items():
         b.update(ts, float(v))
     pd.testing.assert_frame_equal(
-        a.get_latest_indicators(50), b.get_latest_indicators(50),
+        a.get_latest_indicators_df(50), b.get_latest_indicators_df(50),
     )
 
 
@@ -432,8 +448,8 @@ def test_warmup_series_matches_bar_by_bar(random_close):
     for ts, v in random_close.items():
         b.update(ts, float(v))
     pd.testing.assert_frame_equal(
-        a.get_latest_indicators(len(random_close)),
-        b.get_latest_indicators(len(random_close)),
+        a.get_latest_indicators_df(len(random_close)),
+        b.get_latest_indicators_df(len(random_close)),
     )
 
 
@@ -446,7 +462,7 @@ def test_kama_constant_input_tracks_constant():
     ts = _ts_index(20)
     for t in ts:
         sma.update(t, 5.0)
-    df = sma.get_latest_indicators(20)['kama']
+    df = sma.get_latest_indicators_df(20)['kama']
     # First er_length outputs masked; the rest must equal the constant.
     assert df.iloc[:5].isna().all()
     np.testing.assert_allclose(df.iloc[5:].values, 5.0)
@@ -458,7 +474,7 @@ def test_trailing_stop_inherits_state_through_nan_atr():
     tvs.update(ts[0], price=100.0, trigger=100.0, atr=float('nan'))
     tvs.update(ts[1], price=101.0, trigger=101.0, atr=float('nan'))
     tvs.update(ts[2], price=102.0, trigger=102.0, atr=1.0)
-    df = tvs.get_latest_indicators(3)
+    df = tvs.get_latest_indicators_df(3)
     # First two bars: NaN ATR → public stop is NaN, direction defaults to +1.
     assert pd.isna(df['stop'].iloc[0])
     assert pd.isna(df['stop'].iloc[1])
@@ -522,8 +538,8 @@ def test_ewmstdev_upsert_does_not_corrupt_recursion():
         b.update(ts, v)
 
     np.testing.assert_allclose(
-        a.get_latest_indicators(10)['stdev'].values,
-        b.get_latest_indicators(10)['stdev'].values,
+        a.get_latest_indicators_df(10)['stdev'].values,
+        b.get_latest_indicators_df(10)['stdev'].values,
         equal_nan=True, rtol=1e-12,
     )
     # Re-ticked deque has exactly 3 entries (one per distinct timestamp).

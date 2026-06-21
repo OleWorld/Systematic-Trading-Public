@@ -494,8 +494,8 @@ def test_get_latest_bars_base_default_and_explicit_match():
     for i in range(3):
         ts = datetime.datetime(2026, 1, 1, i, tzinfo=UTC)
         h._append_bar('BTC', ts, i, i, i, i, 1)
-    df_default  = h.get_latest_bars('BTC', 5)
-    df_explicit = h.get_latest_bars('BTC', 5, '1h')
+    df_default  = h.get_latest_bars_df('BTC', 5)
+    df_explicit = h.get_latest_bars_df('BTC', 5, '1h')
     assert df_default.equals(df_explicit)
 
 
@@ -504,17 +504,50 @@ def test_get_latest_bars_n_caps_to_available_and_columns_correct():
     for i in range(3):
         ts = datetime.datetime(2026, 1, 1, i, tzinfo=UTC)
         h._append_bar('BTC', ts, i, i, i, i, 1)
-    df = h.get_latest_bars('BTC', 10)
+    df = h.get_latest_bars_df('BTC', 10)
     assert list(df.columns) == ['Open', 'High', 'Low', 'Close', 'Volume']
     assert len(df) == 3
     assert df.index[0].tzinfo is not None
 
 
-def test_get_latest_bars_empty_deque_returns_empty_frame():
+def test_get_latest_bars_df_empty_deque_returns_empty_frame():
     h = _new_stub()
-    df = h.get_latest_bars('BTC', 5)
+    df = h.get_latest_bars_df('BTC', 5)
     assert list(df.columns) == ['Open', 'High', 'Low', 'Close', 'Volume']
     assert len(df) == 0
+
+
+def test_get_latest_bars_returns_list_of_bars():
+    h = _new_stub(base='1h', timeframes={'1h': 50})
+    for i in range(3):
+        ts = datetime.datetime(2026, 1, 1, i, tzinfo=UTC)
+        h._append_bar('BTC', ts, i, i + 1, i, i, 1)
+    bars = h.get_latest_bars('BTC', 2)
+    assert len(bars) == 2
+    assert [b.close for b in bars] == [1.0, 2.0]                 # last 2, oldest→newest
+    assert bars[-1].timestamp == datetime.datetime(2026, 1, 1, 2, tzinfo=UTC)
+
+
+def test_get_latest_bars_empty_deque_returns_empty_list():
+    h = _new_stub()
+    assert h.get_latest_bars('BTC', 5) == []
+
+
+def test_count_bars_returns_deque_length():
+    h = _new_stub(base='1h', timeframes={'1h': 50, '4h': 50})
+    for i in range(4):
+        ts = datetime.datetime(2026, 1, 1, i, tzinfo=UTC)
+        h._append_bar('BTC', ts, i, i, i, i, 1)
+    assert h.count_bars('BTC') == 4
+    assert h.count_bars('BTC', '1h') == 4
+    # 4 hourly bars at 00:00..03:00 fall in a single 4h bucket.
+    assert h.count_bars('BTC', '4h') == 1
+
+
+def test_count_bars_unknown_symbol_raises():
+    h = _new_stub(base='1h', timeframes={'1h': 50}, symbols=('BTC',))
+    with pytest.raises(ValueError):
+        h.count_bars('UNKNOWN')
 
 
 def test_get_latest_bars_unregistered_timeframe_raises():
@@ -723,7 +756,7 @@ def test_historic_handler_appends_to_internal_deque():
     while h.continue_backtest:
         h.update_bar()
 
-    df = h.get_latest_bars('BTC_USDT', 10)
+    df = h.get_latest_bars_df('BTC_USDT', 10)
     assert len(df) == 3
     assert list(df['Close']) == [100.0, 101.0, 102.0]
 

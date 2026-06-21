@@ -37,9 +37,7 @@ also skips on it.
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Protocol
-
-import pandas as pd
+from typing import Any, List, Optional, Protocol
 
 from data import parse_timeframe_to_seconds
 from event import BarEvent
@@ -93,11 +91,11 @@ class _DataHandlerLike(Protocol):
 
     Mirrors ``strategy._base._DataHandlerLike`` — only ``get_latest_bars``
     is consumed (the estimator reads the last two closes at its
-    configured timeframe).
+    configured timeframe, as a plain list of ``Bar`` objects).
     """
 
     def get_latest_bars(self, symbol: str, n: int,
-                        timeframe: Optional[str] = None) -> pd.DataFrame: ...
+                        timeframe: Optional[str] = None) -> List[Any]: ...
 
 
 class VolEstimator(ABC):

@@ -507,12 +507,12 @@ class VolTargetingRiskManager(RiskManager):
     def _data_gate_met(self, symbol: str) -> bool:
         """True once ``symbol`` carries the full ``corr_lookback`` bars at
         ``corr_timeframe`` — the data half of the liveness gate, and the
-        ``warmup_correlation`` boundary. ``get_latest_bars`` returns *up
-        to* n rows, so ``len == corr_lookback`` means at least that many
-        are available (count includes the current forming bar)."""
-        return len(self.data_handler.get_latest_bars(
-            symbol, self.corr_lookback, timeframe=self.corr_timeframe,
-        )) >= self.corr_lookback
+        ``warmup_correlation`` boundary. Uses ``count_bars`` (O(1) deque
+        length, no DataFrame materialization — this runs per symbol on the
+        liveness check); the count includes the current forming bar."""
+        return self.data_handler.count_bars(
+            symbol, timeframe=self.corr_timeframe,
+        ) >= self.corr_lookback
 
     def _classify_warmup_reason(self, symbol: str) -> str:
         """Classify why a symbol absent from ``instrument_weight`` cannot be
@@ -754,7 +754,7 @@ class VolTargetingRiskManager(RiskManager):
         unexpected ``self.corr_mode``.
         """
         closes = {
-            s: self.data_handler.get_latest_bars(
+            s: self.data_handler.get_latest_bars_df(
                 s, self.corr_lookback,
                 timeframe=self.corr_timeframe,
             )['Close']
