@@ -58,7 +58,8 @@ config = BacktestConfig(
     corr_timeframe = '1d',
 
     initial_capital=10_000_000,
-    leverage=10.0,
+    leverage=10.0,                          # universal initial-margin rate = 1/10 = 10%
+    maintenance_margin_rate=0.05,           # margin-call floor = 5% of notional (half the 10% initial)
     vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
     annual_target_vol=1_000_000,        # $1M annual vol
     position_buffer=0.25,
@@ -95,10 +96,15 @@ strategy = EWMACStrategy(
     forecast_scalar_lookback=500,
 )
 
+# margin_mode='portfolio_margin' (the config default) → the portfolio builds a
+# PortfolioMarginModel from leverage + maintenance_margin_rate. To use
+# 'single_margin' (per-symbol margin, future work) a caller would construct a
+# SingleMarginModel and pass it via margin_model=.
 portfolio = BacktestPortfolio(
     events_queue, data_handler, config.symbols,
     initial_capital=config.initial_capital,
     leverage=config.leverage,
+    maintenance_margin_rate=config.maintenance_margin_rate,
 )
 
 vol_timeframe = '1d'

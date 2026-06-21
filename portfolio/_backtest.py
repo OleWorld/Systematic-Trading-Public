@@ -8,6 +8,7 @@ import pandas as pd
 
 from event import BarEvent, OrderEvent, FillEvent, OrderType, Direction
 from portfolio._base import Portfolio, _DataHandlerLike, _EventsQueueLike
+from portfolio._margin import MarginModel, PortfolioMarginModel
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +21,18 @@ class BacktestPortfolio(Portfolio):
         Cash = wallet balance (initial capital + cumulative realized P&L - cumulative commissions)
         Unrealized P&L = sum(qty * (current_price - avg_cost)) over all positions
         Account balance = cash + unrealized P&L
-        Position margin = abs(notional) / leverage
+        Position margin = sum of per-symbol initial margin from the ``MarginModel``
         Available balance = account balance - position_margin - reserved_margin
+
+    All margin numbers come from a pluggable ``MarginModel`` (see
+    ``portfolio/_margin.py``). The default ``PortfolioMarginModel`` applies one
+    universal rate — ``initial_margin = abs(notional) * (1/leverage)``, which
+    reproduces the legacy ``abs(notional) / leverage`` formula exactly — plus a
+    separate (lower) maintenance-margin rate that drives the liquidation
+    trigger. Pass a custom ``margin_model`` to override; otherwise the
+    constructor builds the default from ``leverage`` and
+    ``maintenance_margin_rate``. When a ``margin_model`` is supplied, the
+    ``leverage`` argument is informational only (the model wins).
 
         Opening a position: cash decreases by commission only (no notional flow)
         Closing a position: cash changes by realized P&L minus commission
@@ -42,16 +53,22 @@ class BacktestPortfolio(Portfolio):
     ``_reserved_margin``, so a pending LMT that *adds* to a position keeps
     its capital committed; only the *freeing* assumption is dropped.
 
-    Solvency: the portfolio is solvent while account_balance >= 0. When
-    account_balance falls below zero, ``check_solvency`` cancels every
-    pending non-liquidation order FIFO and submits MKT liquidation orders
-    to fully close every open position in ascending unrealized_pnl order
-    (worst position first). Liquidation at mark price does not recover
-    account_balance (it converts unrealized loss to realized loss); the
-    loop's purpose is to stop further market exposure from making things
-    worse, not to magically restore equity. ``available_balance`` going
-    negative is tolerated — it just means existing positions are sitting
-    at unrealized loss and no new opening orders can be placed.
+    Solvency / margin call: the portfolio is solvent while
+    ``account_balance >= total maintenance margin`` (the sum of the
+    ``MarginModel``'s per-symbol maintenance margins). When account_balance
+    falls below that floor, ``check_solvency`` cancels every pending
+    non-liquidation order FIFO and submits MKT liquidation orders to fully
+    close every open position in ascending unrealized_pnl order (worst
+    position first). With the default ``maintenance_margin_rate=0`` the floor
+    is 0, so the trigger collapses to the legacy ``account_balance < 0``
+    (total wipeout); a positive rate fires the realistic earlier margin call.
+    Liquidation at mark price does not recover account_balance (it converts
+    unrealized loss to realized loss); the loop's purpose is to stop further
+    market exposure from making things worse, not to magically restore equity.
+    ``available_balance`` going negative is tolerated — it just means existing
+    positions are sitting at unrealized loss and no new opening orders can be
+    placed. (Liquidate-all-worst-first is kept; partial liquidation — closing
+    only enough to restore the maintenance floor — is future work.)
 
     Fill-time margin trade-off: margin is reserved at submission price.
     Between submission and fill the price can move arbitrarily — a pending
@@ -70,12 +87,26 @@ class BacktestPortfolio(Portfolio):
                  data_handler: _DataHandlerLike,
                  symbol_list: List[str],
                  initial_capital: float = 100_000.0,
-                 leverage: float = 1.0):
+                 leverage: float = 1.0,
+                 maintenance_margin_rate: float = 0.0,
+                 margin_model: Optional[MarginModel] = None):
         self.events_queue = events_queue
         self.data_handler = data_handler
         self.symbol_list = symbol_list
         self.initial_capital = initial_capital
+        # ``leverage`` is an informational echo once a ``margin_model`` is
+        # supplied — the model is authoritative for all margin math. When no
+        # model is passed, build the default universal-rate model from
+        # ``leverage`` and ``maintenance_margin_rate`` (mm_rate=0 reproduces
+        # the legacy "liquidate at account_balance < 0" behaviour exactly).
         self.leverage = leverage
+        self.margin_model: MarginModel = (
+            margin_model
+            if margin_model is not None
+            else PortfolioMarginModel.from_leverage(
+                leverage, maintenance_margin_rate=maintenance_margin_rate,
+            )
+        )
 
         # Account state
         self.cash: float = initial_capital
@@ -130,8 +161,8 @@ class BacktestPortfolio(Portfolio):
         self._latest_prices[event.symbol] = event.close
 
         # Update margin requirements for this symbol at current price
-        self.margin_requirements[event.symbol] = (
-            abs(self.positions[event.symbol] * event.close) / self.leverage
+        self.margin_requirements[event.symbol] = self.margin_model.initial_margin(
+            event.symbol, self.positions[event.symbol], event.close,
         )
 
         self._refresh_snapshot()
@@ -161,6 +192,7 @@ class BacktestPortfolio(Portfolio):
             'simple_return': simple_return,
             'log_return': log_return,
             'position_margin': self._position_margin(),
+            'maintenance_margin': self._maintenance_margin(),
             'available_balance': self.available_balance,
             'total_commission': self.total_commission,
         })
@@ -250,9 +282,12 @@ class BacktestPortfolio(Portfolio):
             return None
         ref_price = price if price is not None else self.get_price(symbol)
         # Negative prices are tolerated (e.g. WTI 2020 settled at -$37);
-        # downstream margin formulas use ``abs(price)``. Only exact zero is
-        # rejected — it would divide-by-zero in the margin-scaling path.
-        if ref_price is None or pd.isna(ref_price) or ref_price == 0:
+        # downstream margin formulas use ``abs(price)``. Exact zero is also
+        # tolerated now: the ``MarginModel`` owns the only divide-by-price and
+        # returns ``inf`` (no position bound) at price 0, since a zero-priced
+        # position locks no margin. Only None / NaN (no usable reference price)
+        # are rejected.
+        if ref_price is None or pd.isna(ref_price):
             return None
         return ref_price
 
@@ -283,7 +318,9 @@ class BacktestPortfolio(Portfolio):
         self.avg_cost[symbol] = new_avg_cost
         self.cash += realized - event.commission
         self.positions[symbol] = new_pos
-        self.margin_requirements[symbol] = abs(new_pos * fill_price) / self.leverage
+        self.margin_requirements[symbol] = self.margin_model.initial_margin(
+            symbol, new_pos, fill_price,
+        )
         self.realized_pnl[symbol] += realized
         self.total_commission += event.commission
 
@@ -405,10 +442,10 @@ class BacktestPortfolio(Portfolio):
         ``max(abs(new_pos), qty)`` clause for LMT has been removed.
         """
         realized_margin = self.margin_requirements.get(symbol, 0.0)
-        projected_margin_now = abs(pos * price) / self.leverage
+        projected_margin_now = self.margin_model.initial_margin(symbol, pos, price)
         baseline = max(realized_margin, projected_margin_now)
 
-        new_margin_raw = self._calculate_new_margin(pos, qty, direction, price)
+        new_margin_raw = self._calculate_new_margin(symbol, pos, qty, direction, price)
         delta = max(realized_margin, new_margin_raw) - baseline
 
         if delta <= 0:
@@ -421,10 +458,14 @@ class BacktestPortfolio(Portfolio):
             return qty
 
         # Scale down so the new symbol margin tops out at baseline + available.
-        # ``abs(price)`` so this stays correct for negative-priced instruments
-        # (e.g. WTI 2020); margin is a magnitude, position-bound is a magnitude.
+        # The model owns the divide-by-price (and its price==0 edge: it returns
+        # ``inf``, i.e. no position bound — a zero-priced position locks no
+        # margin). ``max_abs_position`` is a magnitude, correct for
+        # negative-priced instruments (e.g. WTI 2020).
         max_new_margin = max(0.0, baseline + available)
-        max_abs_new_pos = max_new_margin * self.leverage / abs(price)
+        max_abs_new_pos = self.margin_model.max_abs_position(
+            symbol, max_new_margin, price,
+        )
         if direction == Direction.BUY:
             max_qty = max_abs_new_pos - pos
         elif direction == Direction.SELL:
@@ -471,10 +512,11 @@ class BacktestPortfolio(Portfolio):
         order's risk-reducing/increasing split is measured against the
         running projected position that includes earlier pending orders.
 
-        Per-order reservation = ``risk_increasing_qty * abs(price) / leverage``,
-        where ``risk_increasing_qty = qty - min(qty, max(0, -dir_sign * running_pos))``.
-        ``abs(price)`` keeps the reservation a magnitude for negative-priced
-        instruments (e.g. WTI 2020).
+        Per-order reservation = ``margin_model.initial_margin(symbol,
+        risk_increasing_qty, price)``, where ``risk_increasing_qty = qty -
+        min(qty, max(0, -dir_sign * running_pos))``. The model's ``abs`` keeps
+        the reservation a magnitude for negative-priced instruments (e.g. WTI
+        2020).
         Risk-reducing pending orders contribute zero. Same formula for
         MKT (priced at current safe price) and LMT (priced at the limit).
         Pending orders for which no safe price is available contribute
@@ -499,20 +541,47 @@ class BacktestPortfolio(Portfolio):
             reducing_capacity = max(0.0, -dir_sign * pos)
             reducing = min(order.quantity, reducing_capacity)
             increasing = order.quantity - reducing
-            reserved += increasing * abs(price) / self.leverage
+            reserved += self.margin_model.initial_margin(
+                order.symbol, increasing, price,
+            )
             running_pos[order.symbol] = pos + dir_sign * order.quantity
         return reserved
 
     def _position_margin(self) -> float:
-        """Total margin locked by realized open positions across all symbols."""
+        """Total initial margin locked by realized open positions across all symbols."""
         return sum(self.margin_requirements.values())
+
+    def _maintenance_margin(self) -> float:
+        """
+        Total maintenance margin across all open positions at current prices —
+        the equity floor below which ``check_solvency`` triggers a margin call.
+
+        Mirrors ``_position_margin`` but consults the model's
+        ``maintenance_margin`` and reads the current mark per symbol; symbols
+        with no available price are skipped (their margin is unknown this tick).
+        With the default ``maintenance_margin_rate=0`` this returns 0.0, so the
+        liquidation trigger collapses to the legacy ``account_balance < 0``.
+        """
+        total = 0.0
+        for sym, qty in self.positions.items():
+            if qty == 0:
+                continue
+            price = self.get_price(sym)
+            if price is None:
+                continue
+            total += self.margin_model.maintenance_margin(sym, qty, price)
+        return total
 
     # ── Solvency enforcement ──────────────────
 
     def check_solvency(self, timestamp: Any) -> None:
         """
-        Enforce solvency. Trigger: ``account_balance < 0`` (cash + unrealized
-        PnL has gone negative; the account is blown up). When triggered:
+        Enforce the maintenance-margin call. Trigger:
+        ``account_balance < total maintenance margin`` (the equity backing the
+        positions has fallen below the exchange's maintenance floor). With the
+        default ``maintenance_margin_rate=0`` the floor is 0, so this is exactly
+        the legacy ``account_balance < 0`` (total wipeout); a positive rate
+        fires the realistic earlier margin call. When triggered:
           1. Cancel every pending non-liquidation order FIFO (stop new exposure).
           2. Submit MKT liquidation orders to fully close every open position
              in ascending ``unrealized_pnl`` order (worst first). Liquidation
@@ -520,8 +589,8 @@ class BacktestPortfolio(Portfolio):
              cancel pass will not cancel them, and a duplicate-submission
              guard prevents re-queuing on a symbol that already has a
              pending liquidation.
-          3. Log an ``[INSOLVENT]`` warning with the timestamp and account
-             balance.
+          3. Log a ``[MARGIN CALL]`` warning with the account balance and the
+             maintenance-margin floor it breached.
 
         Liquidation at mark price does not recover ``account_balance`` (it
         only converts unrealized loss into realized loss), so the loop's
@@ -529,13 +598,14 @@ class BacktestPortfolio(Portfolio):
         Called from ``update_bar`` and ``update_fill``.
         """
         self._refresh_snapshot()
-        if self.account_balance >= 0:
+        maintenance_margin = self._maintenance_margin()
+        if self.account_balance >= maintenance_margin:
             return
 
         logger.warning(
-            "[INSOLVENT] account_balance=%.2f | cancelling pending and "
-            "liquidating all positions",
-            self.account_balance,
+            "[MARGIN CALL] account_balance=%.2f < maintenance_margin=%.2f | "
+            "cancelling pending and liquidating all positions",
+            self.account_balance, maintenance_margin,
         )
         self._cancel_pending_non_liquidation()
         self._liquidate_all_positions(timestamp)
@@ -612,8 +682,8 @@ class BacktestPortfolio(Portfolio):
         else:
             raise ValueError(f"Unexpected direction: {direction!r}")
 
-    def _calculate_new_margin(self, pos: float, qty: float, direction: Direction,
-                              price: float) -> float:
+    def _calculate_new_margin(self, symbol: str, pos: float, qty: float,
+                              direction: Direction, price: float) -> float:
         """
         Projected margin requirement after applying an order to baseline ``pos``.
 
@@ -621,10 +691,11 @@ class BacktestPortfolio(Portfolio):
         ``self.positions[symbol]`` or the projected-through-pending position
         via ``self._projected_position(symbol, ...)``) depending on use case.
 
-        Uniform formula for MKT and LMT: ``abs(new_pos) * price / leverage``.
+        Uniform formula for MKT and LMT: the model's initial margin on the
+        projected position.
         """
         new_pos = pos + self._dir_sign(direction) * qty
-        return abs(new_pos * price) / self.leverage
+        return self.margin_model.initial_margin(symbol, new_pos, price)
 
     def _calculate_unrealized_pnl(self) -> None:
         """Recalculate per-symbol unrealized P&L from current prices."""
@@ -673,8 +744,9 @@ class BacktestPortfolio(Portfolio):
         timestamp. Empty DataFrame if no bars have been processed yet.
 
         Account-level columns (``cash``, ``account_balance``, ``simple_return``,
-        ``log_return``, ``position_margin``, ``available_balance``,
-        ``total_commission``) are recorded once per BarEvent. The per-symbol
+        ``log_return``, ``position_margin``, ``maintenance_margin``,
+        ``available_balance``, ``total_commission``) are recorded once per
+        BarEvent. The per-symbol
         dict columns (``positions``, ``unrealized_pnl``, ``realized_pnl``,
         ``margin_requirements``) are re-attached from the per-timestamp
         snapshot (one per timestamp, last-event-wins): every event row of a

@@ -26,7 +26,9 @@ class BacktestConfig:
 
     # --- Portfolio ---
     initial_capital: float = 100_000.0
-    leverage: float = 1.0
+    leverage: float = 1.0                # universal initial-margin rate = 1/leverage (portfolio_margin mode)
+    maintenance_margin_rate: float = 0.0  # liquidation floor as a fraction of notional; 0.0 = legacy "liquidate at account_balance < 0"; must be <= 1/leverage
+    margin_mode: str = 'portfolio_margin'  # 'portfolio_margin' (one universal leverage) or 'single_margin' (per-symbol margin — scaffold/future)
 
     # --- Risk / Sizing ---
     # Carver vol-targeting knobs consumed by `VolTargetingRiskManager`.
@@ -100,6 +102,25 @@ class BacktestConfig:
             raise ValueError(
                 f"Unknown size_mode: '{self.size_mode}'. "
                 "Must be 'fixed_notional', 'fixed_quantity', or 'fixed_equity_pct'."
+            )
+        # Margin model. ``leverage`` sets the universal initial-margin rate
+        # (1/leverage); ``maintenance_margin_rate`` is the lower liquidation
+        # floor (default 0.0 = legacy "liquidate at account_balance < 0").
+        # NaN-rejecting ``not (...)`` forms mirror the risk-manager validation.
+        if not (self.leverage > 0):
+            raise ValueError(f"leverage must be > 0, got {self.leverage}")
+        if self.margin_mode not in ('portfolio_margin', 'single_margin'):
+            raise ValueError(
+                f"Unknown margin_mode: {self.margin_mode!r}. "
+                "Must be 'portfolio_margin' (one universal leverage) or "
+                "'single_margin' (per-symbol margin — scaffold/future)."
+            )
+        if not (0.0 <= self.maintenance_margin_rate <= 1.0 / self.leverage):
+            raise ValueError(
+                f"maintenance_margin_rate must be in [0, 1/leverage="
+                f"{1.0 / self.leverage}], got {self.maintenance_margin_rate}. "
+                "(It is the maintenance-margin floor as a fraction of notional; "
+                "it cannot exceed the initial-margin rate.)"
             )
         if self.days_convention not in ('calendar', 'business'):
             raise ValueError(
