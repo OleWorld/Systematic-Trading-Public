@@ -3,12 +3,12 @@
 Submodules (internal):
     _base      Portfolio ABC + structural-typing Protocols
     _backtest  BacktestPortfolio (cross-margin futures accounting + simulated margin checks)
-    _margin    MarginModel ABC + PortfolioMarginModel (default) + SingleMarginModel (stub)
+    _margin    MarginModel ABC + PortfolioMarginModel (default, point-value aware)
     _live      LivePortfolio (stub)
 """
 
 from portfolio._base import Portfolio
-from portfolio._margin import MarginModel, PortfolioMarginModel, SingleMarginModel
+from portfolio._margin import MarginModel, PortfolioMarginModel
 from portfolio._backtest import BacktestPortfolio
 from portfolio._live import LivePortfolio
 
@@ -17,6 +17,5 @@ __all__ = [
     "BacktestPortfolio",
     "MarginModel",
     "PortfolioMarginModel",
-    "SingleMarginModel",
     "LivePortfolio",
 ]

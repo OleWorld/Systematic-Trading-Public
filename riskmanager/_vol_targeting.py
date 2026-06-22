@@ -130,10 +130,13 @@ position matches the target.
 
 import datetime
 import logging
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:  # avoid a config<->riskmanager import cycle at module load
+    from config import InstrumentConfig
 
 from analytics import (
     correlation_matrix, diversification_multiplier, equal_weight,
@@ -214,6 +217,7 @@ class VolTargetingRiskManager(RiskManager):
         strategy: _StrategyLike,
         vol_estimator: VolEstimator,
         data_handler: _DataHandlerLike,
+        instruments: Optional[Dict[str, "InstrumentConfig"]] = None,
         idm: float = 1.0,
         idm_cap: Optional[float] = 2.5,
         annual_target_vol: Optional[float] = None,
@@ -247,6 +251,16 @@ class VolTargetingRiskManager(RiskManager):
             ``mode`` (``'min_variance'`` / ``'risk_parity'``) and
             ``corr_matrix=None``. ``corr_timeframe`` must be a key of
             ``data_handler.timeframes``.
+        instruments
+            Per-symbol ``InstrumentConfig`` registry
+            (``Dict[str, InstrumentConfig]``). Two fields are read during
+            sizing: ``point_value`` (the sizing divisor — ``target_qty =
+            annual_cash_target / (point_value * sigma)``) and ``fractional``
+            (whole-lot rounding of the target for futures). Default ``None``
+            builds a uniform ``point_value=1`` / ``fractional=True`` registry
+            over ``strategy.symbol_list`` — the identity reproducing the
+            simplified crypto sizing. Pass the SAME registry handed to the
+            portfolio and execution handler for a futures book.
         idm
             Instrument diversification multiplier (Carver Ch. 8).
             Default ``1.0``. Must be ``> 0``. Auto-updated whenever a
@@ -466,6 +480,15 @@ class VolTargetingRiskManager(RiskManager):
         super().__init__(portfolio, strategy)
         self.vol_estimator = vol_estimator
         self.data_handler = data_handler
+        # Per-symbol point_value (sizing divisor) and fractional flag (whole-lot
+        # rounding). Defaults to a uniform pv=1 / fractional=True registry over
+        # the strategy's universe — the identity that reproduces the simplified
+        # crypto sizing. Pass the SAME registry given to the portfolio/execution
+        # for futures (point_value != 1, fractional=False).
+        if instruments is None:
+            from config import uniform_registry  # lazy: avoid import cycle
+            instruments = uniform_registry(list(strategy.symbol_list))
+        self.instruments = instruments
         self.idm = idm
         self.idm_cap = idm_cap
         # Narrowed to float by the None-rejection above.
@@ -942,6 +965,14 @@ class VolTargetingRiskManager(RiskManager):
             return
 
         target_qty = row['target_qty']
+        # Whole-lot rounding for non-fractional instruments (futures), Carver
+        # §10.7: round the continuous target to the nearest contract BEFORE the
+        # diff and dead-band so the buffer and the traded size agree. A target
+        # that rounds to 0 holds flat (one contract exceeds the vol budget); a
+        # held position whose target rounds to 0 is flattened via the diff.
+        if not self.instruments[symbol].fractional:
+            target_qty = float(round(target_qty))
+            row['target_qty'] = target_qty
         trade_qty = target_qty - current_qty
         buffer_threshold = self.position_buffer * abs(target_qty)
         row['trade_qty'] = trade_qty
@@ -1064,7 +1095,11 @@ class VolTargetingRiskManager(RiskManager):
                 f"Unexpected vol_target_mode: {self.vol_target_mode!r}"
             )
         out['annual_cash_target'] = annual_cash_target
-        out['target_qty'] = annual_cash_target / sigma
+        # Divide by the per-contract dollar vol: point_value * sigma. sigma is
+        # an annualized price-change stdev (price space); the contract
+        # multiplier converts it to dollars of vol per contract.
+        pv = self.instruments[symbol].point_value
+        out['target_qty'] = annual_cash_target / (pv * sigma)
         return out
 
     def _record_row(self, symbol: str, row: Dict[str, Any]) -> None:

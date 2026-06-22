@@ -9,11 +9,13 @@ class BacktestConfig:
     """
     Validated parameter holder for a backtest run.
 
-    Centralizes the infrastructure parameters (data window, portfolio
-    sizing, vol-target knobs, slippage / commission, fill timing) and
-    validates them at construction. Callers read the fields off this
-    object as they wire each module manually (see
-    ``backtests/test_ewmac.py`` for a worked example).
+    Centralizes the *run-level* infrastructure parameters (data window,
+    capital, vol-target knobs, fill timing) and validates them at
+    construction. **Per-symbol economics** (point_value, fractional,
+    slippage, commission, margin/leverage) live in ``InstrumentConfig``
+    (``config/_instrument.py``), supplied as a registry to the portfolio,
+    execution, and risk manager. Callers read the fields off this object as
+    they wire each module manually (see ``backtests/test_ewmac.py``).
     """
 
     # --- Data ---
@@ -25,10 +27,11 @@ class BacktestConfig:
     timeframes: Dict[str, int] = field(default_factory=dict)    # {tf: maxlen} e.g. {'1m': 500, '1h': 500, '4h': 200}
 
     # --- Portfolio ---
+    # NOTE: per-symbol economics (point_value, fractional, slippage,
+    # commission, margin/leverage) live in InstrumentConfig
+    # (config/_instrument.py), supplied as a registry to the portfolio,
+    # execution, and risk manager — NOT here.
     initial_capital: float = 100_000.0
-    leverage: float = 1.0                # universal initial-margin rate = 1/leverage (portfolio_margin mode)
-    maintenance_margin_rate: float = 0.0  # liquidation floor as a fraction of notional; 0.0 = legacy "liquidate at account_balance < 0"; must be <= 1/leverage
-    margin_mode: str = 'portfolio_margin'  # 'portfolio_margin' (one universal leverage) or 'single_margin' (per-symbol margin — scaffold/future)
 
     # --- Risk / Sizing ---
     # Carver vol-targeting knobs consumed by `VolTargetingRiskManager`.
@@ -53,10 +56,8 @@ class BacktestConfig:
     position_size: float = 10_000.0
 
     # --- Execution ---
-    slippage_mode: str = 'absolute'     # 'absolute' ($ per unit — futures default) or 'pct' (% of price)
-    slippage_value: float = 0.0
-    commission_mode: str = 'per_contract'  # 'per_contract' ($ per contract — futures default) or 'rate' (fraction of notional)
-    commission_value: float = 0.0
+    # NOTE: slippage / commission are per-symbol (InstrumentConfig). Only the
+    # run-level fill-timing model lives here.
     fill_on: str = 'signal_close'       # 'signal_close' or 'next_open'
 
     def __post_init__(self):
@@ -83,16 +84,6 @@ class BacktestConfig:
                     f"base_timeframe '{self.base_timeframe}'."
                 )
 
-        if self.slippage_mode not in ('pct', 'absolute'):
-            raise ValueError(
-                f"Unknown slippage_mode: '{self.slippage_mode}'. "
-                "Must be 'pct' or 'absolute'."
-            )
-        if self.commission_mode not in ('rate', 'per_contract'):
-            raise ValueError(
-                f"Unknown commission_mode: '{self.commission_mode}'. "
-                "Must be 'rate' or 'per_contract'."
-            )
         if self.fill_on not in ('signal_close', 'next_open'):
             raise ValueError(
                 f"Unknown fill_on: '{self.fill_on}'. "
@@ -102,25 +93,6 @@ class BacktestConfig:
             raise ValueError(
                 f"Unknown size_mode: '{self.size_mode}'. "
                 "Must be 'fixed_notional', 'fixed_quantity', or 'fixed_equity_pct'."
-            )
-        # Margin model. ``leverage`` sets the universal initial-margin rate
-        # (1/leverage); ``maintenance_margin_rate`` is the lower liquidation
-        # floor (default 0.0 = legacy "liquidate at account_balance < 0").
-        # NaN-rejecting ``not (...)`` forms mirror the risk-manager validation.
-        if not (self.leverage > 0):
-            raise ValueError(f"leverage must be > 0, got {self.leverage}")
-        if self.margin_mode not in ('portfolio_margin', 'single_margin'):
-            raise ValueError(
-                f"Unknown margin_mode: {self.margin_mode!r}. "
-                "Must be 'portfolio_margin' (one universal leverage) or "
-                "'single_margin' (per-symbol margin — scaffold/future)."
-            )
-        if not (0.0 <= self.maintenance_margin_rate <= 1.0 / self.leverage):
-            raise ValueError(
-                f"maintenance_margin_rate must be in [0, 1/leverage="
-                f"{1.0 / self.leverage}], got {self.maintenance_margin_rate}. "
-                "(It is the maintenance-margin floor as a fraction of notional; "
-                "it cannot exceed the initial-margin rate.)"
             )
         if self.days_convention not in ('calendar', 'business'):
             raise ValueError(

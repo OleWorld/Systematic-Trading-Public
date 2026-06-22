@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import pytest
 
+from config import uniform_registry
 from data._bar import Bar
 from event import (
     BarEvent,
@@ -25,7 +26,7 @@ from event import (
     OrderEvent,
     OrderType,
 )
-from portfolio import BacktestPortfolio, Portfolio
+from portfolio import BacktestPortfolio, Portfolio, PortfolioMarginModel
 
 
 # ──────────────────────────────────────────────
@@ -72,19 +73,32 @@ def _new_portfolio(
     capital: float = 100_000.0,
     leverage: float = 1.0,
     maintenance_margin_rate: float = 0.0,
+    point_value: float = 1.0,
+    fractional: bool = True,
     prices: Optional[Dict[str, float]] = None,
     frames: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> Tuple[BacktestPortfolio, FakeQueue, FakeDataHandler]:
-    """Build a BacktestPortfolio with fake queue / data handler. Seeds latest prices if given."""
+    """Build a BacktestPortfolio with fake queue / data handler. Seeds latest prices if given.
+
+    ``leverage`` / ``maintenance_margin_rate`` build the per-symbol
+    ``PortfolioMarginModel``; ``point_value`` / ``fractional`` flow through the
+    uniform ``InstrumentConfig`` registry.
+    """
     q = FakeQueue()
     dh = FakeDataHandler(frames=frames)
+    margin = PortfolioMarginModel.from_leverage(
+        leverage, maintenance_margin_rate=maintenance_margin_rate,
+    )
+    instruments = uniform_registry(
+        list(symbols), point_value=point_value, fractional=fractional,
+        margin=margin,
+    )
     pf = BacktestPortfolio(
         events_queue=q,
         data_handler=dh,
         symbol_list=list(symbols),
+        instruments=instruments,
         initial_capital=capital,
-        leverage=leverage,
-        maintenance_margin_rate=maintenance_margin_rate,
     )
     if prices:
         for sym, px in prices.items():
@@ -165,11 +179,96 @@ def test_init_seeds_cash_and_zero_positions():
     assert pf.pending_orders == {}
 
 
-def test_init_stores_leverage_and_symbol_list():
+def test_init_stores_instruments_and_symbol_list():
     pf, _, _ = _new_portfolio(symbols=('BTC', 'ETH'), capital=1.0, leverage=5.0)
-    assert pf.leverage == 5.0
     assert pf.symbol_list == ['BTC', 'ETH']
     assert pf.initial_capital == 1.0
+    assert set(pf.instruments) == {'BTC', 'ETH'}
+
+
+def test_init_rejects_symbol_missing_from_registry():
+    """Every traded symbol must have an InstrumentConfig."""
+    q = FakeQueue()
+    dh = FakeDataHandler()
+    instruments = uniform_registry(['BTC'])  # ETH absent
+    with pytest.raises(ValueError, match="missing config"):
+        BacktestPortfolio(
+            events_queue=q, data_handler=dh,
+            symbol_list=['BTC', 'ETH'], instruments=instruments,
+        )
+
+
+# ──────────────────────────────────────────────
+# point_value (contract multiplier) money path
+# ──────────────────────────────────────────────
+
+def test_unrealized_pnl_scales_by_point_value():
+    """A $1 move with point_value=1000 yields $1000 PnL per contract."""
+    pf, _, _ = _new_portfolio(capital=1_000_000.0, leverage=1.0, point_value=1000.0)
+    pf.update_fill(_fill(qty=2.0, direction=Direction.BUY, fill_price=50.0))
+    pf.update_bar(_bar(close=51.0))  # $1 move up
+    assert math.isclose(pf.unrealized_pnl['BTC'], 2.0 * 1000.0 * 1.0)
+
+
+def test_realized_pnl_scales_by_point_value():
+    pf, _, _ = _new_portfolio(capital=1_000_000.0, leverage=1.0, point_value=1000.0)
+    pf.update_fill(_fill(qty=1.0, direction=Direction.BUY, fill_price=50.0))
+    pf.update_fill(_fill(qty=1.0, direction=Direction.SELL, fill_price=51.0))
+    # realized = 1 * 1000 * (51 - 50) = 1000, booked into cash and realized_pnl.
+    assert math.isclose(pf.realized_pnl['BTC'], 1000.0)
+    assert math.isclose(pf.cash, 1_000_000.0 + 1000.0)
+    assert math.isclose(pf.trade_log[-1]['realized_pnl'], 1000.0)
+
+
+def test_margin_requirement_scales_by_point_value():
+    pf, _, _ = _new_portfolio(capital=1_000_000.0, leverage=10.0, point_value=1000.0,
+                              prices={'BTC': 50.0})
+    pf.update_fill(_fill(qty=2.0, direction=Direction.BUY, fill_price=50.0))
+    # margin = |2 * 1000 * 50| / 10 = 10_000
+    assert math.isclose(pf.margin_requirements['BTC'], 10_000.0)
+
+
+def test_reserved_margin_scales_by_point_value():
+    pf, _, _ = _new_portfolio(capital=1_000_000.0, leverage=10.0, point_value=1000.0,
+                              prices={'BTC': 50.0})
+    order = pf.submit_order('BTC', quantity=2.0, direction=Direction.BUY,
+                            timestamp=DEFAULT_TS, order_type=OrderType.MKT)
+    assert order is not None and math.isclose(order.quantity, 2.0)
+    # reserved = |2 * 1000 * 50| / 10 = 10_000
+    assert math.isclose(pf._reserved_margin(), 10_000.0)
+
+
+# ──────────────────────────────────────────────
+# fractional flag — whole-lot enforcement at submission
+# ──────────────────────────────────────────────
+
+def test_non_fractional_truncates_order_quantity_toward_zero():
+    pf, q, _ = _new_portfolio(capital=1_000_000.0, leverage=1.0, fractional=False,
+                              prices={'BTC': 100.0})
+    order = pf.submit_order('BTC', quantity=3.7, direction=Direction.BUY,
+                            timestamp=DEFAULT_TS, order_type=OrderType.MKT)
+    assert order is not None
+    assert order.quantity == 3.0  # truncated toward zero
+    assert q.items[0] is order
+
+
+def test_non_fractional_sub_one_lot_order_rejected():
+    pf, q, _ = _new_portfolio(capital=1_000_000.0, leverage=1.0, fractional=False,
+                              prices={'BTC': 100.0})
+    result = pf.submit_order('BTC', quantity=0.4, direction=Direction.BUY,
+                             timestamp=DEFAULT_TS, order_type=OrderType.MKT)
+    assert result is None  # 0.4 floors to 0 → can't trade a partial contract
+    assert q.items == []
+    assert pf.pending_orders == {}
+
+
+def test_fractional_instrument_keeps_fractional_quantity():
+    pf, q, _ = _new_portfolio(capital=1_000_000.0, leverage=1.0, fractional=True,
+                              prices={'BTC': 100.0})
+    order = pf.submit_order('BTC', quantity=3.7, direction=Direction.BUY,
+                            timestamp=DEFAULT_TS, order_type=OrderType.MKT)
+    assert order is not None
+    assert math.isclose(order.quantity, 3.7)  # crypto: fractional preserved
 
 
 # ──────────────────────────────────────────────

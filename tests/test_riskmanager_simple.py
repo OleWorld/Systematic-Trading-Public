@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
+from config import uniform_registry
 from event import BarEvent, OrderType, Direction
 from riskmanager import RiskManager, SimpleRiskManager
 
@@ -95,12 +96,18 @@ def _make(
     positions: Optional[Dict[str, float]] = None,
     size_mode: str = 'fixed_notional',
     position_size: float = 10_000.0,
+    point_value: float = 1.0,
+    fractional: bool = True,
 ):
     pf = FakePortfolio(price=price, balance=balance,
                        positions=positions if positions is not None else {'BTC': 0.0})
     strat = FakeStrategy({'BTC': forecast}, symbol_list=['BTC'])
+    instruments = uniform_registry(
+        list(strat.symbol_list), point_value=point_value, fractional=fractional,
+    )
     rm = SimpleRiskManager(portfolio=pf, strategy=strat,
-                           size_mode=size_mode, position_size=position_size)
+                           size_mode=size_mode, position_size=position_size,
+                           instruments=instruments)
     return pf, strat, rm
 
 
@@ -264,6 +271,34 @@ def test_size_mode_fixed_equity_pct():
     rm.update_bar(_bar())
     # equity * pct / price = 500_000 * 0.10 / 100 = 500
     assert math.isclose(pf.submitted[0]['quantity'], 500.0)
+
+
+# ──────────────────────────────────────────────
+# point_value / fractional (contract sizing)
+# ──────────────────────────────────────────────
+
+def test_fixed_notional_divides_by_point_value():
+    # qty = position_size / (point_value * price) = 10_000 / (10 * 100) = 10
+    pf, _, rm = _make(size_mode='fixed_notional', position_size=10_000.0,
+                      price=100.0, point_value=10.0)
+    rm.update_bar(_bar())
+    assert math.isclose(pf.submitted[0]['quantity'], 10.0)
+
+
+def test_fixed_quantity_ignores_point_value():
+    # fixed_quantity is already in contracts; the multiplier must not change it.
+    pf, _, rm = _make(size_mode='fixed_quantity', position_size=7.0,
+                      point_value=1000.0)
+    rm.update_bar(_bar())
+    assert math.isclose(pf.submitted[0]['quantity'], 7.0)
+
+
+def test_non_fractional_rounds_target_to_whole_lot():
+    # 10_000 / (1 * 300) = 33.33… → round → 33 contracts.
+    pf, _, rm = _make(size_mode='fixed_notional', position_size=10_000.0,
+                      price=300.0, fractional=False)
+    rm.update_bar(_bar())
+    assert math.isclose(pf.submitted[0]['quantity'], 33.0)
 
 
 # ──────────────────────────────────────────────

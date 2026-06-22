@@ -9,51 +9,55 @@ The portfolio consults a ``MarginModel`` everywhere it needs a margin number:
 - **max_abs_position** — the inverse (largest position a margin budget can
   carry) used when an order must be scaled down.
 
-Concentrating all three in one object keeps the divide-by-price arithmetic —
-and its ``price == 0`` edge — in a single place, so the portfolio never has to
-special-case a zero reference price.
+All three take the instrument's contract multiplier (``point_value``), so
+margin is computed on the **true dollar notional** ``abs(qty * point_value *
+price)``. Concentrating that arithmetic — and its ``price == 0`` edge — in one
+place keeps the portfolio from ever special-casing a zero reference price.
 
-Two concrete models (this is a *pure* margin-formula axis — both stay
-cross-margin; pooling/liquidation behaviour is unchanged):
+Per-symbol margin is now expressed by giving each instrument its own model
+instance in the ``InstrumentConfig`` registry (``config/_instrument.py``);
+there is no longer a single model holding per-symbol dicts. The methods are
+therefore symbol-agnostic — they take only ``(quantity, price, point_value)``.
 
-- ``PortfolioMarginModel`` — one universal leverage/rate across every symbol
-  (the default; reproduces the old ``abs(qty*price) / leverage`` math exactly).
-- ``SingleMarginModel`` — per-symbol margin requirements (different margin per
-  symbol). Scaffold/stub for now; methods raise ``NotImplementedError``.
+``PortfolioMarginModel`` is the only concrete model: one universal
+leverage/rate (the default; reproduces the old ``abs(qty*price) / leverage``
+math exactly at ``point_value=1``). A per-contract *dollar* margin model
+remains future work.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Dict
+from dataclasses import dataclass
 
 
 class MarginModel(ABC):
     """
     Abstract margin model consumed by ``BacktestPortfolio``.
 
-    All three methods take ``symbol`` so a per-symbol model
-    (``SingleMarginModel``) fits the same interface as the universal-rate
-    default; the universal model simply ignores it.
+    Symbol-agnostic: per-symbol margin is achieved by assigning a distinct
+    model to each instrument's ``InstrumentConfig``. Each method takes the
+    instrument's ``point_value`` (contract multiplier) so margin is computed
+    on ``abs(quantity * point_value * price)``.
     """
 
     @abstractmethod
-    def initial_margin(self, symbol: str, quantity: float, price: float) -> float:
-        """Margin required to hold ``quantity`` of ``symbol`` at ``price`` (>= 0)."""
+    def initial_margin(self, quantity: float, price: float,
+                       point_value: float = 1.0) -> float:
+        """Margin required to hold ``quantity`` at ``price`` (>= 0)."""
         raise NotImplementedError
 
     @abstractmethod
-    def maintenance_margin(self, symbol: str, quantity: float, price: float) -> float:
-        """Maintenance-margin floor for ``quantity`` of ``symbol`` at ``price`` (>= 0)."""
+    def maintenance_margin(self, quantity: float, price: float,
+                           point_value: float = 1.0) -> float:
+        """Maintenance-margin floor for ``quantity`` at ``price`` (>= 0)."""
         raise NotImplementedError
 
     @abstractmethod
-    def max_abs_position(self, symbol: str, margin_budget: float,
-                         price: float) -> float:
+    def max_abs_position(self, margin_budget: float, price: float,
+                         point_value: float = 1.0) -> float:
         """
-        Largest ``abs(position)`` of ``symbol`` whose initial margin fits
-        ``margin_budget`` at ``price``. Returns ``inf`` when ``price == 0``
-        (a zero-priced position locks no margin), so callers never divide by
-        zero.
+        Largest ``abs(position)`` whose initial margin fits ``margin_budget``
+        at ``price``. Returns ``inf`` when ``price == 0`` (a zero-priced
+        position locks no margin), so callers never divide by zero.
         """
         raise NotImplementedError
 
@@ -62,16 +66,17 @@ class MarginModel(ABC):
 class PortfolioMarginModel(MarginModel):
     """
     Universal-leverage cross-margin model: one ``initial_margin_rate`` and one
-    ``maintenance_margin_rate`` applied to every symbol's notional.
+    ``maintenance_margin_rate`` applied to every position's notional.
 
     This is *not* SPAN/TIMS-style risk-netting "portfolio margin" — the name
-    follows the project's ``margin_mode='portfolio_margin'`` convention,
-    meaning a single account-wide leverage rather than per-symbol margins.
+    follows the project's convention, meaning a single account-wide leverage
+    rather than per-symbol margins.
 
-    Margin = ``abs(quantity * price) * rate``. With
-    ``initial_margin_rate = 1 / leverage`` this reproduces the legacy
-    ``abs(quantity * price) / leverage`` formula exactly. ``abs`` keeps margin
-    a positive magnitude for negative-priced instruments (e.g. WTI 2020).
+    Margin = ``abs(quantity * point_value * price) * rate``. With
+    ``initial_margin_rate = 1 / leverage`` and ``point_value = 1`` this
+    reproduces the legacy ``abs(quantity * price) / leverage`` formula exactly.
+    ``abs`` keeps margin a positive magnitude for negative-priced instruments
+    (e.g. WTI 2020).
 
     ``maintenance_margin_rate`` defaults to ``0.0``, which reproduces the
     legacy "liquidate only when account_balance < 0" behaviour (total
@@ -112,47 +117,16 @@ class PortfolioMarginModel(MarginModel):
         return cls(initial_margin_rate=1.0 / leverage,
                    maintenance_margin_rate=maintenance_margin_rate)
 
-    def initial_margin(self, symbol: str, quantity: float, price: float) -> float:
-        return abs(quantity * price) * self.initial_margin_rate
+    def initial_margin(self, quantity: float, price: float,
+                       point_value: float = 1.0) -> float:
+        return abs(quantity * point_value * price) * self.initial_margin_rate
 
-    def maintenance_margin(self, symbol: str, quantity: float, price: float) -> float:
-        return abs(quantity * price) * self.maintenance_margin_rate
+    def maintenance_margin(self, quantity: float, price: float,
+                           point_value: float = 1.0) -> float:
+        return abs(quantity * point_value * price) * self.maintenance_margin_rate
 
-    def max_abs_position(self, symbol: str, margin_budget: float,
-                         price: float) -> float:
+    def max_abs_position(self, margin_budget: float, price: float,
+                         point_value: float = 1.0) -> float:
         if price == 0:
             return float('inf')
-        return margin_budget / (abs(price) * self.initial_margin_rate)
-
-
-@dataclass
-class SingleMarginModel(MarginModel):
-    """
-    Per-symbol margin model (``margin_mode='single_margin'``): different margin
-    requirements for different symbols.
-
-    SCAFFOLD / STUB — not yet wired. The intended shape carries per-symbol
-    rates, e.g. ``initial_margin_rates[symbol]`` / ``maintenance_margin_rates[symbol]``
-    (or per-contract dollar margins), so each instrument can be margined on its
-    own leverage. Mirrors the ``portfolio/_live.py`` placeholder convention:
-    defined for the extension point, methods raise until implemented.
-    """
-
-    initial_margin_rates: Dict[str, float] = field(default_factory=dict)
-    maintenance_margin_rates: Dict[str, float] = field(default_factory=dict)
-
-    def initial_margin(self, symbol: str, quantity: float, price: float) -> float:
-        raise NotImplementedError(
-            "SingleMarginModel is not yet wired — future work."
-        )
-
-    def maintenance_margin(self, symbol: str, quantity: float, price: float) -> float:
-        raise NotImplementedError(
-            "SingleMarginModel is not yet wired — future work."
-        )
-
-    def max_abs_position(self, symbol: str, margin_budget: float,
-                         price: float) -> float:
-        raise NotImplementedError(
-            "SingleMarginModel is not yet wired — future work."
-        )
+        return margin_budget / (point_value * abs(price) * self.initial_margin_rate)

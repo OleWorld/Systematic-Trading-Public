@@ -5,10 +5,13 @@ For calibrated continuous forecasts (e.g. EWMAC) where conviction should
 modulate position size, prefer ``VolTargetingRiskManager``.
 """
 
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from event import BarEvent, OrderType, Direction
 from riskmanager._base import RiskManager, _PortfolioLike, _StrategyLike
+
+if TYPE_CHECKING:  # avoid a config<->riskmanager import cycle at module load
+    from config import InstrumentConfig
 
 
 class SimpleRiskManager(RiskManager):
@@ -52,7 +55,8 @@ class SimpleRiskManager(RiskManager):
 
     def __init__(self, portfolio: _PortfolioLike, strategy: _StrategyLike,
                  size_mode: str = 'fixed_quantity',
-                 position_size: float = 10_000.0):
+                 position_size: float = 10_000.0,
+                 instruments: Optional[Dict[str, "InstrumentConfig"]] = None):
         """
         Parameters
         ----------
@@ -69,6 +73,14 @@ class SimpleRiskManager(RiskManager):
             ``'fixed_equity_pct'``. Validated at construction.
         position_size
             Magnitude interpreted per ``size_mode``.
+        instruments
+            Per-symbol ``InstrumentConfig`` registry. ``point_value`` divides
+            the notional in the ``'fixed_notional'`` / ``'fixed_equity_pct'``
+            modes (qty = notional / (point_value * |price|)); ``fractional``
+            rounds the target to whole lots for futures. Default ``None``
+            builds a uniform ``point_value=1`` / ``fractional=True`` registry
+            over ``strategy.symbol_list`` (the crypto identity). Pass the SAME
+            registry given to the portfolio for a futures book.
         """
         if size_mode not in self._MODES:
             raise ValueError(
@@ -78,6 +90,10 @@ class SimpleRiskManager(RiskManager):
         super().__init__(portfolio, strategy)
         self.size_mode = size_mode
         self.position_size = position_size
+        if instruments is None:
+            from config import uniform_registry  # lazy: avoid import cycle
+            instruments = uniform_registry(list(strategy.symbol_list))
+        self.instruments = instruments
 
     def update_bar(self, event: BarEvent) -> None:
         """Resize the position to match the strategy's current forecast.
@@ -119,6 +135,11 @@ class SimpleRiskManager(RiskManager):
             return
 
         target_qty = row['target_qty']
+        # Whole-lot rounding for non-fractional instruments (futures): round to
+        # the nearest contract before the diff so the traded size is an integer.
+        if not self.instruments[symbol].fractional:
+            target_qty = float(round(target_qty))
+            row['target_qty'] = target_qty
         trade_qty = target_qty - current_qty
         row['trade_qty'] = trade_qty
 
@@ -173,14 +194,18 @@ class SimpleRiskManager(RiskManager):
             out['target_qty'] = 0.0
             return out
 
+        # Contract multiplier: dollar notional is qty * point_value * price,
+        # so converting a target notional to contracts divides by
+        # point_value * |price|. fixed_quantity is already in contracts.
+        pv = self.instruments[symbol].point_value
         sign = 1.0 if forecast > 0 else -1.0
         if self.size_mode == 'fixed_notional':
-            target_qty = sign * self.position_size / abs(price)
+            target_qty = sign * self.position_size / (pv * abs(price))
         elif self.size_mode == 'fixed_quantity':
             target_qty = sign * self.position_size
         elif self.size_mode == 'fixed_equity_pct':
             equity = self.portfolio.calculate_balance()
-            target_qty = sign * (equity * self.position_size) / abs(price)
+            target_qty = sign * (equity * self.position_size) / (pv * abs(price))
         else:
             raise ValueError(
                 f"Unknown size_mode: '{self.size_mode}'. "

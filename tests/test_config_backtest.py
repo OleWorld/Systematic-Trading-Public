@@ -141,24 +141,6 @@ def test_default_size_mode_is_fixed_quantity():
     assert cfg.size_mode == 'fixed_quantity'
 
 
-def test_default_slippage_mode_is_absolute():
-    """Futures-first default: slippage in $ per unit (ticks), not % of price."""
-    cfg = BacktestConfig(**_kwargs())
-    assert cfg.slippage_mode == 'absolute'
-
-
-def test_default_commission_mode_is_per_contract():
-    """Futures-first default: commission in $ per contract."""
-    cfg = BacktestConfig(**_kwargs())
-    assert cfg.commission_mode == 'per_contract'
-    assert cfg.commission_value == 0.0
-
-
-def test_unknown_commission_mode_rejected():
-    with pytest.raises(ValueError, match="commission_mode"):
-        BacktestConfig(**_kwargs(commission_mode='bps'))
-
-
 def test_unknown_corr_mode_rejected():
     with pytest.raises(ValueError, match="corr_mode"):
         BacktestConfig(**_kwargs(corr_mode='log_return'))

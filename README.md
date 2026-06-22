@@ -16,18 +16,45 @@ config = BacktestConfig(
     # Timeframes — {tf: maxlen}. Omit for single-TF (defaults to {base: 500}).
     # For multi-TF: timeframes={'1m': 500, '1h': 500, '4h': 200},
     initial_capital=1_000_000.0,
-    leverage=5.0,
     annual_target_vol=250_000.0,        # Carver τ — REQUIRED; units depend on vol_target_mode
     vol_target_mode='dollar_volatility',    # 'dollar_volatility' (fixed annual $ vol budget — default)
                                             # or 'percent_volatility' (fraction of equity, e.g. 0.25)
     position_buffer=0.25,         # Carver §10.7 dead-band (0.0 trades every gap)
-    slippage_mode='absolute',     # 'absolute' ($ per unit — default) or 'pct' (% of price)
-    slippage_value=0.5,
-    commission_mode='per_contract',  # 'per_contract' ($ per contract — default) or 'rate' (bps on notional)
-    commission_value=2.5,
     fill_on='signal_close',       # 'signal_close' or 'next_open'
 )
 ```
+
+`BacktestConfig` holds only **run-level** parameters. The per-symbol economics
+(point value, fractional lots, slippage, commission, margin/leverage) live in an
+`InstrumentConfig` registry — see the next section.
+
+### 1b. Instruments — per-symbol economics
+
+Each traded symbol carries an `InstrumentConfig`: its `point_value` (contract
+multiplier — dollar value is `qty × point_value × price`; `1` for crypto, e.g.
+`1000` for WTI crude), `fractional` flag (`True` for crypto, `False` for
+whole-lot-only futures), and its own slippage / commission / margin models.
+The engine consumes a registry `{symbol: InstrumentConfig}`. For a homogeneous
+book, `uniform_registry` builds it in one call:
+
+```python
+from config import uniform_registry
+from execution import SlippageModel, CommissionModel
+from portfolio import PortfolioMarginModel
+
+instruments = uniform_registry(
+    config.symbols,
+    point_value=1.0, fractional=True,                       # crypto-perp defaults
+    slippage=SlippageModel('absolute', 0.5),                # $ per unit
+    commission=CommissionModel('per_contract', 2.5),        # $ per contract
+    margin=PortfolioMarginModel.from_leverage(5.0, maintenance_margin_rate=0.025),
+)
+```
+
+For a futures book with different multipliers/margins per contract, hand a
+per-symbol dict of `InstrumentConfig` instead. Your **strategy and risk-manager
+logic still size in contracts** — the point-value conversion and whole-lot
+rounding happen in the back-end.
 
 ### 2. Strategy — Implement `calculate_forecast()`
 
@@ -147,21 +174,22 @@ data_handler = HistoricDataHandler(events_queue, config.symbols,
                                    base_timeframe=config.base_timeframe,
                                    timeframes=config.timeframes, data=data)
 strategy     = MyStrategy(data_handler, config.symbols, fast=10, slow=30)
+# `instruments` is the registry built in step 1b — the SAME object is passed to
+# the portfolio, risk manager, and execution handler.
 portfolio    = BacktestPortfolio(events_queue, data_handler, config.symbols,
-                                 initial_capital=config.initial_capital,
-                                 leverage=config.leverage)
+                                 instruments=instruments,
+                                 initial_capital=config.initial_capital)
 vol_estimator = EWMAVolEstimator(config.symbols, data_handler=data_handler,
                                  bars_per_year=bars_per_year('1d', config.days_convention),
                                  timeframe='1d', span=36)
 risk_manager  = VolTargetingRiskManager(portfolio, strategy, vol_estimator,
                                               data_handler=data_handler,
+                                              instruments=instruments,
                                               annual_target_vol=config.annual_target_vol,
                                               vol_target_mode=config.vol_target_mode,
                                               position_buffer=config.position_buffer)
 execution     = BacktestExecution(events_queue,
-                                  slippage_model=SlippageModel(config.slippage_mode, config.slippage_value),
-                                  commission_model=CommissionModel(mode=config.commission_mode,
-                                                                   value=config.commission_value),
+                                  instruments=instruments,
                                   fill_on=config.fill_on)
 
 bt = Backtester(events_queue, data_handler, strategy, portfolio, risk_manager, execution)

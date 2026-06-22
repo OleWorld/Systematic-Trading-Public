@@ -2,13 +2,15 @@
 
 import logging
 import math
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import pandas as pd
 
 from event import BarEvent, OrderEvent, FillEvent, OrderType, Direction
 from portfolio._base import Portfolio, _DataHandlerLike, _EventsQueueLike
-from portfolio._margin import MarginModel, PortfolioMarginModel
+
+if TYPE_CHECKING:  # avoid a config<->portfolio import cycle at runtime
+    from config import InstrumentConfig
 
 logger = logging.getLogger(__name__)
 
@@ -19,20 +21,22 @@ class BacktestPortfolio(Portfolio):
 
     Margin model (cross-margin futures):
         Cash = wallet balance (initial capital + cumulative realized P&L - cumulative commissions)
-        Unrealized P&L = sum(qty * (current_price - avg_cost)) over all positions
+        Unrealized P&L = sum(qty * point_value * (current_price - avg_cost)) over all positions
         Account balance = cash + unrealized P&L
-        Position margin = sum of per-symbol initial margin from the ``MarginModel``
+        Position margin = sum of per-symbol initial margin from each instrument's ``MarginModel``
         Available balance = account balance - position_margin - reserved_margin
 
-    All margin numbers come from a pluggable ``MarginModel`` (see
-    ``portfolio/_margin.py``). The default ``PortfolioMarginModel`` applies one
-    universal rate — ``initial_margin = abs(notional) * (1/leverage)``, which
-    reproduces the legacy ``abs(notional) / leverage`` formula exactly — plus a
-    separate (lower) maintenance-margin rate that drives the liquidation
-    trigger. Pass a custom ``margin_model`` to override; otherwise the
-    constructor builds the default from ``leverage`` and
-    ``maintenance_margin_rate``. When a ``margin_model`` is supplied, the
-    ``leverage`` argument is informational only (the model wins).
+    Per-symbol economics come from the ``instruments`` registry
+    (``Dict[str, InstrumentConfig]``, see ``config/_instrument.py``): each
+    symbol carries its own ``point_value`` (contract multiplier — dollar value
+    is ``qty * point_value * price``), ``fractional`` flag (whole-lot
+    enforcement at order submission), and ``MarginModel``. The default
+    ``PortfolioMarginModel`` applies one universal rate
+    (``initial_margin = abs(notional) * (1/leverage)`` at ``point_value=1``,
+    reproducing the legacy formula exactly) plus a separate (lower)
+    maintenance-margin rate that drives the liquidation trigger. Use
+    ``config.uniform_registry(...)`` to build a homogeneous registry, or hand
+    a per-symbol dict for a heterogeneous book.
 
         Opening a position: cash decreases by commission only (no notional flow)
         Closing a position: cash changes by realized P&L minus commission
@@ -40,10 +44,12 @@ class BacktestPortfolio(Portfolio):
     Margin reservation for pending orders splits each order into a
     risk-reducing component (up to abs(projected_position) in the opposite
     direction) and a risk-increasing component. The reducing component
-    reserves zero margin; the increasing component reserves
-    qty_increasing * price / leverage. The same formula applies to MKT and
-    LMT orders — only the reservation price differs (current safe price for
-    MKT, limit price for LMT).
+    reserves zero margin; the increasing component reserves the symbol's
+    ``MarginModel.initial_margin(qty_increasing, price, point_value)``. The
+    same formula applies to MKT and LMT orders — only the reservation price
+    differs (current safe price for MKT, limit price for LMT) — and, since
+    pending orders may span symbols, the model and ``point_value`` are looked
+    up per order.
 
     Position baseline for new-order margin checks (``_projected_position``)
     is realized + pending MKT orders only; LMT pendings are excluded
@@ -86,27 +92,22 @@ class BacktestPortfolio(Portfolio):
     def __init__(self, events_queue: _EventsQueueLike,
                  data_handler: _DataHandlerLike,
                  symbol_list: List[str],
-                 initial_capital: float = 100_000.0,
-                 leverage: float = 1.0,
-                 maintenance_margin_rate: float = 0.0,
-                 margin_model: Optional[MarginModel] = None):
+                 instruments: Dict[str, "InstrumentConfig"],
+                 initial_capital: float = 100_000.0):
         self.events_queue = events_queue
         self.data_handler = data_handler
         self.symbol_list = symbol_list
         self.initial_capital = initial_capital
-        # ``leverage`` is an informational echo once a ``margin_model`` is
-        # supplied — the model is authoritative for all margin math. When no
-        # model is passed, build the default universal-rate model from
-        # ``leverage`` and ``maintenance_margin_rate`` (mm_rate=0 reproduces
-        # the legacy "liquidate at account_balance < 0" behaviour exactly).
-        self.leverage = leverage
-        self.margin_model: MarginModel = (
-            margin_model
-            if margin_model is not None
-            else PortfolioMarginModel.from_leverage(
-                leverage, maintenance_margin_rate=maintenance_margin_rate,
+        # Per-symbol metadata registry (point_value, fractional, and the
+        # per-symbol slippage/commission/margin models). Every traded symbol
+        # must be covered — margin and PnL math read its config per symbol.
+        missing = set(symbol_list) - set(instruments)
+        if missing:
+            raise ValueError(
+                f"instruments registry is missing config for symbols: "
+                f"{sorted(missing)}"
             )
-        )
+        self.instruments = instruments
 
         # Account state
         self.cash: float = initial_capital
@@ -161,8 +162,9 @@ class BacktestPortfolio(Portfolio):
         self._latest_prices[event.symbol] = event.close
 
         # Update margin requirements for this symbol at current price
-        self.margin_requirements[event.symbol] = self.margin_model.initial_margin(
-            event.symbol, self.positions[event.symbol], event.close,
+        cfg = self.instruments[event.symbol]
+        self.margin_requirements[event.symbol] = cfg.margin.initial_margin(
+            self.positions[event.symbol], event.close, cfg.point_value,
         )
 
         self._refresh_snapshot()
@@ -237,9 +239,22 @@ class BacktestPortfolio(Portfolio):
                 symbol, order_type.value, direction.value, original_qty,
             )
             return None
+        # Whole-lot enforcement (authoritative safety net): non-fractional
+        # instruments (futures) trade in integer contracts only. Truncate
+        # toward zero so the rounded order never exceeds the margin-approved
+        # size; a sub-1-lot target can't be traded, so drop the order.
+        if not self.instruments[symbol].fractional:
+            quantity = float(math.floor(quantity))
+            if quantity <= 0:
+                logger.info(
+                    "[ORDER REJECTED] %s %s %s | requested=%.6f | Reason: "
+                    "sub-1-lot for whole-lot instrument",
+                    symbol, order_type.value, direction.value, original_qty,
+                )
+                return None
         if quantity != original_qty:
             logger.warning(
-                "[ORDER SCALED] %s %s %s | requested=%.6f -> approved=%.6f | Reason: insufficient margin",
+                "[ORDER SCALED] %s %s %s | requested=%.6f -> approved=%.6f | Reason: insufficient margin or whole-lot rounding",
                 symbol, order_type.value, direction.value,
                 original_qty, quantity,
             )
@@ -309,19 +324,26 @@ class BacktestPortfolio(Portfolio):
         After applying the fill, run a solvency check.
         """
         symbol = event.symbol
+        cfg = self.instruments[symbol]
+        pv = cfg.point_value
         fill_price = event.fill_notional / event.quantity if event.quantity != 0 else 0.0
 
+        # ``_apply_fill_to_position`` returns ``realized`` in PRICE space
+        # (per-unit PnL * qty); the contract multiplier converts it to dollars.
+        # avg_cost stays a per-unit price (fill_notional = qty * price), so the
+        # weighted-average math inside is pv-independent.
         new_pos, new_avg_cost, realized = self._apply_fill_to_position(
             symbol, event.quantity, event.direction, fill_price, event.fill_notional)
+        dollar_realized = realized * pv
 
         # Update state
         self.avg_cost[symbol] = new_avg_cost
-        self.cash += realized - event.commission
+        self.cash += dollar_realized - event.commission
         self.positions[symbol] = new_pos
-        self.margin_requirements[symbol] = self.margin_model.initial_margin(
-            symbol, new_pos, fill_price,
+        self.margin_requirements[symbol] = cfg.margin.initial_margin(
+            new_pos, fill_price, pv,
         )
-        self.realized_pnl[symbol] += realized
+        self.realized_pnl[symbol] += dollar_realized
         self.total_commission += event.commission
 
         # Release reserved margin
@@ -336,7 +358,7 @@ class BacktestPortfolio(Portfolio):
             'fill_price': fill_price,
             'fill_notional': event.fill_notional,
             'commission': event.commission,
-            'realized_pnl': realized,
+            'realized_pnl': dollar_realized,
             'position_after': new_pos,
             'cash_after': self.cash,
             'order_id': event.order_id,
@@ -441,8 +463,9 @@ class BacktestPortfolio(Portfolio):
         Same formula for MKT and LMT — the worst-case
         ``max(abs(new_pos), qty)`` clause for LMT has been removed.
         """
+        cfg = self.instruments[symbol]
         realized_margin = self.margin_requirements.get(symbol, 0.0)
-        projected_margin_now = self.margin_model.initial_margin(symbol, pos, price)
+        projected_margin_now = cfg.margin.initial_margin(pos, price, cfg.point_value)
         baseline = max(realized_margin, projected_margin_now)
 
         new_margin_raw = self._calculate_new_margin(symbol, pos, qty, direction, price)
@@ -463,8 +486,8 @@ class BacktestPortfolio(Portfolio):
         # margin). ``max_abs_position`` is a magnitude, correct for
         # negative-priced instruments (e.g. WTI 2020).
         max_new_margin = max(0.0, baseline + available)
-        max_abs_new_pos = self.margin_model.max_abs_position(
-            symbol, max_new_margin, price,
+        max_abs_new_pos = cfg.margin.max_abs_position(
+            max_new_margin, price, cfg.point_value,
         )
         if direction == Direction.BUY:
             max_qty = max_abs_new_pos - pos
@@ -512,11 +535,12 @@ class BacktestPortfolio(Portfolio):
         order's risk-reducing/increasing split is measured against the
         running projected position that includes earlier pending orders.
 
-        Per-order reservation = ``margin_model.initial_margin(symbol,
-        risk_increasing_qty, price)``, where ``risk_increasing_qty = qty -
+        Per-order reservation = ``margin.initial_margin(risk_increasing_qty,
+        price, point_value)``, where ``risk_increasing_qty = qty -
         min(qty, max(0, -dir_sign * running_pos))``. The model's ``abs`` keeps
         the reservation a magnitude for negative-priced instruments (e.g. WTI
-        2020).
+        2020). The pending orders may span DIFFERENT symbols, so the margin
+        model and ``point_value`` are looked up per order (``order.symbol``).
         Risk-reducing pending orders contribute zero. Same formula for
         MKT (priced at current safe price) and LMT (priced at the limit).
         Pending orders for which no safe price is available contribute
@@ -541,8 +565,9 @@ class BacktestPortfolio(Portfolio):
             reducing_capacity = max(0.0, -dir_sign * pos)
             reducing = min(order.quantity, reducing_capacity)
             increasing = order.quantity - reducing
-            reserved += self.margin_model.initial_margin(
-                order.symbol, increasing, price,
+            cfg = self.instruments[order.symbol]
+            reserved += cfg.margin.initial_margin(
+                increasing, price, cfg.point_value,
             )
             running_pos[order.symbol] = pos + dir_sign * order.quantity
         return reserved
@@ -569,7 +594,8 @@ class BacktestPortfolio(Portfolio):
             price = self.get_price(sym)
             if price is None:
                 continue
-            total += self.margin_model.maintenance_margin(sym, qty, price)
+            cfg = self.instruments[sym]
+            total += cfg.margin.maintenance_margin(qty, price, cfg.point_value)
         return total
 
     # ── Solvency enforcement ──────────────────
@@ -695,16 +721,23 @@ class BacktestPortfolio(Portfolio):
         projected position.
         """
         new_pos = pos + self._dir_sign(direction) * qty
-        return self.margin_model.initial_margin(symbol, new_pos, price)
+        cfg = self.instruments[symbol]
+        return cfg.margin.initial_margin(new_pos, price, cfg.point_value)
 
     def _calculate_unrealized_pnl(self) -> None:
-        """Recalculate per-symbol unrealized P&L from current prices."""
+        """Recalculate per-symbol unrealized P&L (in dollars) from current prices.
+
+        Dollar PnL = ``qty * point_value * (price - avg_cost)`` — avg_cost is a
+        per-unit price, so the contract multiplier converts the price move to
+        dollars.
+        """
         for sym, qty in self.positions.items():
             if qty != 0:
                 price = self.get_price(sym)
                 if price is None:
                     continue  # Keep previous unrealized_pnl for this symbol
-                self.unrealized_pnl[sym] = qty * (price - self.avg_cost[sym])
+                pv = self.instruments[sym].point_value
+                self.unrealized_pnl[sym] = qty * pv * (price - self.avg_cost[sym])
             else:
                 self.unrealized_pnl[sym] = 0.0
 

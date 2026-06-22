@@ -16,6 +16,7 @@ from typing import Any, List, Optional, Tuple
 
 import pytest
 
+from config import InstrumentConfig, uniform_registry
 from event import (
     BarEvent,
     Direction,
@@ -84,14 +85,27 @@ def _new_execution(
     fill_on: str = 'signal_close',
     slippage: Tuple[str, float] = ('pct', 0.0),
     commission: Tuple[str, float] = ('per_contract', 0.0),
+    point_value: float = 1.0,
+    symbols: Tuple[str, ...] = ('BTC', 'ETH'),
+    instruments: Optional[dict] = None,
     exchange_name: str = 'BACKTEST',
 ) -> Tuple[BacktestExecution, FakeQueue]:
-    """Build a BacktestExecution with a fake queue. Zero-cost by default."""
+    """Build a BacktestExecution with a fake queue. Zero-cost by default.
+
+    The uniform slippage / commission / point_value are bundled into an
+    InstrumentConfig registry covering ``symbols`` (override with an explicit
+    ``instruments`` dict for per-symbol economics).
+    """
     q = FakeQueue()
+    if instruments is None:
+        instruments = uniform_registry(
+            list(symbols), point_value=point_value,
+            slippage=SlippageModel(mode=slippage[0], value=slippage[1]),
+            commission=CommissionModel(mode=commission[0], value=commission[1]),
+        )
     ex = BacktestExecution(
         events_queue=q,
-        slippage_model=SlippageModel(mode=slippage[0], value=slippage[1]),
-        commission_model=CommissionModel(mode=commission[0], value=commission[1]),
+        instruments=instruments,
         fill_on=fill_on,
         exchange_name=exchange_name,
     )
@@ -186,6 +200,25 @@ def test_commission_per_contract_ignores_price():
 def test_commission_invalid_mode_raises():
     with pytest.raises(ValueError, match="CommissionModel mode"):
         CommissionModel(mode='bps', value=0.001)
+
+
+def test_commission_rate_mode_scales_by_point_value():
+    """'rate' commission is bps on TRUE dollar notional = abs(qty * pv * price)."""
+    c = CommissionModel(mode='rate', value=0.001)
+    # abs(2 * 1000 * 100) * 0.001 = 200
+    assert math.isclose(c.calculate(2.0, 100.0, 1000.0), 200.0)
+
+
+def test_commission_per_contract_ignores_point_value():
+    """Per-contract cost is independent of the contract multiplier."""
+    c = CommissionModel(mode='per_contract', value=2.5)
+    assert math.isclose(c.calculate(4.0, 100.0, 1000.0), 10.0)
+
+
+def test_commission_point_value_defaults_to_one():
+    """pv defaults to 1.0 so legacy two-arg calls are unchanged."""
+    c = CommissionModel(mode='rate', value=0.001)
+    assert math.isclose(c.calculate(2.0, 100.0), c.calculate(2.0, 100.0, 1.0))
 
 
 # ──────────────────────────────────────────────
@@ -525,6 +558,43 @@ def test_emit_fill_fills_at_full_requested_quantity():
                             order_type=OrderType.MKT))
     assert len(q.items) == 1
     assert math.isclose(q.items[0].quantity, 42.0)
+
+
+def test_emit_fill_rate_commission_scales_by_point_value():
+    """'rate' commission charges bps on the true dollar notional
+    abs(qty * point_value * fill_price)."""
+    ex, q = _new_execution(fill_on='signal_close',
+                           commission=('rate', 0.001), point_value=1000.0)
+    ex.update_bar(_bar(symbol='BTC', open=50.0, high=51.0, low=49.0, close=50.0))
+    ex.execute_order(_order(symbol='BTC', qty=2.0, direction=Direction.BUY,
+                            order_type=OrderType.MKT))
+    # no slippage → fill 50; commission = |2 * 1000 * 50| * 0.001 = 100
+    assert math.isclose(q.items[0].commission, 100.0)
+
+
+def test_emit_fill_uses_per_symbol_slippage_and_commission():
+    """Each symbol's own SlippageModel / CommissionModel is applied."""
+    instruments = {
+        'BTC': InstrumentConfig(slippage=SlippageModel('absolute', 1.0),
+                                commission=CommissionModel('per_contract', 2.0)),
+        'ETH': InstrumentConfig(slippage=SlippageModel('absolute', 5.0),
+                                commission=CommissionModel('per_contract', 3.0)),
+    }
+    ex, q = _new_execution(fill_on='signal_close', instruments=instruments)
+    ex.update_bar(_bar(symbol='BTC', open=100.0, high=101.0, low=99.0, close=100.0))
+    ex.update_bar(_bar(symbol='ETH', open=100.0, high=101.0, low=99.0, close=100.0))
+    ex.execute_order(_order(symbol='BTC', qty=1.0, direction=Direction.BUY,
+                            order_type=OrderType.MKT))
+    ex.execute_order(_order(symbol='ETH', qty=1.0, direction=Direction.BUY,
+                            order_type=OrderType.MKT))
+    btc = next(f for f in q.items if f.symbol == 'BTC')
+    eth = next(f for f in q.items if f.symbol == 'ETH')
+    # BTC: slip +1 → 101, commission 2.0
+    assert math.isclose(btc.fill_notional, 1.0 * 101.0)
+    assert math.isclose(btc.commission, 2.0)
+    # ETH: slip +5 → 105, commission 3.0
+    assert math.isclose(eth.fill_notional, 1.0 * 105.0)
+    assert math.isclose(eth.commission, 3.0)
 
 
 # ──────────────────────────────────────────────
