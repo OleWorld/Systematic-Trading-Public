@@ -577,11 +577,12 @@ def test_kama_constant_input_tracks_constant():
 
 
 def test_stdev_constant_nonzero_window_is_exactly_zero():
-    """A constant non-zero window has true variance 0. The Welford slide /
-    direct compute leave a ~1e-15 residue, which the two-sided noise floor
-    must snap to exactly 0.0 — never NaN, never a tiny positive (which would
-    slip past a strict ``sigma == 0`` zero-vol guard downstream and get
-    divided by). 5.1 is non-integer so the arithmetic is genuinely inexact."""
+    """A constant non-zero window has true variance 0. The incremental Welford
+    slide leaves a ~1e-15 residue, which the dust-band trigger resolves to
+    exactly 0.0 via an exact mean-centered recompute — never NaN, never a tiny
+    positive (which would slip past a strict ``sigma == 0`` zero-vol guard
+    downstream and get divided by). 5.1 is non-integer so the arithmetic is
+    genuinely inexact."""
     sd = Stdev(length=4)
     ts = _ts_index(10)
     for t in ts:
@@ -592,6 +593,35 @@ def test_stdev_constant_nonzero_window_is_exactly_zero():
     finite = df.iloc[3:]
     assert not finite.isna().any()
     np.testing.assert_array_equal(finite.values, 0.0)
+
+
+def test_stdev_high_mean_low_cv_matches_vectorized():
+    """A window with tiny dispersion relative to a large mean (coefficient of
+    variation < ~1e-6) still has genuine, non-zero variance. The O(1) slide's
+    degenerate-window handling must not mistake it for a constant window and
+    zero it out — that would diverge from ``from_series`` (plain
+    ``rolling().std()``, no snap) and silently feed ``sigma == 0`` downstream.
+    Regression guard for the mean²-scaled noise floor."""
+    rng = np.random.default_rng(0)
+    # mean 1e6, std 0.5 → CV 5e-7, below the old 1e-6 false-snap threshold.
+    vals = pd.Series(1_000_000.0 + rng.normal(0.0, 0.5, size=200),
+                     index=_ts_index(200), name='close')
+    vec = Stdev.from_series(vals, length=35)
+    state = _drive_single(Stdev(length=35), vals)
+    np.testing.assert_allclose(state.values, vec.values, equal_nan=True, rtol=1e-7)
+
+
+def test_stdev_translation_invariant():
+    """Variance is translation-invariant: ``Stdev(x) == Stdev(x + C)`` for any
+    constant offset C. A large offset drives the coefficient of variation below
+    the degenerate-window threshold, so this directly encodes the invariant the
+    constant-window handling must not break."""
+    rng = np.random.default_rng(1)
+    walk = pd.Series(rng.standard_normal(200).cumsum() + 100.0,
+                     index=_ts_index(200), name='close')
+    base = _drive_single(Stdev(length=35), walk)
+    shifted = _drive_single(Stdev(length=35), walk + 1e8)
+    np.testing.assert_allclose(shifted.values, base.values, equal_nan=True, rtol=1e-6)
 
 
 def test_trailing_stop_inherits_state_through_nan_atr():
