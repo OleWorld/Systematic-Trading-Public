@@ -75,7 +75,7 @@ instruments = uniform_registry(
     point_value=1.0,
     fractional=True,
     slippage=SlippageModel('absolute', 0.0),     # futures default: $ per unit
-    commission=CommissionModel('rate', 0.001),  # futures default: bps on notional
+    commission=CommissionModel('per_contract', 0.0),   # futures default: $ per contract
     margin=PortfolioMarginModel.from_leverage(10.0, maintenance_margin_rate=0.05),
 )
 
@@ -100,8 +100,8 @@ data_handler = HistoricDataHandler(
 # same dynamic forecast scalar EWMAC uses to drive avg |f| toward 50.
 strategy = RSIMRStrategy(
     data_handler, config.symbols,
-    rsi_windows=[7, 14, 28],
-    weights=[1.0 / 3.0] * 3,
+    rsi_windows=[3, 14, 28],
+    weights=[0.50, 0.25, 0.25],
     fdm=1.0,
     forecast_scalar_lookback=256,
 )

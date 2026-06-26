@@ -76,7 +76,7 @@ instruments = uniform_registry(
     point_value=1.0,
     fractional=True,
     slippage=SlippageModel('absolute', 0.0),     # futures default: $ per unit
-    commission=CommissionModel('rate', 0.001),  # futures default: $ per contract
+    commission=CommissionModel('per_contract', 0.0),  # futures default: $ per contract
     margin=PortfolioMarginModel.from_leverage(10.0, maintenance_margin_rate=0.05),
 )
 
@@ -299,3 +299,4 @@ if not riskmanager_records.empty:
 # df_close = pd.concat(list_close, axis=1)
 # corr_matrix = correlation_matrix(df_close.diff().dropna(), lookback=60)
 # corr_matrix = correlation_matrix(df_close.diff().dropna(), lookback=60, shrinkage='ledoit_wolf')
+# display(corr_matrix)
