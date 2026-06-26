@@ -76,7 +76,7 @@ instruments = uniform_registry(
     point_value=1.0,
     fractional=True,
     slippage=SlippageModel('absolute', 0.0),     # futures default: $ per unit
-    commission=CommissionModel('per_contract', 0.0),  # futures default: $ per contract
+    commission=CommissionModel('rate', 0.001),  # futures default: $ per contract
     margin=PortfolioMarginModel.from_leverage(10.0, maintenance_margin_rate=0.05),
 )
 
