@@ -165,6 +165,21 @@ def test_from_leverage_non_positive_raises(bad_leverage):
         PortfolioMarginModel.from_leverage(bad_leverage)
 
 
+@pytest.mark.parametrize("sub_unit_leverage", [0.5, 0.99])
+def test_from_leverage_below_one_raises_leverage_worded(sub_unit_leverage):
+    """0 < leverage < 1 implies initial_margin_rate > 1 (posting more than 100%
+    of notional), which this model disallows. The guard must reject it in
+    from_leverage with a leverage-worded message naming the bad value — not leak
+    the derived-rate ValueError from __post_init__, which talks about a rate the
+    caller never supplied."""
+    with pytest.raises(ValueError) as exc:
+        PortfolioMarginModel.from_leverage(sub_unit_leverage)
+    msg = str(exc.value)
+    assert "leverage" in msg
+    assert str(sub_unit_leverage) in msg
+    assert "initial_margin_rate" not in msg
+
+
 # ──────────────────────────────────────────────
 # Interface
 # ──────────────────────────────────────────────

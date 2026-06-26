@@ -111,9 +111,20 @@ class PortfolioMarginModel(MarginModel):
         """
         Build from a leverage scalar: ``initial_margin_rate = 1 / leverage``.
         The backward-compatible bridge for callers that still pass ``leverage``.
+
+        ``leverage`` must be ``>= 1``: ``1 / leverage`` is the fraction of
+        notional posted as margin, so ``leverage < 1`` would require posting
+        more than 100% of notional, which ``initial_margin_rate``'s ``<= 1`` cap
+        disallows. Rejecting it here gives a leverage-worded error instead of
+        leaking the derived-rate ``ValueError`` from ``__post_init__``.
         """
-        if not (leverage > 0.0):
-            raise ValueError(f"leverage must be > 0, got {leverage}")
+        if not (leverage >= 1.0):
+            raise ValueError(
+                f"leverage must be >= 1, got {leverage}. "
+                f"(Margin = notional / leverage; leverage < 1 implies posting "
+                f"more than 100% of notional, which this model's rate cap of "
+                f"1.0 disallows.)"
+            )
         return cls(initial_margin_rate=1.0 / leverage,
                    maintenance_margin_rate=maintenance_margin_rate)
 
