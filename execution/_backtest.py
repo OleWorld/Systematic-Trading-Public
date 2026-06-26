@@ -1,90 +1,16 @@
-"""BacktestExecution — simulated exchange for backtesting, plus cost models."""
+"""BacktestExecution — simulated exchange for backtesting."""
 
 import logging
 import queue
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from event import BarEvent, OrderEvent, FillEvent, OrderType, Direction
 from execution._base import ExecutionHandler
 
+if TYPE_CHECKING:  # avoid a config<->execution import cycle at runtime
+    from config import InstrumentConfig
+
 logger = logging.getLogger(__name__)
-
-
-# ──────────────────────────────────────────────
-# Cost Models
-# ──────────────────────────────────────────────
-
-@dataclass
-class SlippageModel:
-    """
-    Configurable slippage applied to fill prices.
-
-    Modes:
-        'pct'      — percentage of price (e.g., 0.001 = 0.1%)
-        'absolute' — fixed value per unit (e.g., 0.50 tick size)
-    """
-    mode: str
-    value: float
-
-    def __post_init__(self):
-        if self.mode not in ('pct', 'absolute'):
-            raise ValueError(f"Unknown SlippageModel mode: '{self.mode}'. Must be 'pct' or 'absolute'.")
-
-    def apply(self, price: float, direction: Direction) -> float:
-        # ``abs(price)`` for the pct branch so slippage is always a positive
-        # magnitude — at negative prices (e.g. WTI 2020) the raw product
-        # ``price * value`` would push the fill in the wrong direction.
-        if self.mode == 'pct':
-            slip = abs(price) * self.value
-        elif self.mode == 'absolute':
-            slip = self.value
-        else:
-            raise ValueError(f"Unknown SlippageModel mode: '{self.mode}'. Must be 'pct' or 'absolute'.")
-
-        if direction == Direction.BUY:
-            return price + slip
-        elif direction == Direction.SELL:
-            return price - slip
-        else:
-            raise ValueError(f"Unexpected direction: {direction!r}")
-
-
-@dataclass
-class CommissionModel:
-    """
-    Configurable commission applied per fill.
-
-    Modes:
-        'per_contract' — fixed $ per contract: ``abs(quantity) * value``
-                         (default — futures brokers charge per contract,
-                         independent of price level; safe for negative/
-                         zero prices)
-        'rate'         — fraction of notional: ``abs(quantity * fill_price)
-                         * value`` (e.g., 0.0004 = 4bps taker fee — the
-                         crypto/equity convention)
-    """
-    mode: str = 'per_contract'
-    value: float = 0.0
-
-    def __post_init__(self):
-        if self.mode not in ('rate', 'per_contract'):
-            raise ValueError(
-                f"Unknown CommissionModel mode: '{self.mode}'. "
-                "Must be 'rate' or 'per_contract'."
-            )
-
-    def calculate(self, quantity: float, fill_price: float) -> float:
-        """Commission in $ for a fill (always non-negative)."""
-        if self.mode == 'rate':
-            return abs(quantity * fill_price) * self.value
-        elif self.mode == 'per_contract':
-            return abs(quantity) * self.value
-        else:
-            raise ValueError(
-                f"Unknown CommissionModel mode: '{self.mode}'. "
-                "Must be 'rate' or 'per_contract'."
-            )
 
 
 # ──────────────────────────────────────────────
@@ -120,13 +46,13 @@ class BacktestExecution(ExecutionHandler):
     """
 
     def __init__(self, events_queue: queue.Queue[Any],
-                 slippage_model: SlippageModel,
-                 commission_model: CommissionModel,
+                 instruments: Dict[str, "InstrumentConfig"],
                  fill_on: str,
                  exchange_name: str = 'BACKTEST'):
         self.events_queue = events_queue
-        self.slippage = slippage_model
-        self.commission = commission_model
+        # Per-symbol metadata registry: slippage / commission models and the
+        # point_value used to compute true dollar notional for rate-commission.
+        self.instruments = instruments
         self.exchange_name = exchange_name
         if fill_on not in ('signal_close', 'next_open'):
             raise ValueError(
@@ -225,12 +151,19 @@ class BacktestExecution(ExecutionHandler):
             raise ValueError(f"Unexpected order_type: {order.order_type!r}")
 
     def _emit_fill(self, order: OrderEvent, base_price: float, bar: BarEvent) -> None:
-        """Create and enqueue a FillEvent with slippage and commission applied."""
-        fill_price = self.slippage.apply(base_price, order.direction)
+        """Create and enqueue a FillEvent with per-symbol slippage and commission applied.
+
+        ``fill_notional`` stays in price space (``qty * fill_price``) — the
+        portfolio applies ``point_value`` when converting to dollar PnL.
+        Commission, however, is charged in dollars, so the contract multiplier
+        is passed to the rate-commission notional here.
+        """
+        cfg = self.instruments[order.symbol]
+        fill_price = cfg.slippage.apply(base_price, order.direction)
         qty = order.quantity
 
         fill_notional = qty * fill_price
-        commission = self.commission.calculate(qty, fill_price)
+        commission = cfg.commission.calculate(qty, fill_price, cfg.point_value)
 
         fill = FillEvent(
             timestamp=bar.timestamp,

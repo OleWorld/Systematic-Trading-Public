@@ -29,6 +29,7 @@ import pandas as pd
 import pytest
 
 from analytics import correlation_matrix
+from config import uniform_registry
 from event import BarEvent, OrderType, Direction
 from riskmanager import VolTargetingRiskManager
 
@@ -184,14 +185,20 @@ def _make(
     # Golden-formula tests pin Carver's original percent-of-equity form;
     # the class default is 'dollar_volatility' (futures-first).
     vol_target_mode: str = 'percent_volatility',
+    point_value: float = 1.0,
+    fractional: bool = True,
 ):
     pf = FakePortfolio(balance=balance, positions=positions or {'BTC': 0.0})
     strat = FakeStrategy({'BTC': forecast}, symbol_list=['BTC'])
     vol = FakeVolEstimator({'BTC': sigma})
     dh = FakeDataHandler()
+    instruments = uniform_registry(
+        list(strat.symbol_list), point_value=point_value, fractional=fractional,
+    )
     rm = VolTargetingRiskManager(
         pf, strat, vol,
         data_handler=dh,
+        instruments=instruments,
         idm=idm,
         annual_target_vol=annual_target_vol,
         vol_target_mode=vol_target_mode,
@@ -496,6 +503,41 @@ def test_forecast_zero_with_long_position_flattens():
     assert len(pf.submitted) == 1
     assert pf.submitted[0]['direction'] == Direction.SELL
     assert math.isclose(pf.submitted[0]['quantity'], 1.0)
+
+
+# ──────────────────────────────────────────────
+# point_value / fractional (contract sizing)
+# ──────────────────────────────────────────────
+
+def test_point_value_divides_target_qty():
+    """The per-contract dollar vol is point_value * sigma, so the golden
+    target_qty (1.5625) is divided by point_value=1000."""
+    pf, _, _, rm = _make(point_value=1000.0)
+    rm.update_bar(_bar())
+    assert len(pf.submitted) == 1
+    assert math.isclose(pf.submitted[0]['quantity'], 1.5625 / 1000.0, rel_tol=1e-12)
+
+
+def test_non_fractional_rounds_target_to_whole_lot():
+    """fractional=False rounds the continuous target (1.5625) to 2 contracts."""
+    pf, _, _, rm = _make(fractional=False)
+    rm.update_bar(_bar())
+    assert len(pf.submitted) == 1
+    assert math.isclose(pf.submitted[0]['quantity'], 2.0)
+
+
+def test_non_fractional_subhalf_target_rounds_to_zero_holds_flat():
+    """forecast=10 → target 0.3125 → rounds to 0; from flat, no order."""
+    pf, _, _, rm = _make(fractional=False, forecast=10.0)
+    rm.update_bar(_bar())
+    assert pf.submitted == []
+
+
+def test_fractional_keeps_continuous_target():
+    """The fractional default leaves the continuous target untouched."""
+    pf, _, _, rm = _make(fractional=True)
+    rm.update_bar(_bar())
+    assert math.isclose(pf.submitted[0]['quantity'], 1.5625, rel_tol=1e-12)
 
 
 # ──────────────────────────────────────────────

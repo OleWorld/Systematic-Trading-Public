@@ -393,6 +393,91 @@ def test_sma_upsert_replaces_forming_in_place():
     assert len(sma._outputs) == 2
 
 
+def test_stdev_upsert_replaces_forming_in_place():
+    """Stdev counterpart to the SMA upsert test: a same-ts re-tick swaps the
+    forming value (not appends), so the O(1) Welford slide must fold from the
+    finalized prior (``_outputs[-2]``), not the stale forming entry."""
+    t0, t1 = dt.datetime(2024, 1, 1, 0), dt.datetime(2024, 1, 1, 1)
+    sd = Stdev(length=2)
+    sd.update(t0, 1.0)
+    sd.update(t1, 3.0)  # window [1, 3] → stdev = sqrt(2)
+    assert sd.forming is not None and sd.forming['stdev'] == pytest.approx(2.0 ** 0.5)
+    sd.update(t1, 5.0)  # re-tick: window becomes [1, 5] → stdev = sqrt(8)
+    assert sd.forming is not None and sd.forming['stdev'] == pytest.approx(8.0 ** 0.5)
+    # Deque still has 2 entries — re-tick replaced, did not append.
+    assert len(sd._outputs) == 2
+
+
+# Distinct timestamps, several carrying intermediate re-ticks. The window
+# (3) is smaller than the timestamp count (8), so the O(1) slide must compose
+# eviction (rollover) with the re-tick prev-selection. Re-ticked output must
+# equal both a clean instance fed only the final per-ts value and the
+# vectorized ``from_series`` of those finals.
+_ROLLOVER_TICKS: List[Tuple[int, List[float]]] = [
+    (0, [10.0]),
+    (1, [11.0, 11.5, 12.0]),
+    (2, [13.0]),
+    (3, [9.0, 8.0]),
+    (4, [14.0]),
+    (5, [7.0, 7.5]),
+    (6, [15.0]),
+    (7, [6.0, 6.5, 5.0]),
+]
+
+
+def _drive_reticks(ind, ticks: List[Tuple[int, List[float]]]):
+    ts = _ts_index(len(ticks))
+    for i, vals in ticks:
+        for v in vals:
+            ind.update(ts[i], v)
+    return ind
+
+
+def _drive_finals(ind, ticks: List[Tuple[int, List[float]]]):
+    ts = _ts_index(len(ticks))
+    for i, vals in ticks:
+        ind.update(ts[i], vals[-1])
+    return ind
+
+
+def _finals_series(ticks: List[Tuple[int, List[float]]]) -> pd.Series:
+    ts = _ts_index(len(ticks))
+    return pd.Series([vals[-1] for _, vals in ticks],
+                     index=[ts[i] for i, _ in ticks])
+
+
+def test_sma_retick_with_rollover_matches_clean_and_vectorized():
+    reticked = _drive_reticks(SMA(window=3), _ROLLOVER_TICKS)
+    clean = _drive_finals(SMA(window=3), _ROLLOVER_TICKS)
+    vec = SMA.from_series(_finals_series(_ROLLOVER_TICKS), window=3)
+    n = len(_ROLLOVER_TICKS)
+    np.testing.assert_allclose(
+        reticked.get_latest_indicators_df(n)['sma'].values,
+        clean.get_latest_indicators_df(n)['sma'].values,
+        equal_nan=True, rtol=1e-12,
+    )
+    np.testing.assert_allclose(
+        reticked.get_latest_indicators_df(n)['sma'].values,
+        vec.values, equal_nan=True, rtol=1e-12,
+    )
+
+
+def test_stdev_retick_with_rollover_matches_clean_and_vectorized():
+    reticked = _drive_reticks(Stdev(length=3), _ROLLOVER_TICKS)
+    clean = _drive_finals(Stdev(length=3), _ROLLOVER_TICKS)
+    vec = Stdev.from_series(_finals_series(_ROLLOVER_TICKS), length=3)
+    n = len(_ROLLOVER_TICKS)
+    np.testing.assert_allclose(
+        reticked.get_latest_indicators_df(n)['stdev'].values,
+        clean.get_latest_indicators_df(n)['stdev'].values,
+        equal_nan=True, rtol=1e-12,
+    )
+    np.testing.assert_allclose(
+        reticked.get_latest_indicators_df(n)['stdev'].values,
+        vec.values, equal_nan=True, rtol=1e-10,
+    )
+
+
 # ──────────────────────────────────────────────
 # Lifecycle: is_latest_ready, latest, forming, reset, warmup
 # ──────────────────────────────────────────────
@@ -453,6 +538,29 @@ def test_warmup_series_matches_bar_by_bar(random_close):
     )
 
 
+@pytest.mark.parametrize('ind_factory', [
+    lambda: SMA(window=10),
+    lambda: Stdev(length=10),
+])
+def test_reset_redrives_cleanly_for_incremental(ind_factory, random_close):
+    """The O(1) indicators carry their aggregates inside ``_outputs`` (cleared
+    by ``reset``), so a reset-then-redrive must match a fresh instance — guards
+    against any stale carried state surviving a reset."""
+    a = ind_factory()
+    for ts, v in random_close.iloc[:50].items():
+        a.update(ts, float(v))
+    a.reset()
+    assert len(a._outputs) == 0 and len(a._inputs) == 0
+    for ts, v in random_close.iloc[:50].items():
+        a.update(ts, float(v))
+    b = ind_factory()
+    for ts, v in random_close.iloc[:50].items():
+        b.update(ts, float(v))
+    pd.testing.assert_frame_equal(
+        a.get_latest_indicators_df(50), b.get_latest_indicators_df(50),
+    )
+
+
 # ──────────────────────────────────────────────
 # Edge cases
 # ──────────────────────────────────────────────
@@ -466,6 +574,54 @@ def test_kama_constant_input_tracks_constant():
     # First er_length outputs masked; the rest must equal the constant.
     assert df.iloc[:5].isna().all()
     np.testing.assert_allclose(df.iloc[5:].values, 5.0)
+
+
+def test_stdev_constant_nonzero_window_is_exactly_zero():
+    """A constant non-zero window has true variance 0. The incremental Welford
+    slide leaves a ~1e-15 residue, which the dust-band trigger resolves to
+    exactly 0.0 via an exact mean-centered recompute — never NaN, never a tiny
+    positive (which would slip past a strict ``sigma == 0`` zero-vol guard
+    downstream and get divided by). 5.1 is non-integer so the arithmetic is
+    genuinely inexact."""
+    sd = Stdev(length=4)
+    ts = _ts_index(10)
+    for t in ts:
+        sd.update(t, 5.1)
+    df = sd.get_latest_indicators_df(10)['stdev']
+    # First length-1 = 3 outputs masked NaN; the rest exactly 0.0.
+    assert df.iloc[:3].isna().all()
+    finite = df.iloc[3:]
+    assert not finite.isna().any()
+    np.testing.assert_array_equal(finite.values, 0.0)
+
+
+def test_stdev_high_mean_low_cv_matches_vectorized():
+    """A window with tiny dispersion relative to a large mean (coefficient of
+    variation < ~1e-6) still has genuine, non-zero variance. The O(1) slide's
+    degenerate-window handling must not mistake it for a constant window and
+    zero it out — that would diverge from ``from_series`` (plain
+    ``rolling().std()``, no snap) and silently feed ``sigma == 0`` downstream.
+    Regression guard for the mean²-scaled noise floor."""
+    rng = np.random.default_rng(0)
+    # mean 1e6, std 0.5 → CV 5e-7, below the old 1e-6 false-snap threshold.
+    vals = pd.Series(1_000_000.0 + rng.normal(0.0, 0.5, size=200),
+                     index=_ts_index(200), name='close')
+    vec = Stdev.from_series(vals, length=35)
+    state = _drive_single(Stdev(length=35), vals)
+    np.testing.assert_allclose(state.values, vec.values, equal_nan=True, rtol=1e-7)
+
+
+def test_stdev_translation_invariant():
+    """Variance is translation-invariant: ``Stdev(x) == Stdev(x + C)`` for any
+    constant offset C. A large offset drives the coefficient of variation below
+    the degenerate-window threshold, so this directly encodes the invariant the
+    constant-window handling must not break."""
+    rng = np.random.default_rng(1)
+    walk = pd.Series(rng.standard_normal(200).cumsum() + 100.0,
+                     index=_ts_index(200), name='close')
+    base = _drive_single(Stdev(length=35), walk)
+    shifted = _drive_single(Stdev(length=35), walk + 1e8)
+    np.testing.assert_allclose(shifted.values, base.values, equal_nan=True, rtol=1e-6)
 
 
 def test_trailing_stop_inherits_state_through_nan_atr():

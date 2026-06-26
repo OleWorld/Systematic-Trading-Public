@@ -10,10 +10,10 @@ from logging_setup import configure_logging
 configure_logging(level=logging.WARNING)
 
 from analytics import backtest_stats
-from config import BacktestConfig
+from config import BacktestConfig, uniform_registry
 from data import HistoricDataHandler
 from strategy import EWMACStrategy
-from portfolio import BacktestPortfolio
+from portfolio import BacktestPortfolio, PortfolioMarginModel
 from execution import BacktestExecution, SlippageModel, CommissionModel
 from volatility import EWMAVolEstimator, bars_per_year
 from riskmanager import VolTargetingRiskManager
@@ -58,16 +58,26 @@ config = BacktestConfig(
     corr_timeframe = '1d',
 
     initial_capital=10_000_000,
-    leverage=10.0,
     vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
     annual_target_vol=1_000_000,        # $1M annual vol
     position_buffer=0.25,
 
-    slippage_mode='absolute',               # futures default: $ per unit
-    slippage_value=0.0,                     # default 0.0 — one fixed tick can't fit BTC & DOGE scales
-    commission_mode='per_contract',         # futures default: $ per contract
-    commission_value=0.0,                   # default 0.0 — per-contract cost isn't uniform across the basket
     fill_on='signal_close',
+)
+
+# Per-symbol economics (point_value, fractional, slippage, commission, margin)
+# now live in an InstrumentConfig registry, NOT BacktestConfig. The crypto
+# basket is homogeneous, so a uniform registry is a one-liner: point_value=1
+# and fractional=True reproduce the simplified crypto-perp accounting, with
+# 10x leverage / 5% maintenance margin and zero slippage/commission (a fixed
+# tick or per-contract fee can't fit BTC & DOGE scales at once).
+instruments = uniform_registry(
+    config.symbols,
+    point_value=1.0,
+    fractional=True,
+    slippage=SlippageModel('absolute', 0.0),     # futures default: $ per unit
+    commission=CommissionModel('per_contract', 0.0),  # futures default: $ per contract
+    margin=PortfolioMarginModel.from_leverage(10.0, maintenance_margin_rate=0.05),
 )
 
 
@@ -95,10 +105,13 @@ strategy = EWMACStrategy(
     forecast_scalar_lookback=500,
 )
 
+# The portfolio reads each symbol's point_value (PnL/margin) and MarginModel
+# from the instruments registry. For a heterogeneous futures book, hand a
+# per-symbol dict instead of the uniform registry built above.
 portfolio = BacktestPortfolio(
     events_queue, data_handler, config.symbols,
+    instruments=instruments,
     initial_capital=config.initial_capital,
-    leverage=config.leverage,
 )
 
 vol_timeframe = '1d'
@@ -111,6 +124,7 @@ vol_estimator = EWMAVolEstimator(
 risk_manager = VolTargetingRiskManager(
     portfolio, strategy, vol_estimator,
     data_handler=data_handler,
+    instruments=instruments,
     annual_target_vol=config.annual_target_vol,
     vol_target_mode=config.vol_target_mode,
     position_buffer=config.position_buffer,
@@ -126,9 +140,7 @@ risk_manager = VolTargetingRiskManager(
 
 execution = BacktestExecution(
     events_queue,
-    slippage_model=SlippageModel(config.slippage_mode, config.slippage_value),
-    commission_model=CommissionModel(mode=config.commission_mode,
-                                     value=config.commission_value),
+    instruments=instruments,
     fill_on=config.fill_on,
 )
 

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import pytest
 
+from config import uniform_registry
 from data._bar import Bar
 from event import (
     BarEvent,
@@ -25,7 +26,7 @@ from event import (
     OrderEvent,
     OrderType,
 )
-from portfolio import BacktestPortfolio, Portfolio
+from portfolio import BacktestPortfolio, Portfolio, PortfolioMarginModel
 
 
 # ──────────────────────────────────────────────
@@ -71,18 +72,33 @@ def _new_portfolio(
     symbols: Tuple[str, ...] = ('BTC',),
     capital: float = 100_000.0,
     leverage: float = 1.0,
+    maintenance_margin_rate: float = 0.0,
+    point_value: float = 1.0,
+    fractional: bool = True,
     prices: Optional[Dict[str, float]] = None,
     frames: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> Tuple[BacktestPortfolio, FakeQueue, FakeDataHandler]:
-    """Build a BacktestPortfolio with fake queue / data handler. Seeds latest prices if given."""
+    """Build a BacktestPortfolio with fake queue / data handler. Seeds latest prices if given.
+
+    ``leverage`` / ``maintenance_margin_rate`` build the per-symbol
+    ``PortfolioMarginModel``; ``point_value`` / ``fractional`` flow through the
+    uniform ``InstrumentConfig`` registry.
+    """
     q = FakeQueue()
     dh = FakeDataHandler(frames=frames)
+    margin = PortfolioMarginModel.from_leverage(
+        leverage, maintenance_margin_rate=maintenance_margin_rate,
+    )
+    instruments = uniform_registry(
+        list(symbols), point_value=point_value, fractional=fractional,
+        margin=margin,
+    )
     pf = BacktestPortfolio(
         events_queue=q,
         data_handler=dh,
         symbol_list=list(symbols),
+        instruments=instruments,
         initial_capital=capital,
-        leverage=leverage,
     )
     if prices:
         for sym, px in prices.items():
@@ -163,11 +179,96 @@ def test_init_seeds_cash_and_zero_positions():
     assert pf.pending_orders == {}
 
 
-def test_init_stores_leverage_and_symbol_list():
+def test_init_stores_instruments_and_symbol_list():
     pf, _, _ = _new_portfolio(symbols=('BTC', 'ETH'), capital=1.0, leverage=5.0)
-    assert pf.leverage == 5.0
     assert pf.symbol_list == ['BTC', 'ETH']
     assert pf.initial_capital == 1.0
+    assert set(pf.instruments) == {'BTC', 'ETH'}
+
+
+def test_init_rejects_symbol_missing_from_registry():
+    """Every traded symbol must have an InstrumentConfig."""
+    q = FakeQueue()
+    dh = FakeDataHandler()
+    instruments = uniform_registry(['BTC'])  # ETH absent
+    with pytest.raises(ValueError, match="missing config"):
+        BacktestPortfolio(
+            events_queue=q, data_handler=dh,
+            symbol_list=['BTC', 'ETH'], instruments=instruments,
+        )
+
+
+# ──────────────────────────────────────────────
+# point_value (contract multiplier) money path
+# ──────────────────────────────────────────────
+
+def test_unrealized_pnl_scales_by_point_value():
+    """A $1 move with point_value=1000 yields $1000 PnL per contract."""
+    pf, _, _ = _new_portfolio(capital=1_000_000.0, leverage=1.0, point_value=1000.0)
+    pf.update_fill(_fill(qty=2.0, direction=Direction.BUY, fill_price=50.0))
+    pf.update_bar(_bar(close=51.0))  # $1 move up
+    assert math.isclose(pf.unrealized_pnl['BTC'], 2.0 * 1000.0 * 1.0)
+
+
+def test_realized_pnl_scales_by_point_value():
+    pf, _, _ = _new_portfolio(capital=1_000_000.0, leverage=1.0, point_value=1000.0)
+    pf.update_fill(_fill(qty=1.0, direction=Direction.BUY, fill_price=50.0))
+    pf.update_fill(_fill(qty=1.0, direction=Direction.SELL, fill_price=51.0))
+    # realized = 1 * 1000 * (51 - 50) = 1000, booked into cash and realized_pnl.
+    assert math.isclose(pf.realized_pnl['BTC'], 1000.0)
+    assert math.isclose(pf.cash, 1_000_000.0 + 1000.0)
+    assert math.isclose(pf.trade_log[-1]['realized_pnl'], 1000.0)
+
+
+def test_margin_requirement_scales_by_point_value():
+    pf, _, _ = _new_portfolio(capital=1_000_000.0, leverage=10.0, point_value=1000.0,
+                              prices={'BTC': 50.0})
+    pf.update_fill(_fill(qty=2.0, direction=Direction.BUY, fill_price=50.0))
+    # margin = |2 * 1000 * 50| / 10 = 10_000
+    assert math.isclose(pf.margin_requirements['BTC'], 10_000.0)
+
+
+def test_reserved_margin_scales_by_point_value():
+    pf, _, _ = _new_portfolio(capital=1_000_000.0, leverage=10.0, point_value=1000.0,
+                              prices={'BTC': 50.0})
+    order = pf.submit_order('BTC', quantity=2.0, direction=Direction.BUY,
+                            timestamp=DEFAULT_TS, order_type=OrderType.MKT)
+    assert order is not None and math.isclose(order.quantity, 2.0)
+    # reserved = |2 * 1000 * 50| / 10 = 10_000
+    assert math.isclose(pf._reserved_margin(), 10_000.0)
+
+
+# ──────────────────────────────────────────────
+# fractional flag — whole-lot enforcement at submission
+# ──────────────────────────────────────────────
+
+def test_non_fractional_truncates_order_quantity_toward_zero():
+    pf, q, _ = _new_portfolio(capital=1_000_000.0, leverage=1.0, fractional=False,
+                              prices={'BTC': 100.0})
+    order = pf.submit_order('BTC', quantity=3.7, direction=Direction.BUY,
+                            timestamp=DEFAULT_TS, order_type=OrderType.MKT)
+    assert order is not None
+    assert order.quantity == 3.0  # truncated toward zero
+    assert q.items[0] is order
+
+
+def test_non_fractional_sub_one_lot_order_rejected():
+    pf, q, _ = _new_portfolio(capital=1_000_000.0, leverage=1.0, fractional=False,
+                              prices={'BTC': 100.0})
+    result = pf.submit_order('BTC', quantity=0.4, direction=Direction.BUY,
+                             timestamp=DEFAULT_TS, order_type=OrderType.MKT)
+    assert result is None  # 0.4 floors to 0 → can't trade a partial contract
+    assert q.items == []
+    assert pf.pending_orders == {}
+
+
+def test_fractional_instrument_keeps_fractional_quantity():
+    pf, q, _ = _new_portfolio(capital=1_000_000.0, leverage=1.0, fractional=True,
+                              prices={'BTC': 100.0})
+    order = pf.submit_order('BTC', quantity=3.7, direction=Direction.BUY,
+                            timestamp=DEFAULT_TS, order_type=OrderType.MKT)
+    assert order is not None
+    assert math.isclose(order.quantity, 3.7)  # crypto: fractional preserved
 
 
 # ──────────────────────────────────────────────
@@ -566,15 +667,19 @@ def test_submit_order_lmt_with_nan_price_returns_none():
     assert q.items == []
 
 
-def test_submit_order_lmt_with_zero_price_returns_none():
-    # Exact zero is rejected (margin scaling would divide-by-zero). Negative
-    # prices are allowed — see test_submit_order_lmt_with_negative_price_succeeds.
+def test_submit_order_lmt_with_zero_price_now_accepted():
+    # Exact zero is no longer rejected: the MarginModel owns the only
+    # divide-by-price and returns inf (no bound) at price 0, since a
+    # zero-priced position locks no margin. Only None / NaN are rejected
+    # (see test_submit_order_lmt_with_nan_price_returns_none). Negative prices
+    # are also allowed — see test_submit_order_lmt_with_negative_price_succeeds.
     pf, q, _ = _new_portfolio(prices={'BTC': 100.0})
     result = pf.submit_order('BTC', quantity=1.0, direction=Direction.BUY,
                              timestamp=DEFAULT_TS, order_type=OrderType.LMT,
                              price=0.0)
-    assert result is None
-    assert q.items == []
+    assert isinstance(result, OrderEvent)
+    assert result.price == 0.0
+    assert len(q.items) == 1 and q.items[0] is result
 
 
 def test_submit_order_lmt_with_negative_price_succeeds():
@@ -636,8 +741,8 @@ def test_calculate_new_margin_uses_new_position_notional():
     pf, _, _ = _new_portfolio(leverage=2.0)
     # baseline pos=0 -> BUY 2 @ 100 -> new_pos = 2 -> margin = 2*100/2 = 100
     assert math.isclose(
-        pf._calculate_new_margin(pos=0.0, qty=2.0, direction=Direction.BUY,
-                                 price=100.0),
+        pf._calculate_new_margin(symbol='BTC', pos=0.0, qty=2.0,
+                                 direction=Direction.BUY, price=100.0),
         100.0,
     )
 
@@ -650,8 +755,8 @@ def test_calculate_new_margin_uniform_for_mkt_and_lmt():
     pf, _, _ = _new_portfolio(leverage=1.0)
     # pos=-1, qty=2, BUY -> new_pos = 1 -> margin = 1 * 100 / 1 = 100 (no worst-case 200)
     assert math.isclose(
-        pf._calculate_new_margin(pos=-1.0, qty=2.0, direction=Direction.BUY,
-                                 price=100.0),
+        pf._calculate_new_margin(symbol='BTC', pos=-1.0, qty=2.0,
+                                 direction=Direction.BUY, price=100.0),
         100.0,
     )
 
@@ -962,6 +1067,71 @@ def test_check_solvency_triggers_on_negative_account_balance_via_update_bar():
     assert liq.direction == Direction.BUY  # closing the short
     assert math.isclose(liq.quantity, 1.0)  # full close
     assert liq.order_type == OrderType.MKT
+
+
+# ── Maintenance-margin call (the worked example) ──────────
+#
+# Setup throughout: capital=$1,000, leverage=10 (initial-margin rate 10%),
+# long $10,000 notional = 100 BTC @ $100. With maintenance_margin_rate=0.05
+# the liquidation boundary solves to ~-5.26% (price ~94.74); see plan.
+
+def test_margin_call_holds_just_above_maintenance_floor():
+    """A 5% drop leaves account_balance ($500) above the maintenance floor
+    ($475), so NO margin call fires."""
+    pf, q, _ = _new_portfolio(capital=1_000.0, leverage=10.0,
+                              maintenance_margin_rate=0.05,
+                              prices={'BTC': 100.0})
+    pf.positions['BTC'] = 100.0
+    pf.avg_cost['BTC'] = 100.0
+    pf.margin_requirements['BTC'] = 100.0  # 10000 * 0.1
+    pf.update_bar(_bar(close=95.0))
+    # account_balance = 1000 + 100*(95-100) = 500; maintenance = 10000*0.95*0.05 = 475
+    assert pf.account_balance == pytest.approx(500.0)
+    liq = [i for i in q.items if isinstance(i, OrderEvent) and i.is_liquidation]
+    assert liq == []
+    assert pf.positions['BTC'] == 100.0  # untouched
+
+
+def test_margin_call_triggers_below_maintenance_floor():
+    """A 6% drop pushes account_balance ($400) below the maintenance floor
+    ($470), firing a full-close liquidation — before equity reaches zero."""
+    pf, q, _ = _new_portfolio(capital=1_000.0, leverage=10.0,
+                              maintenance_margin_rate=0.05,
+                              prices={'BTC': 100.0})
+    pf.positions['BTC'] = 100.0
+    pf.avg_cost['BTC'] = 100.0
+    pf.margin_requirements['BTC'] = 100.0
+    pf.update_bar(_bar(close=94.0))
+    # account_balance = 1000 + 100*(94-100) = 400; maintenance = 9400*0.05 = 470
+    assert pf.account_balance == pytest.approx(400.0)
+    liq = [i for i in q.items if isinstance(i, OrderEvent) and i.is_liquidation]
+    assert len(liq) == 1
+    assert liq[0].symbol == 'BTC'
+    assert liq[0].direction == Direction.SELL  # closing the long
+    assert math.isclose(liq[0].quantity, 100.0)  # full close
+    assert liq[0].order_type == OrderType.MKT
+
+
+def test_zero_maintenance_rate_reproduces_legacy_wipeout_trigger():
+    """maintenance_margin_rate=0 -> floor 0 -> liquidate only at
+    account_balance < 0. The same 6% drop that triggered above is HELD here;
+    liquidation waits until equity actually goes negative (~10% drop)."""
+    pf, q, _ = _new_portfolio(capital=1_000.0, leverage=10.0,
+                              maintenance_margin_rate=0.0,
+                              prices={'BTC': 100.0})
+    pf.positions['BTC'] = 100.0
+    pf.avg_cost['BTC'] = 100.0
+    pf.margin_requirements['BTC'] = 100.0
+    pf.update_bar(_bar(close=94.0))
+    assert pf.account_balance == pytest.approx(400.0)
+    liq = [i for i in q.items if isinstance(i, OrderEvent) and i.is_liquidation]
+    assert liq == []  # legacy trigger (account_balance < 0) not breached
+    # Crash to 89: account_balance = 1000 + 100*(89-100) = -100 < 0 -> fires.
+    pf.update_bar(_bar(close=89.0))
+    assert pf.account_balance == pytest.approx(-100.0)
+    liq = [i for i in q.items if isinstance(i, OrderEvent) and i.is_liquidation]
+    assert len(liq) == 1
+    assert liq[0].direction == Direction.SELL
 
 
 def test_check_solvency_cancels_non_liquidation_pending_fifo():
