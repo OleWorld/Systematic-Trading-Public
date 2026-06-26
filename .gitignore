@@ -100,12 +100,14 @@ tmp/
 
 # Local research material (PDFs, transcripts)
 references/
+results/
 
 # Internal project notes (kept out of the public repo)
 CLAUDE.md
 CLAUDE.html
 DESIGN_FLOW_CHART.md
 docs/
+debug.ipynb
 
 # OS
 .DS_Store
