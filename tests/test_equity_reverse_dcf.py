@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from equity import ReverseDCFResult, reverse_dcf_cagr
+from equity import ReverseDCFResult, Segment, reverse_dcf_cagr
 
 
 # ──────────────────────────────────────────────
@@ -577,3 +577,433 @@ def test_rejects_non_numeric_axis_value():
 def test_rejects_inverted_cagr_bounds():
     with pytest.raises(ValueError, match="cagr_bounds"):
         reverse_dcf_cagr(**_valid_kwargs(cagr_bounds=(1.0, -1.0)))
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Multi-segment ("swing segment") reverse DCF
+# ══════════════════════════════════════════════════════════════════════
+
+# Independent golden forward model summed over segments. Each segment is a
+# (revenue_share, fcf_margin, growth) tuple; deliberately a separate plain
+# implementation so it stays a golden reference, not a re-use of internals.
+def _forward_price_segments(
+    *,
+    base_revenue,
+    segments,
+    wacc,
+    terminal_growth,
+    horizon,
+    net_debt,
+    shares_outstanding,
+):
+    """Plain multi-segment two-stage FCFF implied price per share."""
+    pv = 0.0
+    fcf_n = 0.0
+    for share, margin, growth in segments:
+        rev0_margin = base_revenue * share * margin
+        for t in range(1, horizon + 1):
+            pv += rev0_margin * (1 + growth) ** t / (1 + wacc) ** t
+        fcf_n += rev0_margin * (1 + growth) ** horizon
+    tv_n = fcf_n * (1 + terminal_growth) / (wacc - terminal_growth)
+    pv += tv_n / (1 + wacc) ** horizon
+    return (pv - net_debt) / shares_outstanding
+
+
+# Company-level consensus assumptions (no fcf_margin — that is per segment).
+_SEG_GLOBALS = dict(
+    shares_outstanding=500.0,
+    base_revenue=1000.0,
+    wacc=0.09,
+    terminal_growth=0.025,
+    horizon=10,
+    net_debt=200.0,
+)
+
+
+def _ai_mobile():
+    """A valid 2-segment book: AI (swing) 10 % + mobile (fixed @2.5 %) 90 %."""
+    return [
+        Segment('AI', 0.10, 0.20, None),       # swing: growth solved
+        Segment('mobile', 0.90, 0.12, 0.025),  # fixed
+    ]
+
+
+# ── Swing round-trip correctness ──────────────────────────────────────
+
+def test_swing_round_trip_recovers_known_ai_growth():
+    """Price the book at a known AI growth g*, reverse it, recover g* (in %)."""
+    g_star = 0.30
+    price = _forward_price_segments(
+        segments=[(0.10, 0.20, g_star), (0.90, 0.12, 0.025)], **_SEG_GLOBALS
+    )
+    res = reverse_dcf_cagr(
+        market_price=price,
+        segments=_ai_mobile(),
+        axis_a='wacc',
+        axis_a_values=[0.09],
+        axis_b='AI.fcf_margin',
+        axis_b_values=[0.18, 0.20, 0.22],
+        **_SEG_GLOBALS,
+    )
+    assert res.swing_segment == 'AI'
+    # wacc 0.09 → 9.0; AI margin 0.20 → 20.0 (rate-like dotted axis in %).
+    assert res.consensus_cell == (9.0, 20.0)
+    assert res.consensus_cagr == pytest.approx(g_star * 100, abs=1e-4)
+
+
+def test_single_segment_matches_flat_call_exactly():
+    """A one-segment book (share 1.0) reproduces the flat fcf_margin heatmap."""
+    price = _forward_price(0.08, **_BASE)  # _BASE carries fcf_margin=0.15
+    grid = dict(
+        market_price=price,
+        axis_a='wacc',
+        axis_a_values=[0.08, 0.09, 0.10],
+        axis_b='terminal_growth',
+        axis_b_values=[0.02, 0.025, 0.03],
+    )
+    res_flat = reverse_dcf_cagr(**grid, **_BASE)
+    res_seg = reverse_dcf_cagr(
+        **grid,
+        segments=[Segment('co', 1.0, 0.15, None)],
+        **_base_without_margin(),
+    )
+    pd.testing.assert_frame_equal(res_seg.heatmap, res_flat.heatmap)
+    assert res_seg.swing_segment == 'co'
+    assert res_flat.swing_segment is None
+
+
+# ── Fixed-segment growth as a sweep axis ──────────────────────────────
+
+def test_pinned_mobile_growth_axis_moves_implied_ai_growth():
+    """Higher pinned mobile growth ⇒ AI needs less growth for the same price."""
+    g_star = 0.30
+    price = _forward_price_segments(
+        segments=[(0.10, 0.20, g_star), (0.90, 0.12, 0.025)], **_SEG_GLOBALS
+    )
+    res = reverse_dcf_cagr(
+        market_price=price,
+        segments=_ai_mobile(),
+        axis_a='mobile.growth',
+        axis_a_values=[0.02, 0.025, 0.03],
+        axis_b='wacc',
+        axis_b_values=[0.09],
+        **_SEG_GLOBALS,
+    )
+    # Down the index (mobile growth ascending): implied AI growth falls.
+    col = res.heatmap[9.0].dropna()
+    assert col.is_monotonic_decreasing
+    # At consensus mobile growth (2.5 %) the AI implied growth is g*.
+    assert res.heatmap.loc[2.5, 9.0] == pytest.approx(g_star * 100, abs=1e-4)
+
+
+# ── Revenue-mix sweep + N-general renormalization ─────────────────────
+
+def test_revenue_share_sweep_renormalizes_other_segments():
+    """Each solved cell reprices when the other segments renormalize (3-seg)."""
+    g_star = 0.30
+    fwd = [(0.10, 0.20, g_star), (0.60, 0.12, 0.025), (0.30, 0.15, 0.05)]
+    price = _forward_price_segments(segments=fwd, **_SEG_GLOBALS)
+    res = reverse_dcf_cagr(
+        market_price=price,
+        segments=[
+            Segment('AI', 0.10, 0.20, None),
+            Segment('mobile', 0.60, 0.12, 0.025),
+            Segment('networks', 0.30, 0.15, 0.05),
+        ],
+        axis_a='AI.revenue_share',
+        axis_a_values=[0.08, 0.10, 0.15],
+        axis_b='wacc',
+        axis_b_values=[0.09],
+        cagr_bounds=(-0.5, 2.0),
+        **_SEG_GLOBALS,
+    )
+    old_ai = 0.10
+    for s_pct in res.heatmap.index:                 # 8.0, 10.0, 15.0
+        g_pct = res.heatmap.loc[s_pct, 9.0]
+        assert not math.isnan(g_pct)
+        s = s_pct / 100
+        factor = (1 - s) / (1 - old_ai)             # proportional renorm
+        recomputed = _forward_price_segments(
+            segments=[
+                (s, 0.20, g_pct / 100),
+                (0.60 * factor, 0.12, 0.025),
+                (0.30 * factor, 0.15, 0.05),
+            ],
+            **_SEG_GLOBALS,
+        )
+        assert recomputed == pytest.approx(price, rel=1e-6)
+    # Consensus mix (AI 10 %) recovers g*.
+    assert res.heatmap.loc[10.0, 9.0] == pytest.approx(g_star * 100, abs=1e-4)
+
+
+def test_out_of_range_revenue_share_cell_is_nan():
+    """A swept share of 0 leaves no room for the swing → NaN (does not raise)."""
+    g_star = 0.30
+    price = _forward_price_segments(
+        segments=[(0.10, 0.20, g_star), (0.90, 0.12, 0.025)], **_SEG_GLOBALS
+    )
+    res = reverse_dcf_cagr(
+        market_price=price,
+        segments=_ai_mobile(),
+        axis_a='AI.revenue_share',
+        axis_a_values=[0.0, 0.10, 0.20],   # 0.0 is infeasible
+        axis_b='wacc',
+        axis_b_values=[0.09],
+        cagr_bounds=(-0.5, 2.0),
+        **_SEG_GLOBALS,
+    )
+    assert math.isnan(res.heatmap.loc[0.0, 9.0])
+    assert not math.isnan(res.heatmap.loc[10.0, 9.0])
+
+
+# ── Dotted-axis display + labelling ───────────────────────────────────
+
+def test_segment_margin_axis_labelled_in_percent():
+    """A '<seg>.fcf_margin' axis labels in percentage points and styled() adds %."""
+    g_star = 0.30
+    price = _forward_price_segments(
+        segments=[(0.10, 0.20, g_star), (0.90, 0.12, 0.025)], **_SEG_GLOBALS
+    )
+    res = reverse_dcf_cagr(
+        market_price=price,
+        segments=_ai_mobile(),
+        axis_a='AI.fcf_margin',
+        axis_a_values=[0.18, 0.20, 0.22],
+        axis_b='wacc',
+        axis_b_values=[0.09],
+        **_SEG_GLOBALS,
+    )
+    assert list(res.heatmap.index) == [18.0, 20.0, 22.0]   # margin → percent
+    assert res.heatmap.index.name == 'AI.fcf_margin'
+    html = res.styled().to_html()
+    assert '20.0%' in html
+    assert 'AI growth' in html                              # caption names swing
+
+
+# ── Axis rejection in segment mode ────────────────────────────────────
+
+def test_rejects_sweeping_swing_segment_growth():
+    with pytest.raises(ValueError, match="cannot sweep the swing"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=_ai_mobile(),
+            axis_a='AI.growth',
+            axis_a_values=[0.2, 0.3],
+            axis_b='wacc',
+            axis_b_values=[0.09],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_bare_fcf_margin_axis_in_segment_mode():
+    with pytest.raises(ValueError, match="segment mode"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=_ai_mobile(),
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='fcf_margin',
+            axis_b_values=[0.20],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_unknown_segment_in_axis():
+    with pytest.raises(ValueError, match="unknown segment"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=_ai_mobile(),
+            axis_a='cloud.fcf_margin',
+            axis_a_values=[0.20],
+            axis_b='wacc',
+            axis_b_values=[0.09],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_bad_segment_field_in_axis():
+    with pytest.raises(ValueError, match="field must be one of"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=_ai_mobile(),
+            axis_a='AI.foo',
+            axis_a_values=[0.20],
+            axis_b='wacc',
+            axis_b_values=[0.09],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_dotted_axis_without_segments():
+    with pytest.raises(ValueError, match="require segments"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            axis_a='AI.fcf_margin',
+            axis_a_values=[0.20],
+            axis_b='wacc',
+            axis_b_values=[0.09],
+            **_BASE,  # single-segment (carries fcf_margin)
+        )
+
+
+# ── Segment-list validation ───────────────────────────────────────────
+
+def test_rejects_shares_not_summing_to_one():
+    with pytest.raises(ValueError, match="sum to 1.0"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=[Segment('AI', 0.10, 0.20, None), Segment('mobile', 0.80, 0.12, 0.025)],
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='AI.fcf_margin',
+            axis_b_values=[0.20],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_no_swing_segment():
+    with pytest.raises(ValueError, match="exactly one segment must have growth=None"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=[Segment('AI', 0.10, 0.20, 0.30), Segment('mobile', 0.90, 0.12, 0.025)],
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='AI.fcf_margin',
+            axis_b_values=[0.20],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_two_swing_segments():
+    with pytest.raises(ValueError, match="exactly one segment must have growth=None"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=[Segment('AI', 0.10, 0.20, None), Segment('mobile', 0.90, 0.12, None)],
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='AI.fcf_margin',
+            axis_b_values=[0.20],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_segment_name_with_dot():
+    with pytest.raises(ValueError, match="must not contain"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=[Segment('A.I', 0.10, 0.20, None), Segment('mobile', 0.90, 0.12, 0.025)],
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='wacc',
+            axis_b_values=[0.09],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_duplicate_segment_name():
+    with pytest.raises(ValueError, match="duplicate segment name"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=[Segment('AI', 0.10, 0.20, None), Segment('AI', 0.90, 0.12, 0.025)],
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='AI.fcf_margin',
+            axis_b_values=[0.20],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_reserved_segment_name():
+    with pytest.raises(ValueError, match="reserved axis name"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=[Segment('wacc', 0.10, 0.20, None), Segment('mobile', 0.90, 0.12, 0.025)],
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='mobile.fcf_margin',
+            axis_b_values=[0.12],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_share_out_of_range():
+    with pytest.raises(ValueError, match="revenue_share must be in"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=[Segment('AI', 1.5, 0.20, None), Segment('mobile', 0.90, 0.12, 0.025)],
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='AI.fcf_margin',
+            axis_b_values=[0.20],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_zero_swing_margin():
+    with pytest.raises(ValueError, match="non-zero fcf_margin"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=[Segment('AI', 0.10, 0.0, None), Segment('mobile', 0.90, 0.12, 0.025)],
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='mobile.fcf_margin',
+            axis_b_values=[0.12],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_empty_segments_list():
+    with pytest.raises(ValueError, match="non-empty"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=[],
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='wacc',
+            axis_b_values=[0.09],
+            **_SEG_GLOBALS,
+        )
+
+
+def test_rejects_top_level_margin_with_segments():
+    with pytest.raises(ValueError, match="top-level fcf_margin"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            fcf_margin=0.15,           # not allowed alongside segments
+            segments=_ai_mobile(),
+            axis_a='wacc',
+            axis_a_values=[0.09],
+            axis_b='AI.fcf_margin',
+            axis_b_values=[0.20],
+            **_SEG_GLOBALS,
+        )
+
+
+# ── Percent-typo guardrail extends to segment inputs ──────────────────
+
+def test_warns_when_segment_growth_axis_looks_like_percents():
+    with pytest.warns(UserWarning, match="must be fractions"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=_ai_mobile(),
+            axis_a='mobile.growth',
+            axis_a_values=[2, 3],      # percents, not fractions
+            axis_b='wacc',
+            axis_b_values=[0.09],
+            cagr_bounds=(-0.5, 2.0),
+            **_SEG_GLOBALS,
+        )
+
+
+def test_warns_when_revenue_share_axis_looks_like_percents():
+    with pytest.warns(UserWarning, match="must be fractions"):
+        reverse_dcf_cagr(
+            market_price=10.0,
+            segments=_ai_mobile(),
+            axis_a='AI.revenue_share',
+            axis_a_values=[5, 10],     # percents, not fractions
+            axis_b='wacc',
+            axis_b_values=[0.09],
+            cagr_bounds=(-0.5, 2.0),
+            **_SEG_GLOBALS,
+        )
