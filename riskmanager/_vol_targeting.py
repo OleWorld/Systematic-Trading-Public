@@ -8,13 +8,13 @@ give the size:
     # vol_target_mode='dollar_volatility' (default — institutional futures
     # convention: a fixed annual $ vol budget, like a drawdown limit that
     # resets yearly instead of compounding with the account):
-    annual_cash_target = IDM × strategy_weight × instrument_weight
+    annual_cash_target = IDM × instrument_weight
                                 × annual_target_vol × (forecast / TARGET_AVG_ABS_FORECAST)
 
     # vol_target_mode='percent_volatility' (Carver's original form — the
     # vol budget is a fraction of *current* account equity, so position
     # sizes compound as the account grows/shrinks):
-    annual_cash_target = capital × IDM × strategy_weight × instrument_weight
+    annual_cash_target = capital × IDM × instrument_weight
                                 × annual_target_vol × (forecast / TARGET_AVG_ABS_FORECAST)
 
     daily_cash_target  = annual_cash_target / sqrt(days_per_year)
@@ -24,7 +24,6 @@ give the size:
 where:
     capital                = portfolio.calculate_balance()              (account equity)
     IDM                    = instrument diversification multiplier      (constructor)
-    strategy_weight        = per-strategy capital weight                (self.strategy_weight)
     instrument_weight      = per-symbol capital weight                  (self.instrument_weight)
     annual_target_vol  = annualized vol target                      (constructor; REQUIRED —
                              $ amount in dollar mode, e.g. 250_000;
@@ -56,16 +55,19 @@ Carver's vol-target notional. At ``|forecast| = FORECAST_CAP`` (= 2 ×
 target by design) the factor is 2.0, doubling the size. At
 ``forecast = 0`` the target is zero (flat).
 
-Weights are owned by the risk manager (no external allocator
+Instrument weights are owned by the risk manager (no external allocator
 dependency). ``self.instrument_weight: Dict[str, float]`` spreads
 capital across symbols and defaults to equal-weight ``1/N`` across
-``strategy.symbol_list``. ``self.strategy_weight: Dict[str, float]``
-spreads capital across strategies and is a placeholder today —
-``{strategy_class_name: 1.0}`` for the single bound strategy. Both
-dicts are populated at ``__init__`` by ``calculate_instrument_weight()``
-/ ``calculate_strategy_weight()``; either method can be re-called later
-(or its dict overwritten directly) to refresh weights — e.g. monthly
-rebalances, correlation-driven weight schemes — without per-bar wiring.
+``strategy.symbol_list``; it is populated at ``__init__`` by
+``calculate_instrument_weight()``, which can be re-called later (or the
+dict overwritten directly) to refresh weights — e.g. monthly rebalances,
+correlation-driven weight schemes — without per-bar wiring. **Strategy
+weighting is not a risk-manager concern**: with multiple strategies an
+``orchestrator.Orchestrator`` owns the per-strategy weights and bakes
+them into the single combined forecast it hands the risk manager (the
+``strategy`` parameter accepts a single ``Strategy`` or an
+``Orchestrator`` interchangeably). The risk manager's job is purely
+forecast → order quantity.
 
 **Universe liveness gating**: with staggered listings, symbols do not
 share the full price history, so weights are computed over the **live
@@ -130,7 +132,7 @@ position matches the target.
 
 import datetime
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -145,7 +147,8 @@ from analytics import (
 from data import get_period_start
 from event import BarEvent, OrderType, Direction
 from riskmanager._base import (
-    RiskManager, _DataHandlerLike, _PortfolioLike, _StrategyLike,
+    RiskManager, _DataHandlerLike, _OrchestratorLike, _PortfolioLike,
+    _StrategyLike,
 )
 from strategy import Strategy
 from volatility import VolEstimator
@@ -162,7 +165,7 @@ _MIN_CORR_OBS = 30
 class VolTargetingRiskManager(RiskManager):
     """Forecast-aware cash-vol-targeting sizer (Carver's framework).
 
-    Owns two weight dicts:
+    Owns one weight dict:
 
     - ``instrument_weight``: per-symbol capital weight, populated at
       construction by ``calculate_instrument_weight()`` (default 1/N
@@ -170,12 +173,13 @@ class VolTargetingRiskManager(RiskManager):
       ``'risk_parity'`` derived inline from a trailing window of
       returns pulled from ``self.data_handler`` and optimized by the
       ``analytics`` portfolio optimizers).
-    - ``strategy_weight``: per-strategy capital weight, populated at
-      construction by ``calculate_strategy_weight()`` (default
-      ``{strategy_class_name: 1.0}`` — placeholder until multi-strategy
-      lands).
 
-    Either ``calculate_*`` method can be re-called or its dict
+    Strategy weighting is **not** a risk-manager concern — an
+    ``orchestrator.Orchestrator`` (passed in the ``strategy`` slot in
+    place of a single ``Strategy``) owns the per-strategy weights and
+    bakes them into the combined forecast.
+
+    ``calculate_instrument_weight`` can be re-called or its dict
     overwritten directly to refresh weights without per-bar wiring.
     With a corr-based mode (``'min_variance'`` / ``'risk_parity'``)
     and ``corr_step_size > 0``,
@@ -190,7 +194,7 @@ class VolTargetingRiskManager(RiskManager):
     completed bar appends one row to ``self._records[symbol]`` and emits
     a DEBUG log line. Columns capture all sizing inputs and
     intermediates (``forecast``, ``sigma``, ``instrument_weight``,
-    ``strategy_weight``, ``capital``, ``idm``, ``annual_target_vol``,
+    ``capital``, ``idm``, ``annual_target_vol``,
     ``position_buffer``, ``annual_cash_target``, ``target_qty``,
     ``current_qty``, ``trade_qty``, ``buffer_threshold``) plus
     ``submitted`` (bool) and ``skip_reason`` — ``None`` when an order
@@ -214,7 +218,7 @@ class VolTargetingRiskManager(RiskManager):
     def __init__(
         self,
         portfolio: _PortfolioLike,
-        strategy: _StrategyLike,
+        strategy: Union[_StrategyLike, _OrchestratorLike],
         vol_estimator: VolEstimator,
         data_handler: _DataHandlerLike,
         instruments: Optional[Dict[str, "InstrumentConfig"]] = None,
@@ -237,9 +241,12 @@ class VolTargetingRiskManager(RiskManager):
         portfolio
             Portfolio surface (positions, balance, submit_order).
         strategy
-            Strategy exposing ``get_forecast(symbol)`` and ``symbol_list``.
-            Read on every completed bar (forecast) and at construction
-            (symbol_list, for the equal-weight default).
+            Forecast source — a single ``Strategy`` or a multi-strategy
+            ``orchestrator.Orchestrator`` (both expose
+            ``get_forecast(symbol)``, ``symbol_list`` and
+            ``is_warmed_up(symbol)``). Read on every completed bar
+            (forecast) and at construction (symbol_list, for the
+            equal-weight default).
         vol_estimator
             ``VolEstimator`` providing ``get_annual_vol(symbol)`` in
             price (cash) units. Updated by ``update_bar`` on every
@@ -518,14 +525,13 @@ class VolTargetingRiskManager(RiskManager):
         self._periods_since_recalc: int = 0
         self._last_seen_period_start: Optional[datetime.datetime] = None
 
-        # Per-symbol / per-strategy capital weights. Populated by the
-        # ``calculate_*`` methods below; either may be re-called or its
+        # Per-symbol capital weights. Populated by
+        # ``calculate_instrument_weight`` below; may be re-called or the
         # dict overwritten directly to refresh weights without per-bar
-        # wiring.
+        # wiring. (Strategy weighting is owned by the orchestrator, not
+        # the risk manager.)
         self.instrument_weight: Dict[str, float] = {}
-        self.strategy_weight: Dict[str, float] = {}
         self.calculate_instrument_weight()
-        self.calculate_strategy_weight()
 
     def _data_gate_met(self, symbol: str) -> bool:
         """True once ``symbol`` carries the full ``corr_lookback`` bars at
@@ -864,17 +870,6 @@ class VolTargetingRiskManager(RiskManager):
             idm = min(idm, self.idm_cap)
         self.idm = idm
 
-    def calculate_strategy_weight(self) -> None:
-        """Populate ``self.strategy_weight`` with the single-strategy placeholder.
-
-        ``analytics.equal_weight`` over the one bound strategy —
-        ``{strategy_class_name: 1.0}``. Will become a real ``1/M`` (or
-        correlation-driven) allocation once the risk manager holds
-        multiple strategies. Mutates in place; safe to re-call any time.
-        """
-        name = self.strategy.__class__.__name__
-        self.strategy_weight = equal_weight([name])
-
     def update_bar(self, event: BarEvent) -> None:
         """Update sizing inputs and resize the position to the Carver target.
 
@@ -930,7 +925,6 @@ class VolTargetingRiskManager(RiskManager):
             'forecast': forecast,
             'sigma': None,
             'instrument_weight': None,
-            'strategy_weight': None,
             'capital': capital,
             'idm': self.idm,
             'annual_target_vol': self.annual_target_vol,
@@ -986,13 +980,13 @@ class VolTargetingRiskManager(RiskManager):
         # flat; otherwise the dead-band collapses to zero and any nonzero
         # current position triggers a flatten via the submit path.
         if abs(trade_qty) < 1e-12:                # already at target
-            # When the zero came from a zero weight (rather than a genuine
-            # at-target), surface it as 'zero_weight' — more informative
-            # than 'at_target' (the position is flat *because* it carries
-            # no weight). Both factors are populated floats here: a symbol
-            # absent from instrument_weight returned earlier with a
-            # warmup_* reason.
-            if row['instrument_weight'] == 0 or row['strategy_weight'] == 0:
+            # When the zero came from a zero instrument weight (rather than
+            # a genuine at-target), surface it as 'zero_weight' — more
+            # informative than 'at_target' (the position is flat *because*
+            # it carries no weight). instrument_weight is a populated float
+            # here: a symbol absent from instrument_weight returned earlier
+            # with a warmup_* reason.
+            if row['instrument_weight'] == 0:
                 row['skip_reason'] = 'zero_weight'
             else:
                 row['skip_reason'] = 'at_target'
@@ -1016,7 +1010,7 @@ class VolTargetingRiskManager(RiskManager):
         """Carver cash-vol target-qty pipeline.
 
         target_qty = annual_cash_target / annual_price_vol, where
-        annual_cash_target = IDM × strategy_weight × instrument_weight
+        annual_cash_target = IDM × instrument_weight
         × annual_target_vol × (forecast / TARGET_AVG_ABS_FORECAST),
         additionally scaled by ``capital`` (current account equity) under
         ``vol_target_mode='percent_volatility'`` — see the module
@@ -1025,8 +1019,8 @@ class VolTargetingRiskManager(RiskManager):
         Owns the *target-derivation* skip ladder: ``'warmup_volatility'``
         (sigma not ready) / ``'zero_vol'`` / the universe warmup labels
         from ``_classify_warmup_reason`` (``'warmup_forecast'`` /
-        ``'warmup_correlation'`` / ``'warmup_weight'``). A zero combined
-        weight (``iw * sw == 0``) is **not** a skip — it returns
+        ``'warmup_correlation'`` / ``'warmup_weight'``). A zero instrument
+        weight (``iw == 0``) is **not** a skip — it returns
         ``target_qty = 0`` (with ``skip_reason`` left ``None``) so a held
         position is flattened by ``update_bar``'s submit path and a flat
         one is relabelled ``'zero_weight'`` there. The returned dict is
@@ -1039,7 +1033,7 @@ class VolTargetingRiskManager(RiskManager):
         out: Dict[str, Any] = {
             'target_qty': None, 'skip_reason': None,
             'sigma': None, 'instrument_weight': None,
-            'strategy_weight': None, 'annual_cash_target': None,
+            'annual_cash_target': None,
         }
 
         sigma = self.vol_estimator.get_annual_vol(symbol)
@@ -1059,13 +1053,11 @@ class VolTargetingRiskManager(RiskManager):
             out['skip_reason'] = self._classify_warmup_reason(symbol)
             return out
         iw = self.instrument_weight[symbol]
-        sw = self.strategy_weight.get(self.strategy.__class__.__name__, 0.0)
         out['instrument_weight'] = iw
-        out['strategy_weight'] = sw
-        if iw * sw == 0:
-            # A zero instrument or strategy weight means a target of 0 —
-            # NOT a reason to skip. Flow through as target_qty=0 so a held
-            # position is flattened by the normal submit path (exactly like
+        if iw == 0:
+            # A zero instrument weight means a target of 0 — NOT a reason
+            # to skip. Flow through as target_qty=0 so a held position is
+            # flattened by the normal submit path (exactly like
             # forecast=0), instead of being silently stranded. ``update_bar``
             # relabels the flat case as 'zero_weight' for diagnostics.
             out['annual_cash_target'] = 0.0
@@ -1079,7 +1071,7 @@ class VolTargetingRiskManager(RiskManager):
             # account.
             capital = self.portfolio.calculate_balance()
             annual_cash_target = (
-                capital * self.idm * sw * iw * self.annual_target_vol
+                capital * self.idm * iw * self.annual_target_vol
                 * (forecast / Strategy.TARGET_AVG_ABS_FORECAST)
             )
         elif self.vol_target_mode == 'dollar_volatility':
@@ -1087,7 +1079,7 @@ class VolTargetingRiskManager(RiskManager):
             # futures convention: the risk limit is a dollar number, not
             # a compounding fraction of equity).
             annual_cash_target = (
-                self.idm * sw * iw * self.annual_target_vol
+                self.idm * iw * self.annual_target_vol
                 * (forecast / Strategy.TARGET_AVG_ABS_FORECAST)
             )
         else:
@@ -1107,10 +1099,10 @@ class VolTargetingRiskManager(RiskManager):
         super()._record_row(symbol, row)
         action = 'submit' if row['submitted'] else row['skip_reason']
         logger.debug(
-            "[CARVER] %s fc=%s sigma=%s iw=%s sw=%s cap=%.2f "
+            "[CARVER] %s fc=%s sigma=%s iw=%s cap=%.2f "
             "target=%s cur=%.6f trade=%s action=%s",
             symbol, row['forecast'], row['sigma'],
-            row['instrument_weight'], row['strategy_weight'],
+            row['instrument_weight'],
             row['capital'], row['target_qty'], row['current_qty'],
             row['trade_qty'], action,
         )

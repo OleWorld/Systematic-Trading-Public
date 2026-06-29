@@ -3,9 +3,10 @@ Unit tests for ``VolTargetingRiskManager``.
 
 Pin:
 - Golden cash-vol formula:
-    target_qty = (capital * idm * sw * iw * annual_target_vol * (forecast/50)) / sigma
-  where ``sigma`` is the annualized stdev of price changes ($-vol),
-  ``sw`` = strategy_weight, ``iw`` = instrument_weight.
+    target_qty = (capital * idm * iw * annual_target_vol * (forecast/50)) / sigma
+  where ``sigma`` is the annualized stdev of price changes ($-vol) and
+  ``iw`` = instrument_weight. (Strategy weighting is owned by the
+  orchestrator, not the risk manager.)
 - Direction sign comes from ``trade_qty``.
 - Skip-on-warmup: vol estimator returns None → no order.
 - Skip-on-zero-vol.
@@ -14,7 +15,7 @@ Pin:
   order (the second call sees the realized position at target).
 - Position buffer (Carver §10.7) dead-band.
 - Constructor validation (idm, annual_target_vol, position_buffer ranges).
-- Built-in instrument / strategy weight defaults + recalc.
+- Built-in instrument weight defaults + recalc.
 
 Run from the repo root:  pytest tests/test_riskmanager_vol_targeting.py -v
 """
@@ -416,17 +417,6 @@ def test_instrument_weight_default_is_equal_weight_three_symbols():
     assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
 
 
-def test_strategy_weight_default_is_one_for_single_strategy():
-    """Placeholder: ``{strategy_class_name: 1.0}`` for the one bound strategy."""
-    pf = FakePortfolio()
-    strat = FakeStrategy(symbol_list=['BTC'])
-    rm = VolTargetingRiskManager(
-        pf, strat, FakeVolEstimator(), data_handler=FakeDataHandler(),
-        annual_target_vol=0.25,
-    )
-    assert rm.strategy_weight == {'FakeStrategy': 1.0}
-
-
 def test_calculate_instrument_weight_is_recallable_after_symbol_list_change():
     pf = FakePortfolio()
     strat = FakeStrategy(symbol_list=['BTC'])
@@ -444,26 +434,14 @@ def test_calculate_instrument_weight_is_recallable_after_symbol_list_change():
     assert math.isclose(rm.instrument_weight['ETH'], 0.5)
 
 
-def test_calculate_strategy_weight_is_recallable():
-    pf = FakePortfolio()
-    strat = FakeStrategy(symbol_list=['BTC'])
-    rm = VolTargetingRiskManager(
-        pf, strat, FakeVolEstimator(), data_handler=FakeDataHandler(),
-        annual_target_vol=0.25,
-    )
-    rm.strategy_weight = {'OverriddenName': 0.7}
-    rm.calculate_strategy_weight()
-    assert rm.strategy_weight == {'FakeStrategy': 1.0}
-
-
 # ──────────────────────────────────────────────
 # Golden Carver cash-vol formula
 # ──────────────────────────────────────────────
 
 def test_golden_carver_formula():
-    """Capital=100k, idm=1, sw=1.0, iw=0.5, annual_target_vol=0.25,
+    """Capital=100k, idm=1, iw=0.5, annual_target_vol=0.25,
     sigma=$8000 ($-vol), forecast=+50 →
-       annual_cash_target = 100k * 1 * 1 * 0.5 * 0.25 * (50/50) = 12_500
+       annual_cash_target = 100k * 1 * 0.5 * 0.25 * (50/50) = 12_500
        target_qty         = 12_500 / 8_000 = 1.5625.
     From 0 → BUY 1.5625."""
     pf, _, _, rm = _make()
@@ -684,17 +662,6 @@ def test_instrument_weight_scales_target_linearly():
                         2.0 * pf1.submitted[0]['quantity'], rel_tol=1e-12)
 
 
-def test_strategy_weight_scales_target_linearly():
-    """Halving strategy_weight halves the target quantity."""
-    pf1, _, _, rm1 = _make()
-    rm1.update_bar(_bar())
-    pf2, _, _, rm2 = _make()
-    rm2.strategy_weight = {'FakeStrategy': 0.5}
-    rm2.update_bar(_bar())
-    assert math.isclose(pf2.submitted[0]['quantity'],
-                        0.5 * pf1.submitted[0]['quantity'], rel_tol=1e-12)
-
-
 # ──────────────────────────────────────────────
 # Skip conditions
 # ──────────────────────────────────────────────
@@ -727,15 +694,6 @@ def test_skip_when_instrument_weight_is_zero():
     assert row['skip_reason'] == 'zero_weight'
 
 
-def test_skip_when_strategy_weight_is_zero():
-    pf, _, _, rm = _make()
-    rm.strategy_weight = {'FakeStrategy': 0.0}
-    rm.update_bar(_bar())
-    assert pf.submitted == []
-    row = rm.get_records('BTC').iloc[0]
-    assert row['skip_reason'] == 'zero_weight'
-
-
 # ──────────────────────────────────────────────
 # A skip must never orphan a HELD position
 # ──────────────────────────────────────────────
@@ -755,18 +713,6 @@ def test_held_position_zero_instrument_weight_is_flattened():
     assert row['submitted']
     assert row['skip_reason'] is None
     assert row['target_qty'] == 0.0
-
-
-def test_held_position_zero_strategy_weight_is_flattened():
-    """Same invariant via a zero *strategy* weight on a held short — the
-    diff back to flat is a BUY of the (absolute) position size."""
-    pf, _, _, rm = _make(positions={'BTC': -2.0})
-    rm.strategy_weight = {'FakeStrategy': 0.0}
-    rm.update_bar(_bar())
-    assert len(pf.submitted) == 1
-    order = pf.submitted[0]
-    assert order['direction'] == Direction.BUY
-    assert math.isclose(order['quantity'], 2.0)
 
 
 def test_flat_position_zero_weight_still_labelled_zero_weight():
@@ -926,7 +872,6 @@ def test_record_skip_reason_warmup_volatility():
     assert not row['submitted']
     assert row['sigma'] is None
     assert row['instrument_weight'] is None       # not read on warmup
-    assert row['strategy_weight'] is None         # not read on warmup
     assert row['target_qty'] is None
     assert row['trade_qty'] is None
     assert pf.submitted == []
@@ -940,7 +885,6 @@ def test_record_skip_reason_zero_vol():
     assert not row['submitted']
     assert row['sigma'] == 0.0
     assert row['instrument_weight'] is None       # not read after zero-vol skip
-    assert row['strategy_weight'] is None
     assert row['target_qty'] is None
     assert pf.submitted == []
 
@@ -952,25 +896,12 @@ def test_record_skip_reason_zero_weight_instrument():
     assert row['skip_reason'] == 'zero_weight'
     assert not row['submitted']
     assert row['instrument_weight'] == 0.0
-    assert math.isclose(row['strategy_weight'], 1.0)
     assert row['sigma'] == 8000.0                 # was read before the skip
     # Zero weight is now a target of 0 (flows through), not an early skip —
     # so the flat row carries target_qty=0.0; nothing is submitted because
     # the position is already flat, and the label stays the informative
     # 'zero_weight'.
     assert row['target_qty'] == 0.0
-    assert pf.submitted == []
-
-
-def test_record_skip_reason_zero_weight_strategy():
-    pf, _, _, rm = _make()
-    rm.strategy_weight = {'FakeStrategy': 0.0}
-    rm.update_bar(_bar())
-    row = rm.get_records('BTC').iloc[0]
-    assert row['skip_reason'] == 'zero_weight'
-    assert not row['submitted']
-    assert row['strategy_weight'] == 0.0
-    assert math.isclose(row['instrument_weight'], 0.5)
     assert pf.submitted == []
 
 
@@ -1007,14 +938,13 @@ def test_record_submitted_row_matches_golden_formula():
     )
     rm.update_bar(_bar())
     row = rm.get_records('BTC').iloc[0]
-    # 1_000_000 * 1.5 * 1.0 * 0.5 * 0.2 * (50/50) = 150_000
+    # 1_000_000 * 1.5 * 0.5 * 0.2 * (50/50) = 150_000
     # target_qty = 150_000 / 10_000 = 15.0
     assert row['submitted']
     assert row['skip_reason'] is None
     assert row['forecast'] == 50.0
     assert row['sigma'] == 10_000.0
     assert math.isclose(row['instrument_weight'], 0.5)
-    assert math.isclose(row['strategy_weight'], 1.0)
     assert row['capital'] == 1_000_000.0
     assert row['idm'] == 1.5
     assert row['annual_target_vol'] == 0.2

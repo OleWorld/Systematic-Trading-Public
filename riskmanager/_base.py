@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Union
 
 import pandas as pd
 
@@ -81,6 +81,36 @@ class _StrategyLike(Protocol):
 
 
 # ──────────────────────────────────────────────
+# Orchestrator dependency (multi-strategy forecast source)
+# ──────────────────────────────────────────────
+
+class _OrchestratorLike(Protocol):
+    """Read surface of an ``orchestrator.Orchestrator`` the RiskManager reads.
+
+    Structurally identical to ``_StrategyLike`` — an orchestrator combines
+    several strategies' forecasts into one combined forecast per symbol, but
+    presents the *same* three members the risk manager consumes. The risk
+    manager therefore treats a single strategy and a multi-strategy
+    orchestrator interchangeably as forecast sources (its ``strategy``
+    parameter is typed ``Union[_StrategyLike, _OrchestratorLike]``); the two
+    protocols are kept distinct only to document that both source kinds are
+    first-class.
+    """
+
+    symbol_list: List[str]
+
+    def get_forecast(self, symbol: str) -> Optional[float]: ...
+
+    def is_warmed_up(self, symbol: str) -> bool: ...
+
+
+# A forecast source is either a single strategy or a multi-strategy
+# orchestrator — both expose ``symbol_list`` / ``get_forecast`` /
+# ``is_warmed_up``.
+_ForecastSourceLike = Union[_StrategyLike, _OrchestratorLike]
+
+
+# ──────────────────────────────────────────────
 # Abstract Base
 # ──────────────────────────────────────────────
 
@@ -114,7 +144,8 @@ class RiskManager(ABC):
     DEBUG log line.
     """
 
-    def __init__(self, portfolio: _PortfolioLike, strategy: _StrategyLike):
+    def __init__(self, portfolio: _PortfolioLike,
+                 strategy: _ForecastSourceLike):
         """Bind dependencies and initialise the diagnostic-row buffer.
 
         Parameters
@@ -122,8 +153,10 @@ class RiskManager(ABC):
         portfolio
             Portfolio surface (positions, balance, submit_order).
         strategy
-            Strategy exposing ``get_forecast(symbol)`` and
-            ``symbol_list``.
+            Forecast source — either a single ``Strategy`` or a
+            multi-strategy ``Orchestrator`` (both expose
+            ``get_forecast(symbol)``, ``symbol_list`` and
+            ``is_warmed_up(symbol)``). Stored as ``self.strategy``.
         """
         self.portfolio = portfolio
         self.strategy = strategy

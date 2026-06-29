@@ -5,10 +5,12 @@ For calibrated continuous forecasts (e.g. EWMAC) where conviction should
 modulate position size, prefer ``VolTargetingRiskManager``.
 """
 
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from event import BarEvent, OrderType, Direction
-from riskmanager._base import RiskManager, _PortfolioLike, _StrategyLike
+from riskmanager._base import (
+    RiskManager, _OrchestratorLike, _PortfolioLike, _StrategyLike,
+)
 
 if TYPE_CHECKING:  # avoid a config<->riskmanager import cycle at module load
     from config import InstrumentConfig
@@ -53,7 +55,8 @@ class SimpleRiskManager(RiskManager):
 
     _MODES = ('fixed_notional', 'fixed_quantity', 'fixed_equity_pct')
 
-    def __init__(self, portfolio: _PortfolioLike, strategy: _StrategyLike,
+    def __init__(self, portfolio: _PortfolioLike,
+                 strategy: Union[_StrategyLike, _OrchestratorLike],
                  size_mode: str = 'fixed_quantity',
                  position_size: float = 10_000.0,
                  instruments: Optional[Dict[str, "InstrumentConfig"]] = None):
@@ -65,8 +68,10 @@ class SimpleRiskManager(RiskManager):
             ``submit_order``. Margin checking is the portfolio's
             responsibility, not the risk manager's.
         strategy
-            Strategy instance exposing ``get_forecast(symbol)``. Read on
-            every completed bar to derive the target position.
+            Forecast source — a single ``Strategy`` or a multi-strategy
+            ``orchestrator.Orchestrator`` — exposing
+            ``get_forecast(symbol)``. Read on every completed bar to
+            derive the target position.
         size_mode
             One of ``'fixed_quantity'`` (default — futures convention:
             size in contracts), ``'fixed_notional'``,
