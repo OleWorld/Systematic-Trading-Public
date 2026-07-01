@@ -54,7 +54,7 @@ target-average-absolute-forecast magnitude lives on the same class as
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
@@ -65,20 +65,31 @@ from strategy._base import Strategy, _DataHandlerLike
 __all__ = ['EWMACStrategy']
 
 
-_DEFAULT_LOOKBACK_PAIRS: List[Tuple[int, int]] = [(16, 64), (32, 128), (64, 256)]
+# Default variations as a ``{label: {param_name: value}}`` dict. The labels
+# are param-derived so a default-constructed strategy emits diagnostic columns
+# reading ``fast_ema_16_64`` etc. (identical to the pre-refactor output).
+_DEFAULT_VARIATIONS: Dict[str, Dict[str, int]] = {
+    '16_64': {'fast': 16, 'slow': 64},
+    '32_128': {'fast': 32, 'slow': 128},
+    '64_256': {'fast': 64, 'slow': 256},
+}
+
+# Required per-variation param keys — validated by strict set-equality so a
+# typo (``'fats'``) fails loudly instead of silently NaN-ing the variation.
+_PARAM_KEYS = frozenset({'fast', 'slow'})
 
 
 class EWMACStrategy(Strategy):
     """EWMAC trend-follower with three look-back variations and a dynamic
     forecast scalar.
 
-    Per-symbol state:
-        ``_stdev``                  — shared price-change Stdev (vol_lookback).
-        ``_fast_emas[i]``           — fast EMA for variation ``i``.
-        ``_slow_emas[i]``           — slow EMA for variation ``i``.
-        ``_abs_vol_adj_smas[i]``    — rolling mean of ``|vol_adj_i|`` over
-                                       ``forecast_scalar_lookback`` finalized
-                                       bars.
+    Per-symbol state (per-variation indicators keyed by variation label):
+        ``_stdev``                     — shared price-change Stdev (vol_lookback).
+        ``_fast_emas[label]``          — fast EMA for variation ``label``.
+        ``_slow_emas[label]``          — slow EMA for variation ``label``.
+        ``_abs_vol_adj_smas[label]``   — rolling mean of ``|vol_adj_label|`` over
+                                          ``forecast_scalar_lookback`` finalized
+                                          bars.
     """
 
     def __init__(
@@ -86,8 +97,8 @@ class EWMACStrategy(Strategy):
         data_handler: _DataHandlerLike,
         symbol_list: List[str],
         execution_timeframe: str = '1d',
-        lookback_pairs: Optional[List[Tuple[int, int]]] = None,
-        weights: Optional[List[float]] = None,
+        variations: Optional[Dict[str, Dict[str, int]]] = None,
+        weights: Optional[Dict[str, float]] = None,
         fdm: float = 1.0,
         vol_lookback: int = 25,
         forecast_scalar_lookback: int = 256,
@@ -98,15 +109,24 @@ class EWMACStrategy(Strategy):
         ----------
         execution_timeframe
             Bar timeframe the EWMAC chain runs on (default ``'1d'``).
-        lookback_pairs
-            List of ``(L_fast, L_slow)`` tuples in bars of
-            ``execution_timeframe``. Default ``[(16, 64), (32, 128), (64, 256)]``
-            — Carver's "three slowest" set, suitable for most instruments.
-            Each pair must have ``L_fast >= 2`` and ``L_slow > L_fast``.
+        variations
+            Mapping ``{label: {'fast': L_fast, 'slow': L_slow}}`` of the
+            look-back variations, in bars of ``execution_timeframe``. The
+            label is an opaque string keying both the combination weights and
+            the per-bar diagnostic columns (``fast_ema_<label>`` …), mirroring
+            the orchestrator's ``{label: strategy}`` shape; the nested
+            ``{param_name: value}`` params dict generalizes to indicators with
+            more parameters. Each params dict must have exactly the keys
+            ``{'fast', 'slow'}`` with ``L_fast >= 2`` and ``L_slow > L_fast``.
+            Default ``{'16_64': {'fast': 16, 'slow': 64}, '32_128': {'fast':
+            32, 'slow': 128}, '64_256': {'fast': 64, 'slow': 256}}`` —
+            Carver's "three slowest" set; the param-derived labels keep the
+            default diagnostic columns reading ``fast_ema_16_64`` etc.
         weights
-            Per-variation combination weights. Must have the same length as
-            ``lookback_pairs`` and sum to 1.0. ``None`` (default) → equal
-            weights.
+            Optional ``{label: weight}`` per-variation combination weights.
+            Keys must match ``variations`` exactly; values must be finite,
+            non-negative, and sum to ``1.0``. ``None`` (default) → equal
+            weight ``1/N`` via ``analytics.equal_weight``.
         fdm
             Forecast Diversification Multiplier (Carver, *Systematic
             Trading* ch. 8 / *Advanced Futures Trading Strategies* ch. 4).
@@ -134,32 +154,38 @@ class EWMACStrategy(Strategy):
         """
         super().__init__(data_handler, symbol_list)
 
-        if lookback_pairs is None:
-            lookback_pairs = list(_DEFAULT_LOOKBACK_PAIRS)
-        if not lookback_pairs:
-            raise ValueError("lookback_pairs must be non-empty")
-        for fast, slow in lookback_pairs:
+        # Shared weight validator (analytics.equal_weight default). Imported
+        # lazily so the strategy import path doesn't pull in cvxpy.
+        from analytics import validate_named_weights
+
+        if variations is None:
+            variations = {
+                label: dict(params)
+                for label, params in _DEFAULT_VARIATIONS.items()
+            }
+        if not variations:
+            raise ValueError("variations must be a non-empty dict")
+        for label, params in variations.items():
+            if not isinstance(params, dict) or set(params) != _PARAM_KEYS:
+                raise ValueError(
+                    f"variation {label!r} params must be a dict with keys "
+                    f"{sorted(_PARAM_KEYS)}, got {params!r}"
+                )
+            fast, slow = params['fast'], params['slow']
             if fast < 2:
                 raise ValueError(
-                    f"L_fast must be >= 2 (so EMA has more than one input), got {fast}"
+                    f"variation {label!r}: fast must be >= 2 (so EMA has more "
+                    f"than one input), got {fast}"
                 )
             if slow <= fast:
                 raise ValueError(
-                    f"L_slow must be > L_fast, got fast={fast} slow={slow}"
+                    f"variation {label!r}: slow must be > fast, got "
+                    f"fast={fast} slow={slow}"
                 )
 
-        n_vars = len(lookback_pairs)
-        if weights is None:
-            weights = [1.0 / n_vars] * n_vars
-        else:
-            if len(weights) != n_vars:
-                raise ValueError(
-                    f"weights length {len(weights)} != lookback_pairs length {n_vars}"
-                )
-            if abs(sum(weights) - 1.0) > 1e-6:
-                raise ValueError(
-                    f"weights must sum to 1.0, got sum={sum(weights)}"
-                )
+        # Keys set-equal to the variation labels, finite, non-negative,
+        # sum→1; ``None`` → equal weight (shared with the orchestrator).
+        weights = validate_named_weights(weights, list(variations.keys()))
 
         if fdm <= 0:
             raise ValueError(f"fdm must be > 0, got {fdm}")
@@ -172,8 +198,10 @@ class EWMACStrategy(Strategy):
             )
 
         self.execution_timeframe = execution_timeframe
-        self.lookback_pairs: List[Tuple[int, int]] = list(lookback_pairs)
-        self.weights: List[float] = list(weights)
+        self.variations: Dict[str, Dict[str, int]] = {
+            label: dict(params) for label, params in variations.items()
+        }
+        self.weights: Dict[str, float] = weights
         self.fdm = fdm
         self.vol_lookback = vol_lookback
         self.forecast_scalar_lookback = forecast_scalar_lookback
@@ -183,20 +211,22 @@ class EWMACStrategy(Strategy):
             s: Stdev(length=vol_lookback) for s in symbol_list
         }
 
-        # Per-symbol per-variation indicators.
-        self._fast_emas: Dict[str, List[EMA]] = {
-            s: [EMA(span=fast) for fast, _ in self.lookback_pairs]
+        # Per-symbol per-variation indicators, keyed by variation label.
+        self._fast_emas: Dict[str, Dict[str, EMA]] = {
+            s: {label: EMA(span=p['fast'])
+                for label, p in self.variations.items()}
             for s in symbol_list
         }
-        self._slow_emas: Dict[str, List[EMA]] = {
-            s: [EMA(span=slow) for _, slow in self.lookback_pairs]
+        self._slow_emas: Dict[str, Dict[str, EMA]] = {
+            s: {label: EMA(span=p['slow'])
+                for label, p in self.variations.items()}
             for s in symbol_list
         }
         # SMA(window) keeps inputs_maxlen=window. outputs_maxlen needs to
         # be at least 2 so .latest (= _outputs[-2]) is reachable.
-        self._abs_vol_adj_smas: Dict[str, List[SMA]] = {
-            s: [SMA(window=forecast_scalar_lookback)
-                for _ in self.lookback_pairs]
+        self._abs_vol_adj_smas: Dict[str, Dict[str, SMA]] = {
+            s: {label: SMA(window=forecast_scalar_lookback)
+                for label in self.variations}
             for s in symbol_list
         }
 
@@ -208,11 +238,11 @@ class EWMACStrategy(Strategy):
 
         * ``'forecast'`` — combined capped forecast (possibly NaN).
         * ``'price_stdev'`` — shared price-change Stdev (latest finalized).
-        * Per variation ``(fast, slow)``:
-          ``'fast_ema_<fast>_<slow>'``, ``'slow_ema_<fast>_<slow>'``,
-          ``'vol_adj_<fast>_<slow>'``, ``'abs_mean_<fast>_<slow>'``,
-          ``'scalar_<fast>_<slow>'`` (latest finalized intermediates), and
-          ``'forecast_<fast>_<slow>'`` — the per-variation forecast
+        * Per variation ``label``:
+          ``'fast_ema_<label>'``, ``'slow_ema_<label>'``,
+          ``'vol_adj_<label>'``, ``'abs_mean_<label>'``,
+          ``'scalar_<label>'`` (latest finalized intermediates), and
+          ``'forecast_<label>'`` — the per-variation forecast
           **capped at ±Strategy.FORECAST_CAP** before combining.
 
         The base class clamps the top-level forecast to
@@ -243,18 +273,18 @@ class EWMACStrategy(Strategy):
         # ── Per-variation pipeline: update EMAs, push forming vol_adj into
         # the abs-mean SMA, then compute the forecast and intermediates from
         # finalized values. ─────────────────────────────────────────────
-        n_vars = len(self.lookback_pairs)
-        per_var_forecasts: List[float] = [float('nan')] * n_vars
-        per_var_fast: List[float] = [float('nan')] * n_vars
-        per_var_slow: List[float] = [float('nan')] * n_vars
-        per_var_vol_adj: List[float] = [float('nan')] * n_vars
-        per_var_abs_mean: List[float] = [float('nan')] * n_vars
-        per_var_scalar: List[float] = [float('nan')] * n_vars
+        nan = float('nan')
+        per_var_forecasts: Dict[str, float] = {l: nan for l in self.variations}
+        per_var_fast: Dict[str, float] = {l: nan for l in self.variations}
+        per_var_slow: Dict[str, float] = {l: nan for l in self.variations}
+        per_var_vol_adj: Dict[str, float] = {l: nan for l in self.variations}
+        per_var_abs_mean: Dict[str, float] = {l: nan for l in self.variations}
+        per_var_scalar: Dict[str, float] = {l: nan for l in self.variations}
 
-        for i in range(n_vars):
-            fast_ema = self._fast_emas[symbol][i]
-            slow_ema = self._slow_emas[symbol][i]
-            abs_sma = self._abs_vol_adj_smas[symbol][i]
+        for label in self.variations:
+            fast_ema = self._fast_emas[symbol][label]
+            slow_ema = self._slow_emas[symbol][label]
+            abs_sma = self._abs_vol_adj_smas[symbol][label]
 
             fast_ema.update(forming_ts, forming_close)
             slow_ema.update(forming_ts, forming_close)
@@ -300,18 +330,18 @@ class EWMACStrategy(Strategy):
                     scalar = (
                         Strategy.TARGET_AVG_ABS_FORECAST / abs_mean_latest
                     )
-                    per_var_fast[i] = fast_latest
-                    per_var_slow[i] = slow_latest
-                    per_var_vol_adj[i] = vol_adj_latest
-                    per_var_abs_mean[i] = abs_mean_latest
-                    per_var_scalar[i] = scalar
+                    per_var_fast[label] = fast_latest
+                    per_var_slow[label] = slow_latest
+                    per_var_vol_adj[label] = vol_adj_latest
+                    per_var_abs_mean[label] = abs_mean_latest
+                    per_var_scalar[label] = scalar
                     # Cap each variation individually at ``±FORECAST_CAP``
                     # before combining — keeps one runaway variation from
                     # dominating the weighted sum and keeps the recorded
-                    # ``forecast_<fast>_<slow>`` diagnostic on the same
+                    # ``forecast_<label>`` diagnostic on the same
                     # ``[-100, +100]`` scale as the combined ``forecast``.
                     cap = Strategy.FORECAST_CAP
-                    per_var_forecasts[i] = max(
+                    per_var_forecasts[label] = max(
                         -cap, min(cap, vol_adj_latest * scalar)
                     )
 
@@ -321,11 +351,11 @@ class EWMACStrategy(Strategy):
         # weights are calibrated against the full ensemble. ``Strategy.update_bar``
         # clamps the final value to ``±Strategy.FORECAST_CAP`` before storing
         # it in ``self.forecasts[symbol]``, so no clamp is applied here.
-        if any(pd.isna(f) for f in per_var_forecasts):
-            final_forecast = float('nan')
+        if any(pd.isna(per_var_forecasts[l]) for l in self.variations):
+            final_forecast = nan
         else:
             final_forecast = self.fdm * sum(
-                w * f for w, f in zip(self.weights, per_var_forecasts)
+                self.weights[l] * per_var_forecasts[l] for l in self.variations
             )
 
         # ── Recorded fields. ────────────────────────────────────────────
@@ -333,7 +363,7 @@ class EWMACStrategy(Strategy):
         price_stdev = (
             float(std_l['stdev'])
             if std_l is not None and not pd.isna(std_l['stdev'])
-            else float('nan')
+            else nan
         )
 
         row: Dict[str, Any] = {
@@ -341,11 +371,11 @@ class EWMACStrategy(Strategy):
             'fdm': self.fdm,
             'price_stdev': price_stdev,
         }
-        for i, (fast, slow) in enumerate(self.lookback_pairs):
-            row[f'fast_ema_{fast}_{slow}'] = per_var_fast[i]
-            row[f'slow_ema_{fast}_{slow}'] = per_var_slow[i]
-            row[f'vol_adj_{fast}_{slow}'] = per_var_vol_adj[i]
-            row[f'abs_mean_{fast}_{slow}'] = per_var_abs_mean[i]
-            row[f'scalar_{fast}_{slow}'] = per_var_scalar[i]
-            row[f'forecast_{fast}_{slow}'] = per_var_forecasts[i]
+        for label in self.variations:
+            row[f'fast_ema_{label}'] = per_var_fast[label]
+            row[f'slow_ema_{label}'] = per_var_slow[label]
+            row[f'vol_adj_{label}'] = per_var_vol_adj[label]
+            row[f'abs_mean_{label}'] = per_var_abs_mean[label]
+            row[f'scalar_{label}'] = per_var_scalar[label]
+            row[f'forecast_{label}'] = per_var_forecasts[label]
         return row

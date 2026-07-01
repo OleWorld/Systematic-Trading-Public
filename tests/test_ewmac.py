@@ -2,7 +2,8 @@
 Unit + integration tests for ``EWMACStrategy``.
 
 Covers:
-* Parameter validation (lookback pairs, weights, vol/forecast windows).
+* Parameter validation (variations dict, per-variation params, weights,
+  vol/forecast windows).
 * End-to-end on a synthetic price series, cross-checked against a
   vectorized recomputation built from ``EMA.from_series`` +
   pandas rolling stdev/mean.
@@ -11,7 +12,9 @@ Covers:
 
 After the post-2026-05 redesign, ``EWMACStrategy`` no longer emits
 SignalEvents — it writes the per-bar forecast into ``self.forecasts``,
-which the risk manager reads on every completed bar.
+which the risk manager reads on every completed bar. Variations are a
+``{label: {'fast': L_fast, 'slow': L_slow}}`` dict and weights a
+``{label: weight}`` dict (mirroring the orchestrator's constructor).
 
 Run from repo root:  pytest tests/test_ewmac.py -v
 """
@@ -110,56 +113,70 @@ def _make(symbol='BTC', **kwargs) -> EWMACStrategy:
     return EWMACStrategy(dh, [symbol], **kwargs)
 
 
-def test_default_lookback_pairs_are_carver_slow_trio():
-    strat = _make(
-        lookback_pairs=[(16, 64), (32, 128), (64, 256)],
-        vol_lookback=25,
-        forecast_scalar_lookback=500,
-    )
-    assert strat.lookback_pairs == [(16, 64), (32, 128), (64, 256)]
+def _vars(*pairs):
+    """Build a ``variations`` dict from ``(fast, slow)`` tuples.
+
+    Labels are param-derived (``'<fast>_<slow>'``) — matching the strategy's
+    own default-label convention, so the per-variation diagnostic columns
+    read ``forecast_4_16`` etc.
+    """
+    return {f'{f}_{s}': {'fast': f, 'slow': s} for f, s in pairs}
+
+
+def test_default_variations_are_carver_slow_trio():
+    strat = _make(vol_lookback=25, forecast_scalar_lookback=500)
+    assert strat.variations == {
+        '16_64': {'fast': 16, 'slow': 64},
+        '32_128': {'fast': 32, 'slow': 128},
+        '64_256': {'fast': 64, 'slow': 256},
+    }
 
 
 def test_default_weights_equal_one_third():
-    strat = _make(
-        lookback_pairs=[(16, 64), (32, 128), (64, 256)],
-        vol_lookback=25,
-        forecast_scalar_lookback=500,
-    )
-    assert len(strat.weights) == 3
-    assert all(abs(w - 1.0 / 3.0) < 1e-12 for w in strat.weights)
+    strat = _make(vol_lookback=25, forecast_scalar_lookback=500)
+    assert set(strat.weights) == {'16_64', '32_128', '64_256'}
+    assert all(abs(w - 1.0 / 3.0) < 1e-12 for w in strat.weights.values())
 
 
-def test_empty_lookback_pairs_rejected():
+def test_empty_variations_rejected():
     with pytest.raises(ValueError, match="non-empty"):
+        _make(variations={}, vol_lookback=25, forecast_scalar_lookback=500)
+
+
+def test_variation_params_missing_key_rejected():
+    with pytest.raises(ValueError, match="must be a dict with keys"):
+        _make(variations={'x': {'fast': 4}},
+              vol_lookback=25, forecast_scalar_lookback=500)
+
+
+def test_variation_params_extra_key_rejected():
+    with pytest.raises(ValueError, match="must be a dict with keys"):
+        _make(variations={'x': {'fast': 4, 'slow': 16, 'z': 1}},
+              vol_lookback=25, forecast_scalar_lookback=500)
+
+
+def test_variation_params_typo_key_rejected():
+    with pytest.raises(ValueError, match="must be a dict with keys"):
+        _make(variations={'x': {'fats': 4, 'slow': 16}},
+              vol_lookback=25, forecast_scalar_lookback=500)
+
+
+def test_variation_fast_less_than_two_rejected():
+    with pytest.raises(ValueError, match="fast must be >= 2"):
+        _make(variations=_vars((1, 4)),
+              vol_lookback=25, forecast_scalar_lookback=500)
+
+
+def test_variation_slow_not_greater_than_fast_rejected():
+    with pytest.raises(ValueError, match="slow must be > fast"):
+        _make(variations=_vars((8, 8)),
+              vol_lookback=25, forecast_scalar_lookback=500)
+
+
+def test_weights_keys_mismatch_rejected():
+    with pytest.raises(ValueError, match="match the labels exactly"):
         _make(
-            lookback_pairs=[],
-            vol_lookback=25,
-            forecast_scalar_lookback=500,
-        )
-
-
-def test_lookback_fast_less_than_two_rejected():
-    with pytest.raises(ValueError, match="L_fast"):
-        _make(
-            lookback_pairs=[(1, 4)],
-            vol_lookback=25,
-            forecast_scalar_lookback=500,
-        )
-
-
-def test_lookback_slow_not_greater_than_fast_rejected():
-    with pytest.raises(ValueError, match="L_slow"):
-        _make(
-            lookback_pairs=[(8, 8)],
-            vol_lookback=25,
-            forecast_scalar_lookback=500,
-        )
-
-
-def test_weights_wrong_length_rejected():
-    with pytest.raises(ValueError, match="length"):
-        _make(
-            lookback_pairs=[(4, 16), (8, 32)], weights=[1.0],
+            variations=_vars((4, 16), (8, 32)), weights={'4_16': 1.0},
             vol_lookback=25,
             forecast_scalar_lookback=500,
         )
@@ -168,7 +185,8 @@ def test_weights_wrong_length_rejected():
 def test_weights_not_summing_to_one_rejected():
     with pytest.raises(ValueError, match="sum to 1"):
         _make(
-            lookback_pairs=[(4, 16), (8, 32)], weights=[0.4, 0.4],
+            variations=_vars((4, 16), (8, 32)),
+            weights={'4_16': 0.4, '8_32': 0.4},
             vol_lookback=25,
             forecast_scalar_lookback=500,
         )
@@ -176,40 +194,23 @@ def test_weights_not_summing_to_one_rejected():
 
 def test_vol_lookback_below_two_rejected():
     with pytest.raises(ValueError, match="vol_lookback"):
-        _make(
-            lookback_pairs=[(16, 64), (32, 128), (64, 256)],
-            vol_lookback=1,
-            forecast_scalar_lookback=500,
-        )
+        _make(vol_lookback=1, forecast_scalar_lookback=500)
 
 
 def test_forecast_scalar_lookback_below_two_rejected():
     with pytest.raises(ValueError, match="forecast_scalar_lookback"):
-        _make(
-            lookback_pairs=[(16, 64), (32, 128), (64, 256)],
-            vol_lookback=25,
-            forecast_scalar_lookback=1,
-        )
+        _make(vol_lookback=25, forecast_scalar_lookback=1)
 
 
 def test_default_fdm_is_one():
-    strat = _make(
-        lookback_pairs=[(16, 64), (32, 128), (64, 256)],
-        vol_lookback=25,
-        forecast_scalar_lookback=500,
-    )
+    strat = _make(vol_lookback=25, forecast_scalar_lookback=500)
     assert strat.fdm == 1.0
 
 
 @pytest.mark.parametrize("bad_fdm", [0.0, -0.5])
 def test_fdm_non_positive_rejected(bad_fdm):
     with pytest.raises(ValueError, match="fdm"):
-        _make(
-            lookback_pairs=[(16, 64), (32, 128), (64, 256)],
-            fdm=bad_fdm,
-            vol_lookback=25,
-            forecast_scalar_lookback=500,
-        )
+        _make(fdm=bad_fdm, vol_lookback=25, forecast_scalar_lookback=500)
 
 
 def test_fdm_scales_combined_forecast():
@@ -221,15 +222,13 @@ def test_fdm_scales_combined_forecast():
     start = datetime(2026, 1, 1)
     closes = _trending_closes(200)
     frame = _build_frame(closes, start)
-    lookback_pairs = [(4, 16), (8, 32), (16, 64)]
-    weights = [1.0 / 3.0] * 3
+    variations = _vars((4, 16), (8, 32), (16, 64))
 
     def _run(fdm_value: float) -> pd.Series:
         dh = _StepwiseDataHandler(frame, symbol)
         strat = EWMACStrategy(
             dh, [symbol],
-            lookback_pairs=lookback_pairs,
-            weights=weights,
+            variations=variations,
             fdm=fdm_value,
             vol_lookback=10,
             forecast_scalar_lookback=20,
@@ -268,8 +267,7 @@ def test_fdm_clamps_at_cap_when_combined_exceeds_bound():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = EWMACStrategy(
         dh, [symbol],
-        lookback_pairs=[(4, 16), (8, 32), (16, 64)],
-        weights=[1.0 / 3.0] * 3,
+        variations=_vars((4, 16), (8, 32), (16, 64)),
         fdm=5.0,  # 5x — guaranteed to push at least some bars past ±100.
         vol_lookback=10,
         forecast_scalar_lookback=20,
@@ -299,8 +297,7 @@ def test_fdm_column_recorded_in_records():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = EWMACStrategy(
         dh, [symbol],
-        lookback_pairs=[(4, 16)],
-        weights=[1.0],
+        variations=_vars((4, 16)),
         fdm=fdm_value,
         vol_lookback=10,
         forecast_scalar_lookback=20,
@@ -324,7 +321,7 @@ def test_fdm_column_recorded_in_records():
 def _vectorized_ewmac(
     closes: pd.Series,
     *,
-    lookback_pairs,
+    variations,
     weights,
     vol_lookback,
     forecast_scalar_lookback,
@@ -341,13 +338,20 @@ def _vectorized_ewmac(
     clamp mirrors ``Strategy.update_bar``'s base-class clamp; the dynamic
     forecast scalar reads ``Strategy.TARGET_AVG_ABS_FORECAST`` (the
     project-wide target average absolute forecast).
+
+    ``variations`` is a ``{label: {'fast': .., 'slow': ..}}`` dict and
+    ``weights`` a ``{label: weight}`` dict, iterated by label (the same
+    label-keyed shape the strategy consumes).
     """
     closes_seen = closes.iloc[1:]
     price_change_seen = closes.diff().iloc[1:]
     stdev = price_change_seen.rolling(vol_lookback).std(ddof=1)
 
+    labels = list(variations)
     per_var = []
-    for (fast, slow), _ in zip(lookback_pairs, weights):
+    for label in labels:
+        p = variations[label]
+        fast, slow = p['fast'], p['slow']
         fast_ema = EMA.from_series(closes_seen, span=fast)
         slow_ema = EMA.from_series(closes_seen, span=slow)
         raw_xover = fast_ema - slow_ema
@@ -362,7 +366,7 @@ def _vectorized_ewmac(
             (vol_adj * scalar).clip(-Strategy.FORECAST_CAP, Strategy.FORECAST_CAP)
         )
 
-    combined = fdm * sum(w * f for w, f in zip(weights, per_var))
+    combined = fdm * sum(weights[label] * f for label, f in zip(labels, per_var))
     final_capped = combined.clip(-Strategy.FORECAST_CAP, Strategy.FORECAST_CAP)
     # Reindex so bar 0 is NaN and the rest aligns with ``closes``.
     return final_capped.reindex(closes.index)
@@ -390,8 +394,8 @@ def test_recorded_forecast_matches_vectorized_recomputation():
     symbol = 'BTC'
     start = datetime(2026, 1, 1)
     n = 200
-    lookback_pairs = [(4, 16), (8, 32), (16, 64)]
-    weights = [1.0 / 3.0] * 3
+    variations = _vars((4, 16), (8, 32), (16, 64))
+    weights = {label: 1.0 / 3.0 for label in variations}
     vol_lookback = 10
     forecast_scalar_lookback = 20
 
@@ -401,7 +405,7 @@ def test_recorded_forecast_matches_vectorized_recomputation():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = EWMACStrategy(
         dh, [symbol],
-        lookback_pairs=lookback_pairs,
+        variations=variations,
         weights=weights,
         vol_lookback=vol_lookback,
         forecast_scalar_lookback=forecast_scalar_lookback,
@@ -411,7 +415,7 @@ def test_recorded_forecast_matches_vectorized_recomputation():
     recorded = strat.get_records(symbol)['forecast']
     expected = _vectorized_ewmac(
         frame['Close'],
-        lookback_pairs=lookback_pairs,
+        variations=variations,
         weights=weights,
         vol_lookback=vol_lookback,
         forecast_scalar_lookback=forecast_scalar_lookback,
@@ -440,8 +444,7 @@ def test_recorded_forecast_is_nan_during_warmup():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = EWMACStrategy(
         dh, [symbol],
-        lookback_pairs=[(4, 16)],
-        weights=[1.0],
+        variations=_vars((4, 16)),
         vol_lookback=10,
         forecast_scalar_lookback=20,
     )
@@ -478,8 +481,7 @@ def test_forecast_caps_at_plus_minus_one_hundred():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = EWMACStrategy(
         dh, [symbol],
-        lookback_pairs=[(4, 16)],
-        weights=[1.0],
+        variations=_vars((4, 16)),
         vol_lookback=10,
         forecast_scalar_lookback=20,
     )
@@ -493,7 +495,7 @@ def test_forecast_caps_at_plus_minus_one_hundred():
 
 
 def test_per_variation_forecast_caps_at_plus_minus_one_hundred():
-    """Each per-variation forecast column (``forecast_<fast>_<slow>``) must
+    """Each per-variation forecast column (``forecast_<label>``) must
     individually respect ``±Strategy.FORECAST_CAP`` — the cap is applied
     per variation before the weighted combine, so no single variation can
     blow through the bound even on a regime shift that maximally stresses
@@ -516,19 +518,18 @@ def test_per_variation_forecast_caps_at_plus_minus_one_hundred():
 
     # Multiple variations so the per-variation columns are distinguishable
     # from the combined ``forecast`` column.
-    lookback_pairs = [(4, 16), (8, 32)]
+    variations = _vars((4, 16), (8, 32))
     dh = _StepwiseDataHandler(frame, symbol)
     strat = EWMACStrategy(
         dh, [symbol],
-        lookback_pairs=lookback_pairs,
-        weights=[0.5, 0.5],
+        variations=variations,
         vol_lookback=10,
         forecast_scalar_lookback=20,
     )
     _drive(strat, dh, frame, symbol)
 
     records = strat.get_records(symbol)
-    per_var_cols = [f'forecast_{f}_{s}' for f, s in lookback_pairs]
+    per_var_cols = [f'forecast_{label}' for label in variations]
     for col in per_var_cols:
         series = records[col].dropna()
         assert (series.abs() <= Strategy.FORECAST_CAP + 1e-9).all(), (
@@ -557,8 +558,7 @@ def test_strategy_has_no_events_queue_attribute():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = EWMACStrategy(
         dh, [symbol],
-        lookback_pairs=[(4, 16)],
-        weights=[1.0],
+        variations=_vars((4, 16)),
         vol_lookback=10,
         forecast_scalar_lookback=20,
     )
@@ -578,8 +578,7 @@ def test_cached_forecast_matches_last_recorded_non_nan_forecast():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = EWMACStrategy(
         dh, [symbol],
-        lookback_pairs=[(4, 16)],
-        weights=[1.0],
+        variations=_vars((4, 16)),
         vol_lookback=10,
         forecast_scalar_lookback=20,
     )
@@ -602,8 +601,7 @@ def test_cached_forecast_is_none_during_warmup():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = EWMACStrategy(
         dh, [symbol],
-        lookback_pairs=[(4, 16)],
-        weights=[1.0],
+        variations=_vars((4, 16)),
         vol_lookback=10,
         forecast_scalar_lookback=20,
     )

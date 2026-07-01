@@ -53,7 +53,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from analytics import equal_weight
+from analytics import equal_weight, validate_named_weights
 from event import BarEvent
 from strategy import Strategy
 
@@ -168,30 +168,11 @@ class Orchestrator:
 
         ``None`` → equal weight ``1/M``. Otherwise the keys must match
         ``labels`` exactly and the values must be finite, non-negative,
-        and sum to ``1.0`` within ``_WEIGHT_SUM_TOL``.
+        and sum to ``1.0`` within ``_WEIGHT_SUM_TOL``. Thin delegator to
+        the shared ``analytics.validate_named_weights`` so strategy,
+        instrument, and forecast-variation weights all validate identically.
         """
-        if weights is None:
-            return equal_weight(labels)
-        if set(weights.keys()) != set(labels):
-            raise ValueError(
-                f"weights keys must match the strategy labels exactly; "
-                f"strategies={sorted(labels)}, weights={sorted(weights)}"
-            )
-        out: Dict[str, float] = {}
-        for label in labels:
-            w = weights[label]
-            if not (np.isfinite(w) and w >= 0):
-                raise ValueError(
-                    f"weight for {label!r} must be finite and >= 0, got {w}"
-                )
-            out[label] = float(w)
-        total = sum(out.values())
-        if abs(total - 1.0) > _WEIGHT_SUM_TOL:
-            raise ValueError(
-                f"weights must sum to 1.0 within {_WEIGHT_SUM_TOL}, "
-                f"got {total}"
-            )
-        return out
+        return validate_named_weights(weights, labels, sum_tol=_WEIGHT_SUM_TOL)
 
     def calculate_strategy_weights(self) -> None:
         """Reset ``self.strategy_weights`` to equal weight over current labels.

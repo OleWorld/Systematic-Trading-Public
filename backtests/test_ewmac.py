@@ -98,8 +98,12 @@ data_handler = HistoricDataHandler(
 
 strategy = EWMACStrategy(
     data_handler, config.symbols,
-    lookback_pairs=[(4, 16), (16, 64), (32, 128)],
-    weights=[0.42, 0.16, 0.42],
+    variations={
+        '4_16': {'fast': 4, 'slow': 16},
+        '16_64': {'fast': 16, 'slow': 64},
+        '32_128': {'fast': 32, 'slow': 128},
+    },
+    weights={'4_16': 0.42, '16_64': 0.16, '32_128': 0.42},
     fdm=1.12,
     vol_lookback=25,
     forecast_scalar_lookback=500,

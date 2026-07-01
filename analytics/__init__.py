@@ -22,6 +22,11 @@ Public surface:
   ``analytics._portfolio_optimizer`` for the shared contract
   (label-aligned inputs, per-scheme constraints, corr-vs-covariance
   equivalence).
+* ``validate_named_weights(weights, labels)`` — validate / default a
+  label→weight mapping (``None`` → equal weight; else keys set-equal to
+  ``labels``, finite, non-negative, sum→1). The one shared entry point
+  for weight validation across the allocation hierarchy (instrument,
+  strategy, and forecast-variation weights).
 * ``backtest_stats(equity_curve, trade_log, *, initial_capital,
   timeframe, days_convention)`` — post-run summary statistics (drawdowns,
   Sharpe/Sortino/Calmar, volatility, trade stats) as an ordered
@@ -30,7 +35,12 @@ Public surface:
 
 from analytics._correlation import correlation_matrix
 from analytics._diversification_multiplier import diversification_multiplier
-from analytics._portfolio_optimizer import equal_weight, min_variance, risk_parity
+from analytics._portfolio_optimizer import (
+    equal_weight,
+    min_variance,
+    risk_parity,
+    validate_named_weights,
+)
 from analytics._stats import backtest_stats
 
 __all__ = [
@@ -40,4 +50,5 @@ __all__ = [
     'equal_weight',
     'min_variance',
     'risk_parity',
+    'validate_named_weights',
 ]

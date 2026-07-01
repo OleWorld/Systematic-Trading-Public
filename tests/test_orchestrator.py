@@ -400,11 +400,11 @@ def test_real_strategies_combined_matches_manual_recomputation():
     dh = _StepwiseDataHandler(frame, symbol)
 
     ewmac = EWMACStrategy(
-        dh, [symbol], lookback_pairs=[(2, 4)], weights=[1.0],
+        dh, [symbol], variations={'2_4': {'fast': 2, 'slow': 4}},
         fdm=1.0, vol_lookback=5, forecast_scalar_lookback=5,
     )
     rsimr = RSIMRStrategy(
-        dh, [symbol], rsi_windows=[3], weights=[1.0],
+        dh, [symbol], variations={'3': {'window': 3}},
         fdm=1.0, forecast_scalar_lookback=5,
     )
     weights = {'ewmac': 0.6, 'rsimr': 0.4}

@@ -84,16 +84,24 @@ data_handler = HistoricDataHandler(
 # and reads the shared data handler exactly as it would standalone.
 ewmac = EWMACStrategy(
     data_handler, config.symbols,
-    lookback_pairs=[(4, 16), (16, 64), (32, 128)],
-    weights=[0.42, 0.16, 0.42],
+    variations={
+        '4_16': {'fast': 4, 'slow': 16},
+        '16_64': {'fast': 16, 'slow': 64},
+        '32_128': {'fast': 32, 'slow': 128},
+    },
+    weights={'4_16': 0.42, '16_64': 0.16, '32_128': 0.42},
     fdm=1.12,
     vol_lookback=25,
     forecast_scalar_lookback=500,
 )
 rsimr = RSIMRStrategy(
     data_handler, config.symbols,
-    rsi_windows=[3, 14, 28],
-    weights=[0.50, 0.25, 0.25],
+    variations={
+        '3': {'window': 3},
+        '14': {'window': 14},
+        '28': {'window': 28},
+    },
+    weights={'3': 0.50, '14': 0.25, '28': 0.25},
     fdm=1.0,
     forecast_scalar_lookback=256,
 )
@@ -104,8 +112,8 @@ rsimr = RSIMRStrategy(
 # the Backtester — no engine or risk-manager change is needed.
 orchestrator = Orchestrator(
     {'ewmac': ewmac, 'rsimr': rsimr},
-    weights={'ewmac': 0.5, 'rsimr': 0.5},   # equal default; shown explicitly
-    fdm=1.15,                               # cross-strategy diversification uplift
+    weights={'ewmac': 1, 'rsimr': 0},   # equal default; shown explicitly
+    fdm=1.0,                               # cross-strategy diversification uplift
 )
 
 portfolio = BacktestPortfolio(

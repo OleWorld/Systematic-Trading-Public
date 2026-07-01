@@ -4,13 +4,17 @@ Unit + integration tests for ``RSIMRStrategy``.
 Covers:
 * The ``_raw_from_rsi`` mapping (anchors, mean-reversion sign, symmetry,
   no-raise at the RSI 0/100 extremes).
-* Parameter validation (windows, distinctness, weights, fdm, scalar window).
+* Parameter validation (variations dict, per-variation params, weights,
+  fdm, scalar window).
 * End-to-end on a synthetic price series, cross-checked against a vectorized
   recomputation built from ``RSI.from_series`` + arctanh + pandas rolling mean.
 * Mean-reversion *direction*: oversold (falling prices → low RSI) → LONG
   (positive forecast); overbought (rising prices → high RSI) → SHORT.
 * Forecast-cap clamping, warmup → NaN, and forecast-cache semantics
   (``get_forecast`` None during warmup, ``is_warmed_up`` monotone).
+
+Variations are a ``{label: {'window': w}}`` dict and weights a
+``{label: weight}`` dict (mirroring the orchestrator's constructor).
 
 Run from repo root:  pytest tests/test_rsimr.py -v
 """
@@ -173,15 +177,27 @@ def _make(symbol='BTC', **kwargs) -> RSIMRStrategy:
     return RSIMRStrategy(dh, [symbol], **kwargs)
 
 
-def test_default_rsi_windows_are_fast_medium_slow_trio():
+def _rvars(*windows):
+    """Build a ``variations`` dict from RSI window ints.
+
+    Labels are param-derived (``str(window)``) — matching the strategy's own
+    default-label convention, so the per-variation diagnostic columns read
+    ``forecast_7`` etc.
+    """
+    return {str(w): {'window': w} for w in windows}
+
+
+def test_default_variations_are_fast_medium_slow_trio():
     strat = _make()
-    assert strat.rsi_windows == [7, 14, 28]
+    assert strat.variations == {
+        '7': {'window': 7}, '14': {'window': 14}, '28': {'window': 28},
+    }
 
 
 def test_default_weights_equal_one_third():
     strat = _make()
-    assert len(strat.weights) == 3
-    assert all(abs(w - 1.0 / 3.0) < 1e-12 for w in strat.weights)
+    assert set(strat.weights) == {'7', '14', '28'}
+    assert all(abs(w - 1.0 / 3.0) < 1e-12 for w in strat.weights.values())
 
 
 def test_default_fdm_is_one():
@@ -189,29 +205,40 @@ def test_default_fdm_is_one():
     assert strat.fdm == 1.0
 
 
-def test_empty_rsi_windows_rejected():
+def test_empty_variations_rejected():
     with pytest.raises(ValueError, match="non-empty"):
-        _make(rsi_windows=[])
+        _make(variations={})
+
+
+def test_variation_params_typo_key_rejected():
+    with pytest.raises(ValueError, match="must be a dict with keys"):
+        _make(variations={'x': {'windo': 14}})
 
 
 def test_rsi_window_below_two_rejected():
-    with pytest.raises(ValueError, match="RSI window"):
-        _make(rsi_windows=[1])
+    with pytest.raises(ValueError, match="window must be >= 2"):
+        _make(variations=_rvars(1))
 
 
-def test_duplicate_rsi_windows_rejected():
-    with pytest.raises(ValueError, match="distinct"):
-        _make(rsi_windows=[14, 14])
+def test_duplicate_window_values_across_labels_allowed():
+    """Distinct labels may map to the same window — the diagnostic columns are
+    label-keyed, so there is no collision (the old window-uniqueness rule is
+    gone)."""
+    strat = _make(
+        variations={'a': {'window': 14}, 'b': {'window': 14}},
+        weights={'a': 0.5, 'b': 0.5},
+    )
+    assert set(strat.variations) == {'a', 'b'}
 
 
-def test_weights_wrong_length_rejected():
-    with pytest.raises(ValueError, match="length"):
-        _make(rsi_windows=[7, 14], weights=[1.0])
+def test_weights_keys_mismatch_rejected():
+    with pytest.raises(ValueError, match="match the labels exactly"):
+        _make(variations=_rvars(7, 14), weights={'7': 1.0})
 
 
 def test_weights_not_summing_to_one_rejected():
     with pytest.raises(ValueError, match="sum to 1"):
-        _make(rsi_windows=[7, 14], weights=[0.4, 0.4])
+        _make(variations=_rvars(7, 14), weights={'7': 0.4, '14': 0.4})
 
 
 @pytest.mark.parametrize("bad_fdm", [0.0, -0.5])
@@ -232,7 +259,7 @@ def test_forecast_scalar_lookback_below_two_rejected():
 def _vectorized_rsimr(
     closes: pd.Series,
     *,
-    rsi_windows,
+    variations,
     weights,
     forecast_scalar_lookback,
     fdm: float = 1.0,
@@ -244,10 +271,16 @@ def _vectorized_rsimr(
     no leading offset (unlike EWMAC, which needs a 2-bar price change). The
     per-variation cap mirrors the strategy code (applied before the weighted
     combine); the final ``±FORECAST_CAP`` clamp mirrors ``Strategy.update_bar``.
+
+    ``variations`` is a ``{label: {'window': w}}`` dict and ``weights`` a
+    ``{label: weight}`` dict, iterated by label (the same label-keyed shape the
+    strategy consumes).
     """
     lim = 1.0 - _RSI_DEV_CLIP
+    labels = list(variations)
     per_var = []
-    for w, _ in zip(rsi_windows, weights):
+    for label in labels:
+        w = variations[label]['window']
         rsi = RSI.from_series(closes, window=w)
         dev = ((rsi - 50.0) / 50.0).clip(-lim, lim)
         raw = -np.arctanh(dev)                              # mean-reversion sign
@@ -259,7 +292,7 @@ def _vectorized_rsimr(
             (raw * scalar).clip(-Strategy.FORECAST_CAP, Strategy.FORECAST_CAP)
         )
 
-    combined = fdm * sum(w * f for w, f in zip(weights, per_var))
+    combined = fdm * sum(weights[label] * f for label, f in zip(labels, per_var))
     return combined.clip(-Strategy.FORECAST_CAP, Strategy.FORECAST_CAP)
 
 
@@ -273,8 +306,8 @@ def test_recorded_forecast_matches_vectorized_recomputation():
     symbol = 'BTC'
     start = datetime(2026, 1, 1)
     n = 250
-    rsi_windows = [7, 14]
-    weights = [0.5, 0.5]
+    variations = _rvars(7, 14)
+    weights = {'7': 0.5, '14': 0.5}
     forecast_scalar_lookback = 30
 
     closes = _oscillating_closes(n)
@@ -283,7 +316,7 @@ def test_recorded_forecast_matches_vectorized_recomputation():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = RSIMRStrategy(
         dh, [symbol],
-        rsi_windows=rsi_windows,
+        variations=variations,
         weights=weights,
         forecast_scalar_lookback=forecast_scalar_lookback,
     )
@@ -292,7 +325,7 @@ def test_recorded_forecast_matches_vectorized_recomputation():
     recorded = strat.get_records(symbol)['forecast']
     expected = _vectorized_rsimr(
         frame['Close'],
-        rsi_windows=rsi_windows,
+        variations=variations,
         weights=weights,
         forecast_scalar_lookback=forecast_scalar_lookback,
     )
@@ -325,7 +358,7 @@ def test_oversold_market_gets_long_forecast():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = RSIMRStrategy(
         dh, [symbol],
-        rsi_windows=[4, 8], weights=[0.5, 0.5],
+        variations=_rvars(4, 8),
         forecast_scalar_lookback=10,
     )
     _drive(strat, dh, frame, symbol)
@@ -346,7 +379,7 @@ def test_overbought_market_gets_short_forecast():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = RSIMRStrategy(
         dh, [symbol],
-        rsi_windows=[4, 8], weights=[0.5, 0.5],
+        variations=_rvars(4, 8),
         forecast_scalar_lookback=10,
     )
     _drive(strat, dh, frame, symbol)
@@ -368,14 +401,13 @@ def test_fdm_scales_combined_forecast():
     start = datetime(2026, 1, 1)
     closes = _oscillating_closes(250)
     frame = _build_frame(closes, start)
-    rsi_windows = [7, 14]
-    weights = [0.5, 0.5]
+    variations = _rvars(7, 14)
 
     def _run(fdm_value: float) -> pd.Series:
         dh = _StepwiseDataHandler(frame, symbol)
         strat = RSIMRStrategy(
             dh, [symbol],
-            rsi_windows=rsi_windows, weights=weights, fdm=fdm_value,
+            variations=variations, fdm=fdm_value,
             forecast_scalar_lookback=30,
         )
         _drive(strat, dh, frame, symbol)
@@ -409,7 +441,7 @@ def test_fdm_column_recorded_in_records():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = RSIMRStrategy(
         dh, [symbol],
-        rsi_windows=[4], weights=[1.0], fdm=fdm_value,
+        variations=_rvars(4), fdm=fdm_value,
         forecast_scalar_lookback=10,
     )
     _drive(strat, dh, frame, symbol)
@@ -449,7 +481,7 @@ def test_forecast_caps_at_plus_minus_one_hundred():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = RSIMRStrategy(
         dh, [symbol],
-        rsi_windows=[4], weights=[1.0],
+        variations=_rvars(4),
         forecast_scalar_lookback=20,
     )
     _drive(strat, dh, frame, symbol)
@@ -462,7 +494,7 @@ def test_forecast_caps_at_plus_minus_one_hundred():
 
 
 def test_per_variation_forecast_columns_present_and_capped():
-    """Each ``forecast_<w>`` column exists and individually respects
+    """Each ``forecast_<label>`` column exists and individually respects
     ``±Strategy.FORECAST_CAP`` (the cap is applied per variation before the
     weighted combine)."""
     symbol = 'BTC'
@@ -476,17 +508,17 @@ def test_per_variation_forecast_columns_present_and_capped():
         closes.append(base)
     frame = _build_frame(closes, start)
 
-    rsi_windows = [4, 8]
+    variations = _rvars(4, 8)
     dh = _StepwiseDataHandler(frame, symbol)
     strat = RSIMRStrategy(
         dh, [symbol],
-        rsi_windows=rsi_windows, weights=[0.5, 0.5],
+        variations=variations,
         forecast_scalar_lookback=20,
     )
     _drive(strat, dh, frame, symbol)
 
     records = strat.get_records(symbol)
-    per_var_cols = [f'forecast_{w}' for w in rsi_windows]
+    per_var_cols = [f'forecast_{label}' for label in variations]
     for col in per_var_cols:
         assert col in records.columns
         series = records[col].dropna()
@@ -513,7 +545,7 @@ def test_recorded_forecast_is_nan_during_warmup():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = RSIMRStrategy(
         dh, [symbol],
-        rsi_windows=[4, 8], weights=[0.5, 0.5],
+        variations=_rvars(4, 8),
         forecast_scalar_lookback=20,
     )
     _drive(strat, dh, frame, symbol)
@@ -526,7 +558,7 @@ def test_recorded_forecast_is_nan_during_warmup():
 
 def test_strategy_has_no_events_queue_attribute():
     """Strategy takes no events_queue; the attribute is absent."""
-    strat = _make(rsi_windows=[4], weights=[1.0], forecast_scalar_lookback=10)
+    strat = _make(variations=_rvars(4), forecast_scalar_lookback=10)
     assert not hasattr(strat, 'events_queue')
 
 
@@ -540,7 +572,7 @@ def test_cached_forecast_matches_last_recorded_non_nan_forecast():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = RSIMRStrategy(
         dh, [symbol],
-        rsi_windows=[7], weights=[1.0],
+        variations=_rvars(7),
         forecast_scalar_lookback=30,
     )
     _drive(strat, dh, frame, symbol)
@@ -560,7 +592,7 @@ def test_cached_forecast_is_none_during_warmup():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = RSIMRStrategy(
         dh, [symbol],
-        rsi_windows=[7], weights=[1.0],
+        variations=_rvars(7),
         forecast_scalar_lookback=30,
     )
     _drive(strat, dh, frame, symbol)
@@ -578,7 +610,7 @@ def test_is_warmed_up_flips_and_is_monotone():
     dh = _StepwiseDataHandler(frame, symbol)
     strat = RSIMRStrategy(
         dh, [symbol],
-        rsi_windows=[7], weights=[1.0],
+        variations=_rvars(7),
         forecast_scalar_lookback=30,
     )
     assert strat.is_warmed_up(symbol) is False

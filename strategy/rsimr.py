@@ -66,7 +66,18 @@ from strategy._base import Strategy, _DataHandlerLike
 __all__ = ['RSIMRStrategy']
 
 
-_DEFAULT_RSI_WINDOWS: List[int] = [7, 14, 28]
+# Default variations as a ``{label: {param_name: value}}`` dict. The labels
+# are param-derived so a default-constructed strategy emits diagnostic columns
+# reading ``rsi_7`` etc. (identical to the pre-refactor output).
+_DEFAULT_VARIATIONS: Dict[str, Dict[str, int]] = {
+    '7': {'window': 7},
+    '14': {'window': 14},
+    '28': {'window': 28},
+}
+
+# Required per-variation param key — validated by strict set-equality so a
+# typo fails loudly instead of silently NaN-ing the variation.
+_PARAM_KEYS = frozenset({'window'})
 
 # Clip the normalized RSI deviation away from ±1 so ``math.atanh`` stays finite
 # when RSI hits exactly 0 or 100 (Wilder RSI does reach the bounds when
@@ -96,11 +107,11 @@ def _raw_from_rsi(rsi_value: float) -> float:
 class RSIMRStrategy(Strategy):
     """RSI mean-reverter with one or more RSI windows and a dynamic forecast scalar.
 
-    Per-symbol state:
-        ``_rsis[i]``          — RSI indicator for variation ``i``.
-        ``_abs_raw_smas[i]``  — rolling mean of ``|raw_i|`` over
-                                 ``forecast_scalar_lookback`` finalized bars,
-                                 feeding the dynamic forecast scalar.
+    Per-symbol state (per-variation indicators keyed by variation label):
+        ``_rsis[label]``          — RSI indicator for variation ``label``.
+        ``_abs_raw_smas[label]``  — rolling mean of ``|raw_label|`` over
+                                     ``forecast_scalar_lookback`` finalized bars,
+                                     feeding the dynamic forecast scalar.
     """
 
     def __init__(
@@ -108,8 +119,8 @@ class RSIMRStrategy(Strategy):
         data_handler: _DataHandlerLike,
         symbol_list: List[str],
         execution_timeframe: str = '1d',
-        rsi_windows: Optional[List[int]] = None,
-        weights: Optional[List[float]] = None,
+        variations: Optional[Dict[str, Dict[str, int]]] = None,
+        weights: Optional[Dict[str, float]] = None,
         fdm: float = 1.0,
         forecast_scalar_lookback: int = 256,
     ):
@@ -119,14 +130,24 @@ class RSIMRStrategy(Strategy):
         ----------
         execution_timeframe
             Bar timeframe the RSI chain runs on (default ``'1d'``).
-        rsi_windows
-            List of Wilder-RSI windows in bars of ``execution_timeframe``.
-            Default ``[7, 14, 28]`` — a fast/medium/slow trio. Each window must
-            be ``>= 2`` and the windows must be distinct (the per-bar diagnostic
-            columns are window-named).
+        variations
+            Mapping ``{label: {'window': w}}`` of the Wilder-RSI variations, in
+            bars of ``execution_timeframe``. The label is an opaque string
+            keying both the combination weights and the per-bar diagnostic
+            columns (``rsi_<label>`` …), mirroring the orchestrator's
+            ``{label: strategy}`` shape; the nested ``{param_name: value}``
+            params dict generalizes to indicators with more parameters. Each
+            params dict must have exactly the key ``{'window'}`` with
+            ``window >= 2``. Default ``{'7': {'window': 7}, '14': {'window':
+            14}, '28': {'window': 28}}`` — a fast/medium/slow trio; the
+            param-derived labels keep the default diagnostic columns reading
+            ``rsi_7`` etc. Distinct labels may map to the same window (the
+            columns are label-keyed, not window-keyed).
         weights
-            Per-variation combination weights. Must have the same length as
-            ``rsi_windows`` and sum to 1.0. ``None`` (default) → equal weights.
+            Optional ``{label: weight}`` per-variation combination weights.
+            Keys must match ``variations`` exactly; values must be finite,
+            non-negative, and sum to ``1.0``. ``None`` (default) → equal
+            weight ``1/N`` via ``analytics.equal_weight``.
         fdm
             Forecast Diversification Multiplier (Carver). Multiplied into the
             combined weighted forecast to scale it back up after
@@ -144,33 +165,32 @@ class RSIMRStrategy(Strategy):
         """
         super().__init__(data_handler, symbol_list)
 
-        if rsi_windows is None:
-            rsi_windows = list(_DEFAULT_RSI_WINDOWS)
-        if not rsi_windows:
-            raise ValueError("rsi_windows must be non-empty")
-        for w in rsi_windows:
-            if w < 2:
-                raise ValueError(
-                    f"each RSI window must be >= 2, got {w}"
-                )
-        if len(set(rsi_windows)) != len(rsi_windows):
-            raise ValueError(
-                f"rsi_windows must be distinct (diagnostic columns are "
-                f"window-named), got {rsi_windows}"
-            )
+        # Shared weight validator (analytics.equal_weight default). Imported
+        # lazily so the strategy import path doesn't pull in cvxpy.
+        from analytics import validate_named_weights
 
-        n_vars = len(rsi_windows)
-        if weights is None:
-            weights = [1.0 / n_vars] * n_vars
-        else:
-            if len(weights) != n_vars:
+        if variations is None:
+            variations = {
+                label: dict(params)
+                for label, params in _DEFAULT_VARIATIONS.items()
+            }
+        if not variations:
+            raise ValueError("variations must be a non-empty dict")
+        for label, params in variations.items():
+            if not isinstance(params, dict) or set(params) != _PARAM_KEYS:
                 raise ValueError(
-                    f"weights length {len(weights)} != rsi_windows length {n_vars}"
+                    f"variation {label!r} params must be a dict with keys "
+                    f"{sorted(_PARAM_KEYS)}, got {params!r}"
                 )
-            if abs(sum(weights) - 1.0) > 1e-6:
+            window = params['window']
+            if window < 2:
                 raise ValueError(
-                    f"weights must sum to 1.0, got sum={sum(weights)}"
+                    f"variation {label!r}: window must be >= 2, got {window}"
                 )
+
+        # Keys set-equal to the variation labels, finite, non-negative,
+        # sum→1; ``None`` → equal weight (shared with the orchestrator).
+        weights = validate_named_weights(weights, list(variations.keys()))
 
         if fdm <= 0:
             raise ValueError(f"fdm must be > 0, got {fdm}")
@@ -181,18 +201,22 @@ class RSIMRStrategy(Strategy):
             )
 
         self.execution_timeframe = execution_timeframe
-        self.rsi_windows: List[int] = list(rsi_windows)
-        self.weights: List[float] = list(weights)
+        self.variations: Dict[str, Dict[str, int]] = {
+            label: dict(params) for label, params in variations.items()
+        }
+        self.weights: Dict[str, float] = weights
         self.fdm = fdm
         self.forecast_scalar_lookback = forecast_scalar_lookback
 
-        # Per-symbol per-variation indicators.
-        self._rsis: Dict[str, List[RSI]] = {
-            s: [RSI(window=w) for w in self.rsi_windows]
+        # Per-symbol per-variation indicators, keyed by variation label.
+        self._rsis: Dict[str, Dict[str, RSI]] = {
+            s: {label: RSI(window=p['window'])
+                for label, p in self.variations.items()}
             for s in symbol_list
         }
-        self._abs_raw_smas: Dict[str, List[SMA]] = {
-            s: [SMA(window=forecast_scalar_lookback) for _ in self.rsi_windows]
+        self._abs_raw_smas: Dict[str, Dict[str, SMA]] = {
+            s: {label: SMA(window=forecast_scalar_lookback)
+                for label in self.variations}
             for s in symbol_list
         }
 
@@ -204,10 +228,11 @@ class RSIMRStrategy(Strategy):
 
         * ``'forecast'`` — combined capped forecast (possibly NaN).
         * ``'fdm'`` — the Forecast Diversification Multiplier.
-        * Per variation window ``w``: ``'rsi_<w>'`` (finalized RSI),
-          ``'raw_<w>'`` (raw arctanh forecast pre-scalar), ``'abs_mean_<w>'``
-          (rolling mean of ``|raw|``), ``'scalar_<w>'`` (dynamic forecast
-          scalar), and ``'forecast_<w>'`` — the per-variation forecast
+        * Per variation ``label``: ``'rsi_<label>'`` (finalized RSI),
+          ``'raw_<label>'`` (raw arctanh forecast pre-scalar),
+          ``'abs_mean_<label>'`` (rolling mean of ``|raw|``),
+          ``'scalar_<label>'`` (dynamic forecast scalar), and
+          ``'forecast_<label>'`` — the per-variation forecast
           **capped at ±Strategy.FORECAST_CAP** before combining.
 
         The base class clamps the top-level forecast to
@@ -231,17 +256,16 @@ class RSIMRStrategy(Strategy):
         # ── Per-variation pipeline: update RSI, push forming |raw| into the
         # abs-mean SMA, then compute the forecast and intermediates from
         # finalized values. ─────────────────────────────────────────────────
-        n_vars = len(self.rsi_windows)
         nan = float('nan')
-        per_var_forecasts: List[float] = [nan] * n_vars
-        per_var_rsi: List[float] = [nan] * n_vars
-        per_var_raw: List[float] = [nan] * n_vars
-        per_var_abs_mean: List[float] = [nan] * n_vars
-        per_var_scalar: List[float] = [nan] * n_vars
+        per_var_forecasts: Dict[str, float] = {l: nan for l in self.variations}
+        per_var_rsi: Dict[str, float] = {l: nan for l in self.variations}
+        per_var_raw: Dict[str, float] = {l: nan for l in self.variations}
+        per_var_abs_mean: Dict[str, float] = {l: nan for l in self.variations}
+        per_var_scalar: Dict[str, float] = {l: nan for l in self.variations}
 
-        for i in range(n_vars):
-            rsi = self._rsis[symbol][i]
-            abs_sma = self._abs_raw_smas[symbol][i]
+        for label in self.variations:
+            rsi = self._rsis[symbol][label]
+            abs_sma = self._abs_raw_smas[symbol][label]
 
             rsi.update(forming_ts, forming_close)
 
@@ -267,16 +291,16 @@ class RSIMRStrategy(Strategy):
                     scalar = (
                         Strategy.TARGET_AVG_ABS_FORECAST / abs_mean_latest
                     )
-                    per_var_rsi[i] = rsi_latest
-                    per_var_raw[i] = raw_latest
-                    per_var_abs_mean[i] = abs_mean_latest
-                    per_var_scalar[i] = scalar
+                    per_var_rsi[label] = rsi_latest
+                    per_var_raw[label] = raw_latest
+                    per_var_abs_mean[label] = abs_mean_latest
+                    per_var_scalar[label] = scalar
                     # Cap each variation individually before combining — keeps
                     # one runaway variation from dominating the weighted sum and
-                    # keeps the recorded ``forecast_<w>`` diagnostic on the same
-                    # ``[-100, +100]`` scale as the combined ``forecast``.
+                    # keeps the recorded ``forecast_<label>`` diagnostic on the
+                    # same ``[-100, +100]`` scale as the combined ``forecast``.
                     cap = Strategy.FORECAST_CAP
-                    per_var_forecasts[i] = max(
+                    per_var_forecasts[label] = max(
                         -cap, min(cap, raw_latest * scalar)
                     )
 
@@ -286,11 +310,11 @@ class RSIMRStrategy(Strategy):
         # calibrated against the full ensemble. ``Strategy.update_bar`` clamps
         # the final value to ``±Strategy.FORECAST_CAP`` before storing it, so no
         # clamp is applied here.
-        if any(pd.isna(f) for f in per_var_forecasts):
+        if any(pd.isna(per_var_forecasts[l]) for l in self.variations):
             final_forecast = nan
         else:
             final_forecast = self.fdm * sum(
-                w * f for w, f in zip(self.weights, per_var_forecasts)
+                self.weights[l] * per_var_forecasts[l] for l in self.variations
             )
 
         # ── Recorded fields. ────────────────────────────────────────────────
@@ -298,10 +322,10 @@ class RSIMRStrategy(Strategy):
             'forecast': final_forecast,
             'fdm': self.fdm,
         }
-        for i, w in enumerate(self.rsi_windows):
-            row[f'rsi_{w}'] = per_var_rsi[i]
-            row[f'raw_{w}'] = per_var_raw[i]
-            row[f'abs_mean_{w}'] = per_var_abs_mean[i]
-            row[f'scalar_{w}'] = per_var_scalar[i]
-            row[f'forecast_{w}'] = per_var_forecasts[i]
+        for label in self.variations:
+            row[f'rsi_{label}'] = per_var_rsi[label]
+            row[f'raw_{label}'] = per_var_raw[label]
+            row[f'abs_mean_{label}'] = per_var_abs_mean[label]
+            row[f'scalar_{label}'] = per_var_scalar[label]
+            row[f'forecast_{label}'] = per_var_forecasts[label]
         return row

@@ -100,8 +100,12 @@ data_handler = HistoricDataHandler(
 # same dynamic forecast scalar EWMAC uses to drive avg |f| toward 50.
 strategy = RSIMRStrategy(
     data_handler, config.symbols,
-    rsi_windows=[3, 14, 28],
-    weights=[0.50, 0.25, 0.25],
+    variations={
+        '3': {'window': 3},
+        '14': {'window': 14},
+        '28': {'window': 28},
+    },
+    weights={'3': 0.50, '14': 0.25, '28': 0.25},
     fdm=1.0,
     forecast_scalar_lookback=256,
 )
