@@ -9,7 +9,7 @@ sys.path.insert(0, os.getcwd())
 from logging_setup import configure_logging
 configure_logging(level=logging.WARNING)
 
-from analytics import backtest_stats
+from analytics import backtest_stats, pnl_attribution, turnover_stats
 from config import BacktestConfig, uniform_registry
 from data import HistoricDataHandler
 from strategy import EWMACStrategy, RSIMRStrategy
@@ -102,7 +102,7 @@ rsimr = RSIMRStrategy(
         '28': {'window': 28},
     },
     weights={'3': 0.50, '14': 0.25, '28': 0.25},
-    fdm=1.0,
+    fdm=1.12,
     forecast_scalar_lookback=256,
 )
 
@@ -112,7 +112,7 @@ rsimr = RSIMRStrategy(
 # the Backtester — no engine or risk-manager change is needed.
 orchestrator = Orchestrator(
     {'ewmac': ewmac, 'rsimr': rsimr},
-    weights={'ewmac': 1, 'rsimr': 0},   # equal default; shown explicitly
+    weights={'ewmac': 0.5, 'rsimr': 0.5},   # equal default; shown explicitly
     fdm=1.0,                               # cross-strategy diversification uplift
 )
 
@@ -262,3 +262,78 @@ if not orch_records.empty:
 if not riskmanager_records.empty:
     print(f"\n--- Risk-manager records: last 10 bars ({_fc_symbol}) ---")
     print(riskmanager_records.tail(10).to_string())
+
+# =====================================================================
+#  5. PNL ATTRIBUTION
+# =====================================================================
+print(f"\n{'='*80}")
+print("  PNL ATTRIBUTION")
+print(f"{'='*80}")
+
+attribution = pnl_attribution(equity_df, orchestrator)
+
+print("\n--- Cumulative PnL by strategy [$] ---")
+print(attribution.by('strategy').sum().to_string())
+
+print("\n--- Cumulative PnL by strategy/variation [$] ---")
+print(attribution.by('strategy', 'variation').sum().to_string())
+
+print("\n--- Top / bottom symbol contributors [$] ---")
+_by_symbol = attribution.by('symbol').sum().sort_values()
+print(pd.concat([_by_symbol.tail(5)[::-1], _by_symbol.head(5)]).to_string())
+
+# Reconciliation: attribution is gross of commission, so its cumulative
+# total equals Net PnL + Total Commission from backtest_stats.
+_gross = attribution.total.cumsum().iloc[-1]
+_expected = stats['Net PnL [$]'] + stats['Total Commission [$]']
+print(f"\n  Attributed gross PnL: ${_gross:,.2f}")
+print(f"  Net PnL + commission: ${_expected:,.2f}")
+print(f"  Reconciliation gap:   ${_gross - _expected:,.6f}")
+
+# =====================================================================
+#  6. TURNOVER
+# =====================================================================
+print(f"\n{'='*80}")
+print("  TURNOVER")
+print(f"{'='*80}")
+
+turnover = turnover_stats(
+    equity_df, trade_df,
+    timeframe=config.base_timeframe,
+    days_convention=config.days_convention,
+)
+print(turnover.to_string())
+
+
+
+# import plotly.express as px
+# total = (
+#     pd.DataFrame(equity_df['realized_pnl'].tolist(),   index=equity_df.index)
+#     + pd.DataFrame(equity_df['unrealized_pnl'].tolist(), index=equity_df.index)
+# )
+# pnl_by_instrument = total.groupby(level=0).last()   # one row per timestamp
+# fig = px.line(pnl_by_instrument)
+# fig.show(renderer='browser')
+# fig = px.line(equity_df[['account_balance', 'available_balance']].resample('d').last())
+# fig.show(renderer='browser')
+
+# import plotly.express as px
+# list_weights = []
+# for x in bt.risk_manager.get_live_symbols():
+#     weight = bt.risk_manager.get_records(x)['instrument_weight'].astype(float)
+#     weight.name = x
+#     list_weights.append( weight )
+# df_weight = pd.concat(list_weights, axis=1)
+# fig = px.line(df_weight)
+# fig.show(renderer='browser')
+
+# from analytics import correlation_matrix
+# list_close = []
+# for x in bt.risk_manager.get_live_symbols():
+#     close = bt.strategy.get_records(x)['close'].astype(float)
+#     close.name = x
+#     list_close.append( close )
+# df_close = pd.concat(list_close, axis=1)
+# corr_matrix = correlation_matrix(df_close.diff().dropna(), lookback=60)
+# corr_matrix = correlation_matrix(df_close.diff().dropna(), lookback=60, shrinkage='ledoit_wolf')
+# display(corr_matrix)

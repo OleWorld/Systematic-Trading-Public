@@ -9,7 +9,7 @@ sys.path.insert(0, os.getcwd())
 from logging_setup import configure_logging
 configure_logging(level=logging.WARNING)
 
-from analytics import backtest_stats
+from analytics import backtest_stats, turnover_stats
 from config import BacktestConfig, uniform_registry
 from data import HistoricDataHandler
 from strategy import RSIMRStrategy
@@ -262,6 +262,20 @@ if not strategy_records.empty:
 if not riskmanager_records.empty:
     print(f"\n--- Risk-manager records: last 10 bars ({_fc_symbol}) ---")
     print(riskmanager_records.tail(10).to_string())
+
+# =====================================================================
+#  5. TURNOVER
+# =====================================================================
+print(f"\n{'='*80}")
+print("  TURNOVER")
+print(f"{'='*80}")
+
+turnover = turnover_stats(
+    equity_df, trade_df,
+    timeframe=config.base_timeframe,
+    days_convention=config.days_convention,
+)
+print(turnover.to_string())
 
 
 # import plotly.express as px
