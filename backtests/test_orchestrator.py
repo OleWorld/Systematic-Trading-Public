@@ -11,6 +11,7 @@ configure_logging(level=logging.WARNING)
 
 from analytics import backtest_stats, pnl_attribution, turnover_stats
 from config import BacktestConfig, uniform_registry
+from runlog import save_run
 from data import HistoricDataHandler
 from strategy import EWMACStrategy, RSIMRStrategy
 from orchestrator import Orchestrator
@@ -92,7 +93,7 @@ ewmac = EWMACStrategy(
     weights={'4_16': 0.42, '16_64': 0.16, '32_128': 0.42},
     fdm=1.12,
     vol_lookback=25,
-    forecast_scalar_lookback=500,
+    forecast_scalar_lookback=256,
 )
 rsimr = RSIMRStrategy(
     data_handler, config.symbols,
@@ -157,6 +158,14 @@ bt = Backtester(events_queue, data_handler, orchestrator, portfolio,
 
 # --- Run ---
 bt.run()
+
+# --- Archive the run (raw tables first — a printing/plotting failure below
+# can never lose the archive) ---
+run_record = save_run(
+    portfolio=bt.portfolio, strategy=orchestrator, risk_manager=risk_manager,
+    config=config, instruments=instruments, label='orchestrator-smoke',
+)
+print(f"Run archived: {run_record.path}")
 
 # --- Portfolio results ---
 portfolio = bt.portfolio
@@ -259,6 +268,13 @@ if not riskmanager_records.empty:
 if not orch_records.empty:
     print(f"\n--- Orchestrator records: last 10 bars ({_fc_symbol}) ---")
     print(orch_records.tail(10).to_string())
+# Each child strategy's own record table (incl. per-variation
+# forecast_<label>/weight_<label> diagnostics).
+for label in orchestrator.strategies:
+    strat_records = orchestrator.strategies[label].get_records(_fc_symbol)
+    if not strat_records.empty:
+        print(f"\n--- [{label}] strategy records: last 10 bars ({_fc_symbol}) ---")
+        print(strat_records.tail(10).to_string())
 if not riskmanager_records.empty:
     print(f"\n--- Risk-manager records: last 10 bars ({_fc_symbol}) ---")
     print(riskmanager_records.tail(10).to_string())

@@ -241,9 +241,12 @@ class EWMACStrategy(Strategy):
         * Per variation ``label``:
           ``'fast_ema_<label>'``, ``'slow_ema_<label>'``,
           ``'vol_adj_<label>'``, ``'abs_mean_<label>'``,
-          ``'scalar_<label>'`` (latest finalized intermediates), and
+          ``'scalar_<label>'`` (latest finalized intermediates),
           ``'forecast_<label>'`` — the per-variation forecast
-          **capped at ±Strategy.FORECAST_CAP** before combining.
+          **capped at ±Strategy.FORECAST_CAP** before combining — and
+          ``'weight_<label>'`` — the variation's combination weight
+          (constant per run; recorded for audit/attribution, mirroring
+          the orchestrator's ``weight_<label>`` convention).
 
         The base class clamps the top-level forecast to
         ``±Strategy.FORECAST_CAP`` and writes it to ``self.forecasts[symbol]``
@@ -378,4 +381,5 @@ class EWMACStrategy(Strategy):
             row[f'abs_mean_{label}'] = per_var_abs_mean[label]
             row[f'scalar_{label}'] = per_var_scalar[label]
             row[f'forecast_{label}'] = per_var_forecasts[label]
+            row[f'weight_{label}'] = self.weights[label]
         return row

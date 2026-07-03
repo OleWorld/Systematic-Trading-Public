@@ -231,9 +231,12 @@ class RSIMRStrategy(Strategy):
         * Per variation ``label``: ``'rsi_<label>'`` (finalized RSI),
           ``'raw_<label>'`` (raw arctanh forecast pre-scalar),
           ``'abs_mean_<label>'`` (rolling mean of ``|raw|``),
-          ``'scalar_<label>'`` (dynamic forecast scalar), and
+          ``'scalar_<label>'`` (dynamic forecast scalar),
           ``'forecast_<label>'`` — the per-variation forecast
-          **capped at ±Strategy.FORECAST_CAP** before combining.
+          **capped at ±Strategy.FORECAST_CAP** before combining — and
+          ``'weight_<label>'`` — the variation's combination weight
+          (constant per run; recorded for audit/attribution, mirroring
+          the orchestrator's ``weight_<label>`` convention).
 
         The base class clamps the top-level forecast to
         ``±Strategy.FORECAST_CAP`` and writes it to ``self.forecasts[symbol]``
@@ -328,4 +331,5 @@ class RSIMRStrategy(Strategy):
             row[f'abs_mean_{label}'] = per_var_abs_mean[label]
             row[f'scalar_{label}'] = per_var_scalar[label]
             row[f'forecast_{label}'] = per_var_forecasts[label]
+            row[f'weight_{label}'] = self.weights[label]
         return row

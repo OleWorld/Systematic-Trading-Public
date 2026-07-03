@@ -11,6 +11,7 @@ configure_logging(level=logging.WARNING)
 
 from analytics import backtest_stats, turnover_stats
 from config import BacktestConfig, uniform_registry
+from runlog import save_run
 from data import HistoricDataHandler
 from strategy import EWMACStrategy
 from portfolio import BacktestPortfolio, PortfolioMarginModel
@@ -106,7 +107,7 @@ strategy = EWMACStrategy(
     weights={'4_16': 0.42, '16_64': 0.16, '32_128': 0.42},
     fdm=1.12,
     vol_lookback=25,
-    forecast_scalar_lookback=500,
+    forecast_scalar_lookback=256,
 )
 
 # The portfolio reads each symbol's point_value (PnL/margin) and MarginModel
@@ -153,6 +154,14 @@ bt = Backtester(events_queue, data_handler, strategy, portfolio,
 
 # --- Run ---
 bt.run()
+
+# --- Archive the run (raw tables first — a printing/plotting failure below
+# can never lose the archive) ---
+run_record = save_run(
+    portfolio=bt.portfolio, strategy=strategy, risk_manager=risk_manager,
+    config=config, instruments=instruments, label='ewmac-smoke',
+)
+print(f"Run archived: {run_record.path}")
 
 # --- Portfolio results ---
 portfolio = bt.portfolio
