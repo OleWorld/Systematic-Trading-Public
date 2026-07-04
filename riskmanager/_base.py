@@ -14,13 +14,22 @@ from event import BarEvent, OrderEvent, OrderType, Direction
 # ──────────────────────────────────────────────
 
 class _PortfolioLike(Protocol):
-    """Subset of the Portfolio surface that RiskManager relies on."""
+    """Subset of the Portfolio surface that RiskManager relies on.
+
+    ``projected_position`` is the realized position plus the signed
+    quantities of in-flight (pending) MKT orders — the baseline risk
+    managers size their resize diff against, so an order already on its
+    way to fill (e.g. a same-bar margin-call liquidation) is never
+    double-traded.
+    """
 
     positions: Dict[str, float]
 
     def get_price(self, symbol: str) -> Optional[float]: ...
 
     def calculate_balance(self) -> float: ...
+
+    def projected_position(self, symbol: str) -> float: ...
 
     def submit_order(self, symbol: str, quantity: float, direction: Direction,
                      timestamp, order_type: OrderType,

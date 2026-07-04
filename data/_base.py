@@ -135,13 +135,19 @@ class DataHandler(abc.ABC):
         immutable, but the deque slot is overwritten so the forming bar
         is visible to ``get_latest_bars``. Aggregation is built only from
         completed base bars, which keeps volume correct.
+
+        NaN base volumes (allowed through by design — see ``_append_bar``)
+        are treated as ``0.0`` in the HTF volume sum: one flaky tick must
+        not poison the whole period's aggregate with NaN. The HTF volume
+        is therefore the sum of the period's *non-NaN* base volumes.
         """
         key = (symbol, timeframe)
         period_start = get_period_start(ts, timeframe)
         deq = self._htf_bar_data[key]
+        v_safe = 0.0 if pd.isna(v) else v
 
         if not deq or deq[-1].timestamp != period_start:
-            deq.append(Bar(period_start, o, h, l, c, v))
+            deq.append(Bar(period_start, o, h, l, c, v_safe))
         else:
             last = deq[-1]
             deq[-1] = Bar(
@@ -150,7 +156,7 @@ class DataHandler(abc.ABC):
                 high=max(last.high, h),
                 low=min(last.low, l),
                 close=c,
-                volume=last.volume + v,
+                volume=last.volume + v_safe,
             )
 
     # ── queries ──────────────────────────────────

@@ -62,8 +62,6 @@ config = BacktestConfig(
     vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
     annual_target_vol=1_000_000,        # $1M annual vol
     position_buffer=0.25,
-
-    fill_on='signal_close',
 )
 
 # Per-symbol economics (point_value, fractional, slippage, commission, margin)
@@ -146,7 +144,6 @@ risk_manager = VolTargetingRiskManager(
 execution = BacktestExecution(
     events_queue,
     instruments=instruments,
-    fill_on=config.fill_on,
 )
 
 bt = Backtester(events_queue, data_handler, strategy, portfolio,

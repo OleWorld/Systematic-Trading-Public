@@ -34,15 +34,19 @@ class SimpleRiskManager(RiskManager):
     On every completed bar (``event.is_forming = False``), the manager
     reads ``strategy.get_forecast(symbol)``, computes the target
     quantity via ``_compute_target_qty``, and submits a MKT order for
-    the difference against the current realized position. If the
-    realized position already matches the target (within ``1e-9``), no
-    order is submitted.
+    the difference against the *projected* position — the realized
+    position plus in-flight pending MKT orders (e.g. a same-bar
+    margin-call liquidation), so an order already on its way to fill is
+    never double-traded. If the projected position already matches the
+    target (within ``1e-9``), no order is submitted.
 
     Per-bar diagnostic log analogous to ``Strategy.get_records``:
     every completed bar appends one row to ``self._records[symbol]``.
     Columns: ``forecast``, ``price``, ``size_mode``, ``position_size``,
-    ``target_qty``, ``current_qty``, ``trade_qty``, ``submitted``
-    (bool), and ``skip_reason`` ∈
+    ``target_qty``, ``current_qty`` (realized position),
+    ``pending_mkt_order_quantity`` (signed sum of in-flight MKT orders;
+    the resize diff targets ``current_qty + pending_mkt_order_quantity``),
+    ``trade_qty``, ``submitted`` (bool), and ``skip_reason`` ∈
     ``{None, 'no_price', 'warmup_forecast', 'at_target'}``
     (``'warmup_forecast'`` — the strategy has not cached a forecast yet,
     so ``get_forecast`` returns ``None``). Read via
@@ -116,6 +120,13 @@ class SimpleRiskManager(RiskManager):
         symbol = event.symbol
         forecast = self.strategy.get_forecast(symbol)
         current_qty = self.portfolio.positions.get(symbol, 0.0)
+        # Signed sum of in-flight (pending) MKT orders — e.g. a same-bar
+        # margin-call liquidation. The resize diff targets the projected
+        # end-state ``current_qty + pending_mkt_order_quantity`` so an
+        # order already on its way to fill is never double-traded.
+        pending_mkt_order_quantity = (
+            self.portfolio.projected_position(symbol) - current_qty
+        )
 
         # Seed the diagnostic row with always-known inputs;
         # _compute_target_qty supplies price / target_qty / skip_reason
@@ -129,6 +140,7 @@ class SimpleRiskManager(RiskManager):
             'position_size': self.position_size,
             'target_qty': None,
             'current_qty': current_qty,
+            'pending_mkt_order_quantity': pending_mkt_order_quantity,
             'trade_qty': None,
             'submitted': False,
             'skip_reason': None,
@@ -145,7 +157,7 @@ class SimpleRiskManager(RiskManager):
         if not self.instruments[symbol].fractional:
             target_qty = float(round(target_qty))
             row['target_qty'] = target_qty
-        trade_qty = target_qty - current_qty
+        trade_qty = target_qty - (current_qty + pending_mkt_order_quantity)
         row['trade_qty'] = trade_qty
 
         if abs(trade_qty) < 1e-9:                 # already at target

@@ -577,8 +577,7 @@ def test_integration_real_mini_backtest(tmp_path):
         portfolio, strategy, size_mode=config.size_mode,
         position_size=config.position_size, instruments=instruments,
     )
-    execution = BacktestExecution(events_queue, instruments=instruments,
-                                  fill_on=config.fill_on)
+    execution = BacktestExecution(events_queue, instruments=instruments)
     Backtester(events_queue, data_handler, strategy, portfolio,
                risk_manager, execution).run()
 

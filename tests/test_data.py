@@ -650,6 +650,34 @@ def test_append_bar_accepts_nan_volume():
     assert len(h._base_bar_data['BTC']) == 1
 
 
+def test_nan_volume_does_not_poison_htf_volume_sum():
+    """A NaN base volume counts as 0.0 in the HTF volume accumulation —
+    one flaky tick must not turn the whole period's aggregate into NaN
+    (regression: ``last.volume + NaN`` used to stick as NaN forever)."""
+    h = _new_stub(base='1h', timeframes={'1h': 50, '4h': 50})
+    t0 = datetime.datetime(2026, 1, 1, 0, tzinfo=UTC)
+    h._append_bar('BTC', t0, 1.0, 2.0, 0.5, 1.5, 10.0)
+    h._append_bar('BTC', t0 + datetime.timedelta(hours=1),
+                  1.5, 2.5, 1.0, 2.0, NAN)
+    h._append_bar('BTC', t0 + datetime.timedelta(hours=2),
+                  2.0, 3.0, 1.5, 2.5, 30.0)
+    htf = h._htf_bar_data[('BTC', '4h')]
+    assert len(htf) == 1
+    assert htf[0].volume == 40.0  # 10 + 0 (NaN treated as 0) + 30
+
+
+def test_nan_volume_seeding_new_htf_period_starts_at_zero():
+    """A NaN-volume base bar that OPENS a new HTF period seeds the HTF
+    volume at 0.0, not NaN."""
+    h = _new_stub(base='1h', timeframes={'1h': 50, '4h': 50})
+    t0 = datetime.datetime(2026, 1, 1, 0, tzinfo=UTC)
+    h._append_bar('BTC', t0, 1.0, 2.0, 0.5, 1.5, NAN)
+    h._append_bar('BTC', t0 + datetime.timedelta(hours=1),
+                  1.5, 2.5, 1.0, 2.0, 20.0)
+    htf = h._htf_bar_data[('BTC', '4h')]
+    assert htf[0].volume == 20.0
+
+
 def test_append_bar_returns_true_for_valid_bar():
     h = _new_stub()
     ts = datetime.datetime(2026, 1, 1, tzinfo=UTC)

@@ -438,6 +438,10 @@ class _FakePortfolio:
     def calculate_balance(self):
         return self._balance
 
+    def projected_position(self, symbol):
+        # No pending-order ledger in the double: projected == realized.
+        return self.positions.get(symbol, 0.0)
+
     def submit_order(self, symbol, quantity, direction, timestamp,
                      order_type, price=None):
         self.submitted.append({

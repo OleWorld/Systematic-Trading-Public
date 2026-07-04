@@ -58,6 +58,10 @@ class FakePortfolio:
     def calculate_balance(self) -> float:
         return self._balance
 
+    def projected_position(self, symbol: str) -> float:
+        # No pending-order ledger in the double: projected == realized.
+        return self.positions.get(symbol, 0.0)
+
     def submit_order(self, symbol, quantity, direction, timestamp,
                      order_type, price=None):
         self.submitted.append({
@@ -2104,3 +2108,110 @@ def test_auto_recalc_counts_corr_timeframe_periods_not_base_bars():
                 ts=datetime(2026, 1, 2, hour, 0, 0),
             ))
     assert len(calls) == 1
+
+
+# ──────────────────────────────────────────────
+# Constant-price symbols in the inline corr derivation
+# ──────────────────────────────────────────────
+#
+# A live symbol whose closes are constant across the corr window has a
+# zero-variance change series — its correlation to anything is undefined
+# (NaN off-diagonals). Regression: the NaN used to reach the PSD repair
+# and crash the backtest with LinAlgError; now the symbol is excluded
+# from that recalc's rho and weights (WARNING) and re-enters when it
+# moves again.
+
+def _constant_series(n: int, level: float = 42.0) -> pd.Series:
+    return pd.Series(
+        level, index=pd.date_range('2024-01-01', periods=n, freq='D'),
+    )
+
+
+def test_constant_price_symbol_excluded_from_corr_recalc_without_crash(caplog):
+    symbols = ['BTC', 'ETH', 'DEAD']
+    lookback = 60
+    closes = {
+        'BTC': _price_series(lookback + 5, seed=1),
+        'ETH': _price_series(lookback + 5, seed=2),
+        'DEAD': _constant_series(lookback + 5),
+    }
+    with caplog.at_level(logging.WARNING):
+        rm = VolTargetingRiskManager(
+            FakePortfolio(), FakeStrategy(symbol_list=symbols),
+            FakeVolEstimator(), data_handler=FakeDataHandler(closes=closes),
+            instrument_weight_mode='min_variance', corr_lookback=lookback,
+            annual_target_vol=0.25, vol_target_mode='percent_volatility',
+        )
+    assert set(rm.instrument_weight) == {'BTC', 'ETH'}
+    assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
+    assert any('constant-price' in r.message for r in caplog.records)
+
+
+def test_constant_price_symbol_excluded_under_equal_weight_mode_too():
+    """equal_weight derives rho FIRST (for the IDM), so the constant
+    symbol must be equally absent from the weights — otherwise the DM's
+    weights-vs-labels check would raise."""
+    symbols = ['BTC', 'ETH', 'DEAD']
+    lookback = 60
+    closes = {
+        'BTC': _price_series(lookback + 5, seed=1),
+        'ETH': _price_series(lookback + 5, seed=2),
+        'DEAD': _constant_series(lookback + 5),
+    }
+    rm = VolTargetingRiskManager(
+        FakePortfolio(), FakeStrategy(symbol_list=symbols),
+        FakeVolEstimator(), data_handler=FakeDataHandler(closes=closes),
+        instrument_weight_mode='equal_weight', corr_lookback=lookback,
+        annual_target_vol=0.25, vol_target_mode='percent_volatility',
+    )
+    assert rm.instrument_weight == {
+        'BTC': pytest.approx(0.5), 'ETH': pytest.approx(0.5),
+    }
+    # rho was still derived over the non-constant pair, so the IDM earns
+    # its diversification credit instead of staying at the ctor default.
+    assert rm.idm > 1.0
+
+
+def test_all_constant_symbols_fall_back_to_equal_weight(caplog):
+    """Fewer than 2 non-constant columns: fall back to equal weight over
+    the full live subset (rho=1 degenerate case); IDM untouched."""
+    symbols = ['A', 'B']
+    lookback = 60
+    closes = {s: _constant_series(lookback + 5) for s in symbols}
+    with caplog.at_level(logging.WARNING):
+        rm = VolTargetingRiskManager(
+            FakePortfolio(), FakeStrategy(symbol_list=symbols),
+            FakeVolEstimator(), data_handler=FakeDataHandler(closes=closes),
+            instrument_weight_mode='min_variance', corr_lookback=lookback,
+            annual_target_vol=0.25, vol_target_mode='percent_volatility',
+        )
+    assert rm.instrument_weight == {
+        'A': pytest.approx(0.5), 'B': pytest.approx(0.5),
+    }
+    assert rm.idm == 1.0  # ctor default — fallback leaves it untouched
+
+
+# ──────────────────────────────────────────────
+# Negligible-vol guard (sigma floor)
+# ──────────────────────────────────────────────
+#
+# The EWMA vol estimator decays geometrically on a flat symbol and never
+# reaches exactly 0.0 once positive; without a floor the near-zero
+# divisor explodes the target to the margin-capped maximum. Sigma below
+# 1e-6 x |close| is treated as zero vol.
+
+def test_negligible_sigma_skips_as_zero_vol():
+    pf, _, _, rm = _make(sigma=1e-12)
+    rm.update_bar(_bar())                       # close = 100.0
+    assert pf.submitted == []
+    row = rm.get_records('BTC').iloc[0]
+    assert row['skip_reason'] == 'zero_vol'
+    assert row['submitted'] == False  # noqa: E712  (numpy bool in records)
+
+
+def test_small_but_material_sigma_still_sizes():
+    """The floor is RELATIVE to price (1e-6 x |close|): a small absolute
+    sigma on a low-priced instrument must still size normally."""
+    pf, _, _, rm = _make(sigma=0.01)            # >> 1e-6 * 100
+    rm.update_bar(_bar())
+    assert len(pf.submitted) == 1

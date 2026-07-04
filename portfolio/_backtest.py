@@ -51,13 +51,14 @@ class BacktestPortfolio(Portfolio):
     pending orders may span symbols, the model and ``point_value`` are looked
     up per order.
 
-    Position baseline for new-order margin checks (``_projected_position``)
-    is realized + pending MKT orders only; LMT pendings are excluded
-    because they may never fill, so a pending LMT must not be allowed to
-    pre-credit margin freedom for sizing other orders. The risk-increasing
-    portion of any pending order — MKT or LMT — is still reserved via
-    ``_reserved_margin``, so a pending LMT that *adds* to a position keeps
-    its capital committed; only the *freeing* assumption is dropped.
+    Position baseline for new-order margin checks (``projected_position``,
+    also the baseline risk managers size against) is realized + pending MKT
+    orders only; LMT pendings are excluded because they may never fill, so
+    a pending LMT must not be allowed to pre-credit margin freedom for
+    sizing other orders. The risk-increasing portion of any pending order —
+    MKT or LMT — is still reserved via ``_reserved_margin``, so a pending
+    LMT that *adds* to a position keeps its capital committed; only the
+    *freeing* assumption is dropped.
 
     Solvency / margin call: the portfolio is solvent while
     ``account_balance >= total maintenance margin`` (the sum of the
@@ -77,16 +78,25 @@ class BacktestPortfolio(Portfolio):
     only enough to restore the maintenance floor — is future work.)
 
     Fill-time margin trade-off: margin is reserved at submission price.
-    Between submission and fill the price can move arbitrarily — a pending
-    MKT BUY queued at $100 under ``fill_on='next_open'`` may fill at $200
-    on a gap-up — and the FIFO reservation walk does NOT re-validate at
-    fill time. The triggering fill itself can therefore drive
+    Between submission and fill the price can move — a resting LMT, or a
+    deferred cross-symbol MKT (e.g. a margin-call liquidation waiting for
+    its symbol's own bar), may fill on a later bar at a very different
+    price — and the FIFO reservation walk does NOT re-validate at fill
+    time. The triggering fill itself can therefore drive
     ``account_balance`` below zero in one bar; ``check_solvency`` catches
     this *after* the fill is booked (cash and realized PnL have already
     moved) and liquidates from there. This is acceptable for backtesting
     under conservative slippage models, but ``LiveExecution`` must
     implement its own pre-fill margin gating (in real markets the exchange
     rejects orders that would breach margin at fill time).
+
+    Cancelled orders: ``cancel_order`` and the margin-call cancel pass
+    remove an order from this portfolio's ledger and release its reserved
+    margin, but the simulated exchange holds its own pending book and an
+    already-emitted ``OrderEvent`` cannot be recalled from the events
+    queue. Any ``FillEvent`` that later arrives for a cancelled order id
+    is therefore **voided** in ``update_fill`` (WARNING log, no state
+    change) so a cancelled order can never move positions or cash.
     """
 
     def __init__(self, events_queue: _EventsQueueLike,
@@ -117,6 +127,14 @@ class BacktestPortfolio(Portfolio):
 
         # Pending order tracking (for margin reservation)
         self.pending_orders: Dict[str, OrderEvent] = {}
+
+        # Order ids cancelled via cancel_order / the margin-call cancel
+        # pass. The simulated exchange may still emit a fill for such an
+        # order (its book and the events queue are not recalled);
+        # update_fill voids those fills instead of booking them. An id is
+        # discarded once its fill has been voided (at most one fill per
+        # order id), keeping the set small.
+        self._cancelled_order_ids: set = set()
 
         # Per-symbol unrealized P&L (updated each bar)
         self.unrealized_pnl: Dict[str, float] = {s: 0.0 for s in symbol_list}
@@ -322,7 +340,22 @@ class BacktestPortfolio(Portfolio):
 
         Cash changes only by realized P&L minus commission (futures model).
         After applying the fill, run a solvency check.
+
+        Fills for cancelled orders are **voided**: the portfolio cancelled
+        the order (releasing its reserved margin), but the simulated
+        exchange's book / the events queue may still deliver the fill —
+        booking it would resurrect an order the account no longer backs.
         """
+        if (event.order_id is not None
+                and event.order_id in self._cancelled_order_ids):
+            self._cancelled_order_ids.discard(event.order_id)
+            logger.warning(
+                "[FILL VOIDED] %s %.6f %s | id=%s | Reason: order was cancelled",
+                event.direction.value, event.quantity, event.symbol,
+                event.order_id,
+            )
+            return
+
         symbol = event.symbol
         cfg = self.instruments[symbol]
         pv = cfg.point_value
@@ -447,7 +480,7 @@ class BacktestPortfolio(Portfolio):
         the only difference is the reference price (current safe price
         for MKT, limit price for LMT, which the caller resolves).
         """
-        pos = self._projected_position(symbol)
+        pos = self.projected_position(symbol)
         return self._scale_qty_to_margin(
             symbol, pos, qty, direction, price, exclude_order_id=None,
         )
@@ -499,22 +532,30 @@ class BacktestPortfolio(Portfolio):
 
     # ── Margin calculations ───────────────────
 
-    def _projected_position(self, symbol: str,
-                            exclude_order_id: Optional[str] = None) -> float:
+    def projected_position(self, symbol: str,
+                           exclude_order_id: Optional[str] = None) -> float:
         """
         Realized position plus signed quantities of all pending **MKT**
-        orders for this symbol (optionally excluding one order). LMT
-        pendings are intentionally excluded: they are conditional fills
-        (price may never reach the limit), so projecting them would let
-        an unfilled LMT pre-credit margin freedom that may never
-        materialize. MKT pendings are guaranteed to fill on the next
-        eligible bar by construction, so they are safe to project.
+        orders for this symbol (optionally excluding one order — an
+        internal hook used by the margin checks) — i.e. the position the
+        account will hold once in-flight MKT orders (e.g. a same-bar
+        margin-call liquidation) fill. LMT pendings are intentionally
+        excluded: they are conditional fills (price may never reach the
+        limit), so projecting them would let an unfilled LMT pre-credit
+        margin freedom that may never materialize. MKT pendings are
+        guaranteed to fill on the next eligible bar by construction, so
+        they are safe to project. Unknown symbols project ``0.0``.
 
-        Used as the position baseline for forward-looking margin checks
-        so that same-bar order sequences (e.g. FLATTEN + OPEN_OPPOSITE,
-        which are emitted as MKT) are evaluated against their projected
-        end-state. Risk-increasing LMT pendings still consume capital
-        via ``_reserved_margin``; this method only governs the position
+        Consumers: the forward-looking margin checks use it as the
+        position baseline so same-bar order sequences (e.g. FLATTEN +
+        OPEN_OPPOSITE, which are emitted as MKT) are evaluated against
+        their projected end-state; risk managers size their resize diff
+        against it so an in-flight liquidation is never double-traded.
+        NOTE for any future LMT-emitting risk manager: because resting
+        LMT orders are excluded here, sizing diffs against this baseline
+        would double-count them — such an RM must track its own resting
+        orders. Risk-increasing LMT pendings still consume capital via
+        ``_reserved_margin``; this method only governs the position
         baseline, not the reservation ledger.
         """
         proj = self.positions.get(symbol, 0.0)
@@ -646,7 +687,11 @@ class BacktestPortfolio(Portfolio):
                                   - self._reserved_margin())
 
     def _cancel_pending_non_liquidation(self) -> None:
-        """Cancel every pending order that isn't a liquidation order, FIFO."""
+        """Cancel every pending order that isn't a liquidation order, FIFO.
+
+        Cancelled ids are registered so a fill the simulated exchange may
+        still emit for them is voided by ``update_fill``.
+        """
         for oid in list(self.pending_orders.keys()):
             order = self.pending_orders[oid]
             if order.is_liquidation:
@@ -657,6 +702,7 @@ class BacktestPortfolio(Portfolio):
                 order.direction.value, oid,
             )
             del self.pending_orders[oid]
+            self._cancelled_order_ids.add(oid)
 
     def _liquidate_all_positions(self, timestamp: Any) -> None:
         """
@@ -668,11 +714,11 @@ class BacktestPortfolio(Portfolio):
 
         Caveat on the duplicate-submission guard: the guard is "any pending
         liquidation for this symbol blocks a new one." If a prior liquidation
-        is stuck pending — e.g. queued under ``fill_on='next_open'`` and the
-        next bars are all NaN-skipped, or the position has grown via direct
-        state mutation in a test — no replacement order is enqueued. There
-        is no automatic re-arm; in production this would require operator
-        intervention.
+        is stuck pending — e.g. deferred to the symbol's next bar (its bar
+        for the decision period had not streamed yet) and the symbol never
+        prints again, or the position has grown via direct state mutation
+        in a test — no replacement order is enqueued. There is no automatic
+        re-arm; in production this would require operator intervention.
         """
         symbols_with_pending_liquidation = {
             o.symbol for o in self.pending_orders.values() if o.is_liquidation
@@ -715,7 +761,7 @@ class BacktestPortfolio(Portfolio):
 
         Caller passes the appropriate baseline (raw realized position via
         ``self.positions[symbol]`` or the projected-through-pending position
-        via ``self._projected_position(symbol, ...)``) depending on use case.
+        via ``self.projected_position(symbol, ...)``) depending on use case.
 
         Uniform formula for MKT and LMT: the model's initial margin on the
         projected position.
@@ -765,9 +811,15 @@ class BacktestPortfolio(Portfolio):
     # ── Order management ──────────────────────
 
     def cancel_order(self, order_id: str) -> None:
-        """Cancel a pending order and release its reserved margin."""
+        """Cancel a pending order and release its reserved margin.
+
+        The id is registered as cancelled so a fill the simulated exchange
+        may still emit for it is voided by ``update_fill`` instead of
+        booked.
+        """
         if order_id in self.pending_orders:
             del self.pending_orders[order_id]
+            self._cancelled_order_ids.add(order_id)
 
     # ── Record getters ────────────────────────
 

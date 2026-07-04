@@ -36,12 +36,10 @@ deliberately not attributed.
 
 Timing assumptions
 ------------------
-The one-bar share lag matches the default ``fill_on='signal_close'``.
-Under ``'next_open'`` the *t+1* PnL diff mixes two bars' positions —
-the decomposition still reconciles exactly, but shares are smeared by
-one bar. Slippage on a fill lands at *t* or *t+1* depending on
-same-timestamp symbol processing order (a one-bar smear; totals are
-unaffected because a cumulative series is diffed).
+The one-bar share lag matches the engine's fill timing (orders fill on
+the signal bar's close). Slippage on a fill lands at *t* or *t+1*
+depending on same-timestamp symbol processing order (a one-bar smear;
+totals are unaffected because a cumulative series is diffed).
 """
 
 from __future__ import annotations

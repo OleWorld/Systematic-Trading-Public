@@ -3,8 +3,9 @@
 The ``Bar`` dataclass is the in-memory format for bars held inside the
 deques maintained by ``DataHandler``. It is frozen/immutable; only
 ``DataHandler`` is expected to construct instances. External consumers
-read bars via ``DataHandler.get_latest_bars()``, which returns a
-``pd.DataFrame``.
+read bars via ``DataHandler.get_latest_bars()`` (a ``List[Bar]``,
+oldest→newest) or ``DataHandler.get_latest_bars_df()`` (the DataFrame
+counterpart).
 """
 import datetime
 from dataclasses import dataclass

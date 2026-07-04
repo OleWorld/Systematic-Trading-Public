@@ -11,7 +11,7 @@ configure_logging(level=logging.WARNING)
 
 from analytics import backtest_stats, pnl_attribution, turnover_stats
 from config import BacktestConfig, uniform_registry
-from runlog import save_run
+from runlog import save_run, load_run
 from data import HistoricDataHandler
 from strategy import EWMACStrategy, RSIMRStrategy
 from orchestrator import Orchestrator
@@ -52,8 +52,6 @@ config = BacktestConfig(
     vol_target_mode='dollar_volatility',
     annual_target_vol=1_000_000,            # $1M annual vol
     position_buffer=0.25,
-
-    fill_on='signal_close',
 )
 
 instruments = uniform_registry(
@@ -150,7 +148,6 @@ risk_manager = VolTargetingRiskManager(
 execution = BacktestExecution(
     events_queue,
     instruments=instruments,
-    fill_on=config.fill_on,
 )
 
 bt = Backtester(events_queue, data_handler, orchestrator, portfolio,

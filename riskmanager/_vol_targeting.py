@@ -81,8 +81,11 @@ first non-NaN forecast is cached). Non-live symbols are absent from
 warmup stage they're in (``'warmup_forecast'`` / ``'warmup_correlation'``
 / ``'warmup_weight'`` — see ``_classify_warmup_reason``); live weights
 sum to 1 across the live subset. The live set is monotone
-non-decreasing during a backtest. Delisting/universe-exit handling is
-future work.
+non-decreasing during a backtest, but the *weighted* set can
+temporarily shrink: a symbol whose closes are constant across the corr
+window has no defined correlation, so it is excluded from that
+recalc's ρ and weights (WARNING) until it moves again.
+Delisting/universe-exit handling is future work.
 
 The manager performs **walk-forward** weight estimation in every mode:
 at each recalc point it re-assesses liveness and derives ρ from a
@@ -119,10 +122,16 @@ case); ``self.idm`` is left untouched in this branch.
 On every completed bar the manager:
 1. Updates the vol estimator.
 2. Computes the target quantity per the formula above.
-3. Submits a MKT order for ``target_qty - current_qty`` if the diff is
-   above the configured dead-band (``position_buffer``, Carver §10.7).
+3. Submits a MKT order for ``target_qty - (current_qty +
+   pending_mkt_order_quantity)`` — the diff against the *projected*
+   position (realized + in-flight MKT orders, e.g. a same-bar
+   margin-call liquidation), so an order already on its way to fill is
+   never double-traded — if the diff is above the configured dead-band
+   (``position_buffer``, Carver §10.7).
 
-Skips on warmup (``sigma is None``), zero vol, or forming bars. A zero
+Skips on warmup (``sigma is None``), zero/negligible vol (``sigma <
+_MIN_SIGMA_REL × |close|`` — guards the EWMA estimator's asymptotic
+decay on a flat symbol), or forming bars. A zero
 combined weight is NOT a skip — it is a target of 0, so a held position
 is flattened (a flat one is simply labelled ``'zero_weight'``). Any skip
 that would strand a *held* position emits a WARNING. Idempotent: a
@@ -161,6 +170,17 @@ logger = logging.getLogger(__name__)
 # logs a WARNING and falls back to equal-weight (the ρ=1 degenerate case).
 _MIN_CORR_OBS = 30
 
+# Relative negligible-volatility floor: an annualized sigma below this
+# fraction of the bar's ``|close|`` is treated as zero vol (``'zero_vol'``
+# skip). Guards the EWMA estimator's geometric decay, which approaches —
+# but never reaches — exact 0.0 on a flat-after-activity symbol; without
+# a floor the near-zero divisor would explode the target to the
+# margin-capped maximum. 1e-6 (annualized vol of 0.0001 % of price) is
+# orders of magnitude below any tradable instrument's vol, so real-data
+# sizing is unaffected. At ``close == 0`` the relative term collapses to
+# the exact-zero check.
+_MIN_SIGMA_REL = 1e-6
+
 
 class VolTargetingRiskManager(RiskManager):
     """Forecast-aware cash-vol-targeting sizer (Carver's framework).
@@ -196,7 +216,10 @@ class VolTargetingRiskManager(RiskManager):
     intermediates (``forecast``, ``sigma``, ``instrument_weight``,
     ``capital``, ``idm``, ``annual_target_vol``,
     ``position_buffer``, ``annual_cash_target``, ``target_qty``,
-    ``current_qty``, ``trade_qty``, ``buffer_threshold``) plus
+    ``current_qty`` (realized position), ``pending_mkt_order_quantity``
+    (signed sum of in-flight MKT orders — the resize diff targets
+    ``current_qty + pending_mkt_order_quantity``, the projected
+    position), ``trade_qty``, ``buffer_threshold``) plus
     ``submitted`` (bool) and ``skip_reason`` — ``None`` when an order
     was submitted, otherwise one of the warmup labels
     ``'warmup_volatility'`` (sigma not ready), ``'warmup_forecast'``
@@ -363,16 +386,17 @@ class VolTargetingRiskManager(RiskManager):
         corr_floor
             Element-wise lower bound applied to the inline-derived
             correlation matrix (see ``_derive_corr_matrix``) before it
-            feeds the optimizer and the IDM. Default ``0.0`` — Carver's
-            practice: negative correlations estimated from a short
+            feeds the optimizer and the IDM. Default ``None`` — no
+            flooring (the shrunk sample correlations feed through as
+            estimated). ``0.0`` is the recommended Carver-style
+            setting: negative correlations estimated from a short
             window are mostly sampling noise, and trusting them both
             overweights spuriously anti-correlated instruments
             (min-variance treats them as a free hedge) and inflates the
-            IDM. With the default floor and long-only weights the
-            pre-cap IDM is bounded by ``sqrt(N)``. ``None`` disables
-            flooring. Must be in ``[-1.0, 1.0]`` when not ``None``.
-            NOT applied to an explicitly passed ``corr_matrix`` — the
-            caller owns that matrix.
+            IDM; with a ``0.0`` floor and long-only weights the pre-cap
+            IDM is bounded by ``sqrt(N)``. Must be in ``[-1.0, 1.0]``
+            when not ``None``. NOT applied to an explicitly passed
+            ``corr_matrix`` — the caller owns that matrix.
         corr_shrinkage
             Shrinkage estimator applied when deriving the inline
             correlation matrix (see ``_derive_corr_matrix``). Default
@@ -683,7 +707,6 @@ class VolTargetingRiskManager(RiskManager):
                 self.instrument_weight = {live[0]: 1.0}
                 self.idm = 1.0
                 return
-            self.instrument_weight = equal_weight(live)
             # Equal weights are scheme-final, but the IDM still measures the
             # book's diversification: derive rho over the live subset and set
             # idm = 1/sqrt(w'rho w) so a large decorrelated universe earns its
@@ -691,13 +714,18 @@ class VolTargetingRiskManager(RiskManager):
             # constructor value. The IDM scalar is robust to correlation noise
             # (unlike min_variance corner weights). An explicitly passed
             # corr_matrix is ignored here (equal_weight owns no estimation
-            # hook); rho is always derived inline.
+            # hook); rho is always derived inline — and FIRST, because it
+            # also fixes the weighted universe: constant-price symbols are
+            # dropped from rho (undefined correlation) and must be equally
+            # absent from the weights, or the DM's label check would raise.
             corr_matrix = self._derive_corr_matrix(mode, live)
             if corr_matrix is None:
-                # Data-gap shortfall — keep the equal weights (already set);
-                # leave self.idm untouched (rho=1 degenerate case), mirroring
-                # the corr-based equal-weight fallback.
+                # Data-gap / degenerate shortfall — equal weights over the
+                # full live subset; leave self.idm untouched (rho=1
+                # degenerate case), mirroring the corr-based fallback.
+                self.instrument_weight = equal_weight(live)
                 return
+            self.instrument_weight = equal_weight(list(corr_matrix.index))
             self._update_idm_from_corr(corr_matrix)
         elif mode in ('min_variance', 'risk_parity'):
             if corr_matrix is None:
@@ -762,25 +790,31 @@ class VolTargetingRiskManager(RiskManager):
         via ``self.data_handler.get_latest_bars``, computes per-bar
         price changes per ``self.corr_mode``
         (``'simple_return'`` → ``.pct_change().dropna()``;
-        ``'absolute_price_chg'`` → ``.diff().dropna()``), and calls
-        ``analytics.correlation_matrix`` on the result, forwarding
-        ``self.corr_shrinkage`` (Ledoit-Wolf by default; the fitted
-        intensity is DEBUG-logged). When ``self.corr_floor`` is not
-        ``None``, the matrix is then element-wise floored at
-        ``corr_floor``; since element-wise clipping does not preserve
-        positive-semidefiniteness in general, the floored matrix passes
-        through ``_nearest_psd_correlation`` before being returned, so
-        the optimizer and the IDM always consume the same valid
-        correlation matrix. (All three transforms are estimation
-        hygiene: they apply to this inline path only, never to an
-        explicitly passed ``corr_matrix``.)
+        ``'absolute_price_chg'`` → ``.diff().dropna()``), **drops
+        zero-variance (constant-price) columns** — their correlation to
+        anything is undefined (NaN) and would crash the PSD repair /
+        optimizers; the excluded symbols are WARNING-logged and the
+        returned matrix's labels are then a strict subset of
+        ``symbols`` — and calls ``analytics.correlation_matrix`` on the
+        result, forwarding ``self.corr_shrinkage`` (Ledoit-Wolf by
+        default; the fitted intensity is DEBUG-logged). When
+        ``self.corr_floor`` is not ``None``, the matrix is then
+        element-wise floored at ``corr_floor``; since element-wise
+        clipping does not preserve positive-semidefiniteness in general,
+        the floored matrix passes through ``_nearest_psd_correlation``
+        before being returned, so the optimizer and the IDM always
+        consume the same valid correlation matrix. (All three
+        transforms are estimation hygiene: they apply to this inline
+        path only, never to an explicitly passed ``corr_matrix``.)
 
         Returns ``None`` — after logging a WARNING that names ``mode`` —
         when fewer than ``_MIN_CORR_OBS`` (=30) valid observations
         survive (only reachable via data gaps, since every live symbol
-        carries the full lookback); the caller falls back to
-        equal-weight over the live subset. Raises ``ValueError`` on an
-        unexpected ``self.corr_mode``.
+        carries the full lookback), when fewer than 2 non-constant
+        columns remain, or when the computed matrix still contains NaN
+        (safety net); the caller falls back to equal-weight over the
+        live subset. Raises ``ValueError`` on an unexpected
+        ``self.corr_mode``.
         """
         closes = {
             s: self.data_handler.get_latest_bars_df(
@@ -811,6 +845,30 @@ class VolTargetingRiskManager(RiskManager):
                 mode, len(returns), _MIN_CORR_OBS,
             )
             return None
+        # Constant-price symbols have a zero-variance change series — their
+        # correlation to anything is undefined (NaN off-diagonals), which
+        # would crash the PSD repair / optimizers. Exclude them from this
+        # recalc (they re-enter at a later recalc if they move again); an
+        # excluded symbol is absent from the weights, skips sizing as
+        # 'warmup_weight', and a held position triggers the
+        # stranded-position WARNING.
+        variances = returns.var(ddof=0)
+        constant = [c for c in returns.columns if variances[c] == 0.0]
+        if constant:
+            logger.warning(
+                "%s: excluding %d constant-price symbol(s) from this "
+                "recalc (zero variance over the corr window): %s",
+                mode, len(constant), constant,
+            )
+            returns = returns.drop(columns=constant)
+        if returns.shape[1] < 2:
+            logger.warning(
+                "%s: fewer than 2 non-constant symbols in the corr "
+                "window; falling back to equal-weight (rho=1 degenerate "
+                "case)",
+                mode,
+            )
+            return None
         corr = correlation_matrix(returns, shrinkage=self.corr_shrinkage)
         if self.corr_shrinkage is not None:
             logger.debug(
@@ -818,6 +876,16 @@ class VolTargetingRiskManager(RiskManager):
                 mode, self.corr_shrinkage,
                 corr.attrs.get('lw_shrinkage', float('nan')), len(returns),
             )
+        if corr.isna().any().any():
+            # Safety net: never hand NaN to the PSD repair (LinAlgError) or
+            # the optimizers (ValueError). Zero-variance filtering above
+            # should make this unreachable; data pathologies fall back.
+            logger.warning(
+                "%s: correlation matrix contains NaN entries despite "
+                "zero-variance filtering; falling back to equal-weight",
+                mode,
+            )
+            return None
         if self.corr_floor is not None:
             # Element-wise floor (Carver: zero out spurious negative
             # correlations before weighting). Clipping preserves symmetry
@@ -915,6 +983,15 @@ class VolTargetingRiskManager(RiskManager):
         forecast = self.strategy.get_forecast(symbol)
         capital = self.portfolio.calculate_balance()
         current_qty = self.portfolio.positions.get(symbol, 0.0)
+        # Signed sum of in-flight (pending) MKT orders — e.g. a same-bar
+        # margin-call liquidation submitted by the portfolio earlier in
+        # this bar's processing. The resize diff targets the projected
+        # end-state ``current_qty + pending_mkt_order_quantity`` so an
+        # order already on its way to fill is never double-traded. The
+        # two components are recorded separately for debuggability.
+        pending_mkt_order_quantity = (
+            self.portfolio.projected_position(symbol) - current_qty
+        )
 
         # Seed the diagnostic row with always-known inputs;
         # _compute_target_qty supplies sigma / weights /
@@ -933,6 +1010,7 @@ class VolTargetingRiskManager(RiskManager):
             'annual_cash_target': None,
             'target_qty': None,
             'current_qty': current_qty,
+            'pending_mkt_order_quantity': pending_mkt_order_quantity,
             'trade_qty': None,
             'buffer_threshold': None,
             'submitted': False,
@@ -949,11 +1027,14 @@ class VolTargetingRiskManager(RiskManager):
             # longer lands here: it flows through as target_qty=0 and flattens
             # via the submit path. Flatten-on-universe-exit is deferred to the
             # delisting work; here the target is undefined, so we warn.)
-            if current_qty != 0:
+            # A position with a liquidation already in flight projects to 0
+            # (current + pending) — it is being managed, so no warning.
+            if current_qty + pending_mkt_order_quantity != 0:
                 logger.warning(
-                    "%s: holding %s contracts but skipping resize (%s) — "
-                    "position is unmanaged this bar",
-                    symbol, current_qty, row['skip_reason'],
+                    "%s: holding %s contracts (%s pending) but skipping "
+                    "resize (%s) — position is unmanaged this bar",
+                    symbol, current_qty, pending_mkt_order_quantity,
+                    row['skip_reason'],
                 )
             self._record_row(symbol, row)
             return
@@ -967,7 +1048,7 @@ class VolTargetingRiskManager(RiskManager):
         if not self.instruments[symbol].fractional:
             target_qty = float(round(target_qty))
             row['target_qty'] = target_qty
-        trade_qty = target_qty - current_qty
+        trade_qty = target_qty - (current_qty + pending_mkt_order_quantity)
         buffer_threshold = self.position_buffer * abs(target_qty)
         row['trade_qty'] = trade_qty
         row['buffer_threshold'] = buffer_threshold
@@ -1041,7 +1122,10 @@ class VolTargetingRiskManager(RiskManager):
             out['skip_reason'] = 'warmup_volatility'
             return out
         out['sigma'] = sigma
-        if sigma == 0:
+        # Zero OR negligible vol: the relative term catches the EWMA
+        # estimator's asymptotic decay on a flat symbol (never exactly 0)
+        # before the divide below can explode the target.
+        if sigma == 0 or sigma < _MIN_SIGMA_REL * abs(event.close):
             out['skip_reason'] = 'zero_vol'
             return out
 
@@ -1100,9 +1184,9 @@ class VolTargetingRiskManager(RiskManager):
         action = 'submit' if row['submitted'] else row['skip_reason']
         logger.debug(
             "[CARVER] %s fc=%s sigma=%s iw=%s cap=%.2f "
-            "target=%s cur=%.6f trade=%s action=%s",
+            "target=%s cur=%.6f pend=%s trade=%s action=%s",
             symbol, row['forecast'], row['sigma'],
             row['instrument_weight'],
             row['capital'], row['target_qty'], row['current_qty'],
-            row['trade_qty'], action,
+            row['pending_mkt_order_quantity'], row['trade_qty'], action,
         )
