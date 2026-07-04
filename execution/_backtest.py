@@ -27,18 +27,20 @@ class BacktestExecution(ExecutionHandler):
     the portfolio, which reacts to the resulting ``FillEvent``. As a
     consequence, this class holds no reference to the portfolio.
 
-    Fill timing (single model): orders fill on the bar that generated the
-    signal — MKT at that bar's close, LMT at the limit price if the bar's
-    range satisfied it, otherwise it joins ``pending_orders`` and is
-    evaluated on subsequent bars. Because strategies compute forecasts from
-    **finalized** values only (data through the previous completed bar), a
-    same-bar close fill is achievable in live trading (e.g. a
-    market-on-close order placed during the bar using the already-final
-    forecast) — the effective signal→fill latency is one full bar of
-    information. (The old ``fill_on='next_open'`` mode was removed as
-    redundant: it only moved the fill from close(*t*) to open(*t+1*) while
-    the signal already lagged a bar; callers wanting more delay should lag
-    the forecast itself.)
+    Fill timing (single model): a MKT order fills on the bar that generated
+    the signal, at that bar's close; a LMT order always RESTS — it joins
+    ``pending_orders`` and is evaluated from the next bar onward. A LMT is
+    never tested against its own signal bar's range: the order comes into
+    existence at that bar's close, so its high/low printed before the order
+    could have been on the book — filling there would be look-ahead. Because
+    strategies compute forecasts from **finalized** values only (data
+    through the previous completed bar), a same-bar close fill is achievable
+    in live trading (e.g. a market-on-close order placed during the bar
+    using the already-final forecast) — the effective signal→fill latency is
+    one full bar of information. (The old ``fill_on='next_open'`` mode was
+    removed as redundant: it only moved the fill from close(*t*) to
+    open(*t+1*) while the signal already lagged a bar; callers wanting more
+    delay should lag the forecast itself.)
 
     Cross-symbol orders (the portfolio's margin-call liquidations): an
     order can arrive for a symbol whose bar for the decision period has
@@ -69,13 +71,17 @@ class BacktestExecution(ExecutionHandler):
 
     def execute_order(self, event: OrderEvent) -> None:
         """
-        Route a new order. We attempt an immediate fill against the current
-        (signal-generation) bar; a LMT order whose range is not satisfied
-        falls through to ``pending_orders``. An order for a symbol whose
-        current bar predates the order's own timestamp (a cross-symbol
-        submission, e.g. a margin-call liquidation decided while another
-        symbol's bar was being processed) is deferred to ``pending_orders``
-        instead of filling at the stale bar's past price/timestamp.
+        Route a new order. A MKT order fills immediately at the current
+        (signal-generation) bar's close. A LMT order always RESTS: it joins
+        ``pending_orders`` and is evaluated from the next bar onward via
+        ``_try_fill`` — never against its own signal bar's range, whose
+        high/low printed before the order existed (filling there would be
+        look-ahead; the close is the first moment the order can be on the
+        book). An order for a symbol whose current bar predates the order's
+        own timestamp (a cross-symbol submission, e.g. a margin-call
+        liquidation decided while another symbol's bar was being processed)
+        is likewise deferred to ``pending_orders`` instead of filling at
+        the stale bar's past price/timestamp.
         """
         bar = self._current_bars.get(event.symbol)
         if bar is None:
@@ -89,13 +95,13 @@ class BacktestExecution(ExecutionHandler):
             # the standard pending-orders path (see _try_fill).
             self.pending_orders[event.order_id] = event
             return
-        fill_price = self._try_fill_same_bar(event, bar)
-        if fill_price is not None:
-            self._emit_fill(event, fill_price, bar)
-        else:
-            # LMT that didn't satisfy the signal bar's range — wait for
-            # later bars to fill via the standard pending-orders path.
+        if event.order_type == OrderType.MKT:
+            self._emit_fill(event, bar.close, bar)
+        elif event.order_type == OrderType.LMT:
+            # Rests on the book; evaluated from the next bar via _try_fill.
             self.pending_orders[event.order_id] = event
+        else:
+            raise ValueError(f"Unexpected order_type: {event.order_type!r}")
 
     def update_bar(self, event: BarEvent) -> None:
         """
@@ -118,24 +124,6 @@ class BacktestExecution(ExecutionHandler):
 
         for order_id in to_fill:
             del self.pending_orders[order_id]
-
-    def _try_fill_same_bar(self, order: OrderEvent, bar: BarEvent) -> Optional[float]:
-        """
-        Fill price for an order arriving on its own signal bar. MKT fills at
-        the bar's close; LMT fills at the limit price when the bar's range
-        satisfies it. Gap-favorable pricing does not apply here because the
-        order was not on the book at the bar's open.
-        """
-        if order.order_type == OrderType.MKT:
-            return bar.close
-        elif order.order_type == OrderType.LMT:
-            if order.direction == Direction.BUY and bar.low <= order.price:
-                return order.price
-            if order.direction == Direction.SELL and bar.high >= order.price:
-                return order.price
-            return None
-        else:
-            raise ValueError(f"Unexpected order_type: {order.order_type!r}")
 
     def _try_fill(self, order: OrderEvent, bar: BarEvent) -> Optional[float]:
         """

@@ -1196,6 +1196,11 @@ def test_check_solvency_liquidates_worst_pnl_first_with_two_positions():
     # Drive update via a bar on either symbol so check_solvency fires.
     # account_balance = 200 - 50 - 150 = 0... need it < 0. Push ETH harder.
     pf._latest_prices['ETH'] = 400.0  # ETH unrealized = -200; account = 200 - 50 - 200 = -50.
+    # State was injected directly (bypassing update_bar/update_fill), so
+    # re-sync the per-symbol unrealized cache: the per-event hot path only
+    # refreshes the event symbol's entry and would leave injected BTC
+    # state stale (see _update_symbol_unrealized's invariant note).
+    pf._refresh_snapshot()
     pf.update_bar(_bar(symbol='ETH', close=400.0))
     liq_orders = [item for item in q.items
                   if isinstance(item, OrderEvent) and item.is_liquidation]

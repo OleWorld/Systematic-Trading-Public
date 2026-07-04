@@ -74,8 +74,13 @@ class BacktestPortfolio(Portfolio):
     market exposure from making things worse, not to magically restore equity.
     ``available_balance`` going negative is tolerated — it just means existing
     positions are sitting at unrealized loss and no new opening orders can be
-    placed. (Liquidate-all-worst-first is kept; partial liquidation — closing
-    only enough to restore the maintenance floor — is future work.)
+    placed. While it is negative, the risk-neutral margin-check shortcut is
+    also revoked: an order that merely *replaces* margin demand (e.g. a
+    same-bar re-open netted against an in-flight liquidation) is scaled to
+    what the balance actually backs instead of passing at full size —
+    pure risk-reduction still always passes in full. (Liquidate-all-
+    worst-first is kept; partial liquidation — closing only enough to
+    restore the maintenance floor — is future work.)
 
     Fill-time margin trade-off: margin is reserved at submission price.
     Between submission and fill the price can move — a resting LMT, or a
@@ -185,23 +190,23 @@ class BacktestPortfolio(Portfolio):
             self.positions[event.symbol], event.close, cfg.point_value,
         )
 
-        self._refresh_snapshot()
+        # Per-event fast path: only THIS symbol's price changed since the
+        # last event, so only its unrealized entry needs recomputing —
+        # identical numbers to a full-universe recompute at O(1) instead
+        # of O(N) (see _update_symbol_unrealized's invariant note).
+        self._update_symbol_unrealized(event.symbol)
+        self._refresh_balances()
 
         prior_balance = (
             self.equity_curve[-1]['account_balance']
             if self.equity_curve
             else self.initial_capital
         )
-        if prior_balance > 0:
-            simple_return = (self.account_balance - prior_balance) / prior_balance
-            log_return = (
-                math.log(self.account_balance / prior_balance)
-                if self.account_balance > 0
-                else float('nan')
-            )
-        else:
-            simple_return = float('nan')
-            log_return = float('nan')
+        simple_return, log_return = self._period_returns(prior_balance)
+
+        # Computed once per event, shared by the equity row and the
+        # solvency trigger below (no state mutates in between).
+        maintenance_margin = self._maintenance_margin()
 
         # Lightweight per-event row: account-level scalars only.
         self.equity_curve.append({
@@ -212,7 +217,7 @@ class BacktestPortfolio(Portfolio):
             'simple_return': simple_return,
             'log_return': log_return,
             'position_margin': self._position_margin(),
-            'maintenance_margin': self._maintenance_margin(),
+            'maintenance_margin': maintenance_margin,
             'available_balance': self.available_balance,
             'total_commission': self.total_commission,
         })
@@ -227,7 +232,10 @@ class BacktestPortfolio(Portfolio):
             'margin_requirements': dict(self.margin_requirements),
         }
 
-        self.check_solvency(event.timestamp)
+        # Caches are fresh (refreshed above) — skip the public wrapper's
+        # redundant full refresh and reuse the maintenance margin.
+        self._enforce_solvency(event.timestamp,
+                               maintenance_margin=maintenance_margin)
 
     # ── Order submission ──────────────────────
 
@@ -397,7 +405,12 @@ class BacktestPortfolio(Portfolio):
             'order_id': event.order_id,
         })
 
-        self.check_solvency(event.timestamp)
+        # Only this symbol's position/avg-cost changed — incremental
+        # refresh, then the solvency check (skipping the public wrapper's
+        # redundant full recompute).
+        self._update_symbol_unrealized(symbol)
+        self._refresh_balances()
+        self._enforce_solvency(event.timestamp)
 
     def _apply_fill_to_position(self, symbol: str, qty: float, direction: Direction,
                                 fill_price: float, fill_notional: float
@@ -493,6 +506,17 @@ class BacktestPortfolio(Portfolio):
         against the baseline ``max(realized_margin, projected_margin_now)``
         and scale down if the available balance can't cover it.
 
+        A risk-neutral-or-reducing order (``delta <= 0``) is approved at
+        full size only while ``available >= 0``. Below the floor the
+        order goes through the scaling branch like any other: pure
+        risk-reduction still passes in full (``max_qty >= |pos|`` even at
+        a zero budget — liquidations are never blocked), but the
+        re-open/flip portion is capped by what the balance actually
+        backs. Without that gate, a margin-call bar's in-flight
+        liquidation nets the projected position to 0 and a same-bar
+        full-size re-open scores ``delta == 0`` — a free pass for an
+        insolvent account.
+
         Same formula for MKT and LMT — the worst-case
         ``max(abs(new_pos), qty)`` clause for LMT has been removed.
         """
@@ -504,13 +528,23 @@ class BacktestPortfolio(Portfolio):
         new_margin_raw = self._calculate_new_margin(symbol, pos, qty, direction, price)
         delta = max(realized_margin, new_margin_raw) - baseline
 
-        if delta <= 0:
-            return qty  # Risk-neutral or reducing
-
         available = (self.calculate_balance()
                      - self._position_margin()
                      - self._reserved_margin(exclude_order_id=exclude_order_id))
-        if delta <= available:
+        if delta <= 0:
+            if available >= 0:
+                return qty  # Risk-neutral or reducing; account above its floor
+            # Below the floor (negative available), the risk-neutral free
+            # pass is revoked: netting against an in-flight liquidation
+            # makes a same-bar full-size RE-OPEN look risk-neutral
+            # (projected position 0, new margin == old margin), which
+            # would let an insolvent account rebuild its position for
+            # free. Fall through to the scaling branch instead — it still
+            # grants any pure risk-reduction in full (``max_qty =
+            # max_abs_new_pos + |pos| >= |pos|`` covers a full close even
+            # at a zero margin budget, so liquidations are never blocked)
+            # but balance-caps the re-open/flip portion.
+        elif delta <= available:
             return qty
 
         # Scale down so the new symbol margin tops out at baseline + available.
@@ -587,6 +621,10 @@ class BacktestPortfolio(Portfolio):
         Pending orders for which no safe price is available contribute
         zero (reservation deferred until a price is known).
         """
+        if not self.pending_orders:
+            # Common case (no in-flight orders): skip the O(N)
+            # positions-dict copy below — the sum is 0 regardless.
+            return 0.0
         running_pos: Dict[str, float] = dict(self.positions)
         reserved = 0.0
         for oid, order in self.pending_orders.items():
@@ -662,10 +700,29 @@ class BacktestPortfolio(Portfolio):
         Liquidation at mark price does not recover ``account_balance`` (it
         only converts unrealized loss into realized loss), so the loop's
         exit condition is "no positions left," not "balance restored."
-        Called from ``update_bar`` and ``update_fill``.
+
+        This public entry point performs a FULL cache refresh first, so it
+        is safe to call after arbitrary direct state mutation (tests,
+        research hooks). The engine-driven hot paths (``update_bar`` /
+        ``update_fill``) keep their caches fresh incrementally and call
+        ``_enforce_solvency`` directly, skipping the redundant refresh.
         """
         self._refresh_snapshot()
-        maintenance_margin = self._maintenance_margin()
+        self._enforce_solvency(timestamp)
+
+    def _enforce_solvency(self, timestamp: Any,
+                          maintenance_margin: Optional[float] = None) -> None:
+        """Margin-call trigger + liquidation flow, assuming FRESH caches.
+
+        Callers must guarantee ``unrealized_pnl`` / ``account_balance``
+        reflect current prices and positions (the hot paths refresh
+        incrementally before calling; the public ``check_solvency`` does a
+        full refresh). ``maintenance_margin`` may be passed when the
+        caller already computed it this event (``update_bar`` shares it
+        with the equity row) — state must not have mutated since.
+        """
+        if maintenance_margin is None:
+            maintenance_margin = self._maintenance_margin()
         if self.account_balance >= maintenance_margin:
             return
 
@@ -679,12 +736,107 @@ class BacktestPortfolio(Portfolio):
         self._refresh_snapshot()
 
     def _refresh_snapshot(self) -> None:
-        """Recompute unrealized PnL, account_balance, and available_balance."""
+        """Recompute unrealized PnL (full universe), account_balance, and
+        available_balance — the self-healing full refresh. Used by the
+        public ``check_solvency``, the post-liquidation re-sync, and
+        ``finalize``; the per-event hot paths use the incremental
+        ``_update_symbol_unrealized`` + ``_refresh_balances`` pair instead."""
         self._calculate_unrealized_pnl()
+        self._refresh_balances()
+
+    def _refresh_balances(self) -> None:
+        """Recompute ``account_balance`` / ``available_balance`` from the
+        (already-current) per-symbol ``unrealized_pnl`` cache — the summing
+        half of ``_refresh_snapshot`` without the O(N) per-symbol
+        unrealized recompute."""
         self.account_balance = self.calculate_balance()
         self.available_balance = (self.account_balance
                                   - self._position_margin()
                                   - self._reserved_margin())
+
+    def _update_symbol_unrealized(self, symbol: str) -> None:
+        """Recompute ``unrealized_pnl[symbol]`` only — O(1) per event.
+
+        Same formula as ``_calculate_unrealized_pnl`` restricted to one
+        symbol. INVARIANT this relies on: a symbol's unrealized inputs
+        (``positions``, ``avg_cost``, ``_latest_prices``) mutate only at
+        that symbol's own ``update_bar`` (price) and ``update_fill``
+        (position / avg cost), and both call this method immediately —
+        so every OTHER symbol's cached value is already current and a
+        full-universe recompute would produce identical numbers at O(N)
+        cost. Code that mutates portfolio state directly (tests, research
+        hooks) must re-sync via ``_refresh_snapshot`` or go through the
+        public ``check_solvency``.
+        """
+        qty = self.positions[symbol]
+        if qty != 0:
+            price = self.get_price(symbol)
+            if price is None:
+                return  # Keep previous unrealized_pnl for this symbol
+            pv = self.instruments[symbol].point_value
+            self.unrealized_pnl[symbol] = qty * pv * (price - self.avg_cost[symbol])
+        else:
+            self.unrealized_pnl[symbol] = 0.0
+
+    def _period_returns(self, prior_balance: float) -> tuple:
+        """``(simple_return, log_return)`` of the current ``account_balance``
+        against ``prior_balance``.
+
+        Both are NaN when the prior balance is non-positive; ``log_return``
+        is additionally NaN when the current balance is non-positive.
+        Shared by ``update_bar`` (prior = previous equity row) and
+        ``finalize`` (prior = second-to-last row) so the two stay
+        lock-stepped.
+        """
+        if prior_balance > 0:
+            simple_return = (self.account_balance - prior_balance) / prior_balance
+            log_return = (
+                math.log(self.account_balance / prior_balance)
+                if self.account_balance > 0
+                else float('nan')
+            )
+            return simple_return, log_return
+        return float('nan'), float('nan')
+
+    def finalize(self) -> None:
+        """Reconcile the final equity row with end-of-run portfolio state.
+
+        Fills for the last bar's orders book AFTER that bar's equity row
+        was appended (the engine drains Bar → Order → Fill), so without
+        this hook the curve's final row — and every stat derived from it —
+        permanently misses the run's last realized PnL, slippage, and
+        commission. Called once by ``Backtester.run()`` after the event
+        loop drains: refreshes the account snapshot, overwrites the LAST
+        equity row's scalars (returns recomputed against the same
+        prior-row baseline), and rewrites the final timestamp's per-symbol
+        snapshot. No-op when no bars were processed.
+        """
+        if not self.equity_curve:
+            return
+        self._refresh_snapshot()
+        last = self.equity_curve[-1]
+        prior_balance = (
+            self.equity_curve[-2]['account_balance']
+            if len(self.equity_curve) >= 2
+            else self.initial_capital
+        )
+        simple_return, log_return = self._period_returns(prior_balance)
+        last.update({
+            'cash': self.cash,
+            'account_balance': self.account_balance,
+            'simple_return': simple_return,
+            'log_return': log_return,
+            'position_margin': self._position_margin(),
+            'maintenance_margin': self._maintenance_margin(),
+            'available_balance': self.available_balance,
+            'total_commission': self.total_commission,
+        })
+        self._pnl_snapshots[last['timestamp']] = {
+            'positions': dict(self.positions),
+            'unrealized_pnl': dict(self.unrealized_pnl),
+            'realized_pnl': dict(self.realized_pnl),
+            'margin_requirements': dict(self.margin_requirements),
+        }
 
     def _cancel_pending_non_liquidation(self) -> None:
         """Cancel every pending order that isn't a liquidation order, FIFO.

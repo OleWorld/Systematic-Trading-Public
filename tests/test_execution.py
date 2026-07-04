@@ -275,22 +275,39 @@ def test_signal_close_mkt_fills_at_bar_close():
     assert ex.pending_orders == {}
 
 
-def test_signal_close_lmt_buy_satisfied_fills_at_limit_price():
+def test_lmt_buy_rests_on_signal_bar_fills_next_bar_at_limit():
     ex, q = _new_execution()
-    ex.update_bar(_bar(open=100.0, high=101.0, low=98.0, close=100.5))
-    # limit = 99. bar.low = 98 -> satisfied. Fill at limit, NOT open/close/low.
-    ex.execute_order(_order(qty=2.0, direction=Direction.BUY,
-                            order_type=OrderType.LMT, price=99.0))
+    # Signal bar's range would satisfy limit=99 (low=98), but the order only
+    # comes into existence at the close — it must rest, not fill look-ahead.
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=100.0, high=101.0, low=98.0,
+                       close=100.5))
+    order = _order(qty=2.0, direction=Direction.BUY,
+                   order_type=OrderType.LMT, price=99.0, order_id='L1')
+    ex.execute_order(order)
+    assert q.items == []
+    assert 'L1' in ex.pending_orders
+    # Next bar trades through the limit without gapping (open above limit):
+    # fills at min(99, 100.2) = the limit price.
+    ex.update_bar(_bar(ts=DEFAULT_TS + timedelta(days=1),
+                       open=100.2, high=100.8, low=98.5, close=99.5))
     assert len(q.items) == 1
     assert math.isclose(q.items[0].fill_notional, 2.0 * 99.0)
     assert ex.pending_orders == {}
 
 
-def test_signal_close_lmt_sell_satisfied_fills_at_limit_price():
+def test_lmt_sell_rests_on_signal_bar_fills_next_bar_at_limit():
     ex, q = _new_execution()
-    ex.update_bar(_bar(open=100.0, high=102.0, low=99.0, close=100.5))
-    ex.execute_order(_order(qty=1.0, direction=Direction.SELL,
-                            order_type=OrderType.LMT, price=101.0))
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=100.0, high=102.0, low=99.0,
+                       close=100.5))
+    order = _order(qty=1.0, direction=Direction.SELL,
+                   order_type=OrderType.LMT, price=101.0, order_id='L2')
+    ex.execute_order(order)
+    assert q.items == []
+    assert 'L2' in ex.pending_orders
+    # Next bar trades through the limit (open below it): fill at
+    # max(101, 100.5) = the limit price.
+    ex.update_bar(_bar(ts=DEFAULT_TS + timedelta(days=1),
+                       open=100.5, high=101.5, low=100.0, close=101.2))
     assert len(q.items) == 1
     assert math.isclose(q.items[0].fill_notional, 1.0 * 101.0)
     assert ex.pending_orders == {}
@@ -322,17 +339,26 @@ def test_signal_close_no_current_bar_raises_runtime_error():
         ex.execute_order(_order())  # no bar observed first
 
 
-def test_signal_close_does_not_apply_gap_favorable_pricing():
-    # On the SIGNAL bar, LMT BUY fills strictly at the limit price — gap-favorable
-    # min(limit, bar.open) only applies to orders already resting on the book
-    # at a LATER bar's open. Pin that distinction here.
+def test_lmt_never_fills_on_its_signal_bar_even_when_range_satisfies():
+    """Causality pin: the signal bar's high/low printed BEFORE the order
+    existed (it is decided at that bar's close), so a LMT must never fill
+    against its own signal bar's range — it rests, then fills on the next
+    bar with the standard gap-favorable resting-order pricing."""
     ex, q = _new_execution()
-    ex.update_bar(_bar(open=95.0, high=101.0, low=94.0, close=100.0))
-    ex.execute_order(_order(qty=1.0, direction=Direction.BUY,
-                            order_type=OrderType.LMT, price=100.0))
-    # limit=100 satisfied (low<=100). Fills at 100, not at min(100, 95)=95.
+    # low=94 <= limit=100: the old same-bar model would have filled here.
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=95.0, high=101.0, low=94.0,
+                       close=100.0))
+    order = _order(qty=1.0, direction=Direction.BUY,
+                   order_type=OrderType.LMT, price=100.0, order_id='L1')
+    ex.execute_order(order)
+    assert q.items == []
+    assert 'L1' in ex.pending_orders
+    # Next bar gaps down through the limit: resting order fills at
+    # min(100, open=95) = 95 (gap-favorable — it was on the book at the open).
+    ex.update_bar(_bar(ts=DEFAULT_TS + timedelta(days=1),
+                       open=95.0, high=96.0, low=94.0, close=95.5))
     assert len(q.items) == 1
-    assert math.isclose(q.items[0].fill_notional, 1.0 * 100.0)
+    assert math.isclose(q.items[0].fill_notional, 1.0 * 95.0)
 
 
 # ──────────────────────────────────────────────
@@ -529,11 +555,16 @@ def test_emit_fill_applies_slippage_to_base_price():
 def test_emit_fill_applies_no_slippage_to_lmt_fills():
     """Slippage models taker market impact — a LMT fills at its limit (or
     gap-favorably better), never worse. Same slippage model as the MKT
-    test above; the LMT fill must come through unslipped."""
+    test above; the (resting, next-bar) LMT fill must come through
+    unslipped."""
     ex, q = _new_execution(slippage=('pct', 0.01))
-    ex.update_bar(_bar(open=100.0, high=101.0, low=98.0, close=100.5))
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=100.0, high=101.0, low=98.0,
+                       close=100.5))
     ex.execute_order(_order(qty=1.0, direction=Direction.BUY,
                             order_type=OrderType.LMT, price=99.0))
+    assert q.items == []  # rests on the signal bar
+    ex.update_bar(_bar(ts=DEFAULT_TS + timedelta(days=1),
+                       open=100.0, high=100.5, low=98.5, close=99.2))
     assert len(q.items) == 1
     assert math.isclose(q.items[0].fill_notional, 1.0 * 99.0)
 

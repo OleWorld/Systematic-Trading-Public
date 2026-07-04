@@ -5,6 +5,7 @@ For calibrated continuous forecasts (e.g. EWMAC) where conviction should
 modulate position size, prefer ``VolTargetingRiskManager``.
 """
 
+import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from event import BarEvent, OrderType, Direction
@@ -14,6 +15,8 @@ from riskmanager._base import (
 
 if TYPE_CHECKING:  # avoid a config<->riskmanager import cycle at module load
     from config import InstrumentConfig
+
+logger = logging.getLogger(__name__)
 
 
 class SimpleRiskManager(RiskManager):
@@ -47,10 +50,15 @@ class SimpleRiskManager(RiskManager):
     ``pending_mkt_order_quantity`` (signed sum of in-flight MKT orders;
     the resize diff targets ``current_qty + pending_mkt_order_quantity``),
     ``trade_qty``, ``submitted`` (bool), and ``skip_reason`` ∈
-    ``{None, 'no_price', 'warmup_forecast', 'at_target'}``
-    (``'warmup_forecast'`` — the strategy has not cached a forecast yet,
-    so ``get_forecast`` returns ``None``). Read via
-    ``risk_manager.get_records(symbol)``.
+    ``{None, 'no_price', 'zero_price', 'warmup_forecast', 'at_target'}``
+    (``'no_price'`` — no reference price at all, ``get_price`` returned
+    ``None``; ``'zero_price'`` — an exact-zero price under a notional
+    sizing mode, whose divide-by-|price| is undefined (``fixed_quantity``
+    is price-independent and sizes normally at zero);
+    ``'warmup_forecast'`` — the strategy has not cached a forecast yet,
+    so ``get_forecast`` returns ``None``). Any skip that strands a *held*
+    position emits a WARNING (mirroring ``VolTargetingRiskManager``).
+    Read via ``risk_manager.get_records(symbol)``.
 
     For calibrated continuous forecasts (e.g. EWMAC), use
     ``VolTargetingRiskManager`` instead — it scales the notional
@@ -148,6 +156,17 @@ class SimpleRiskManager(RiskManager):
         row.update(self._compute_target_qty(event))
 
         if row['skip_reason'] is not None:
+            # A skip means no well-defined target this bar. Harmless when
+            # flat, but a HELD position is left unmanaged — surface it
+            # loudly (mirrors VolTargetingRiskManager). A position with a
+            # liquidation already in flight projects to 0, so no warning.
+            if current_qty + pending_mkt_order_quantity != 0:
+                logger.warning(
+                    "%s: holding %s contracts (%s pending) but skipping "
+                    "resize (%s) — position is unmanaged this bar",
+                    symbol, current_qty, pending_mkt_order_quantity,
+                    row['skip_reason'],
+                )
             self._record_row(symbol, row)
             return
 
@@ -177,9 +196,13 @@ class SimpleRiskManager(RiskManager):
     def _compute_target_qty(self, event: BarEvent) -> Dict[str, Any]:
         """Map forecast sign + sizing mode to a signed target quantity.
 
-        Owns the ``'no_price'`` skip (price missing or zero in the
-        portfolio) and the ``'warmup_forecast'`` skip (``get_forecast``
-        returns ``None`` before the strategy's first cached forecast).
+        Owns the ``'no_price'`` skip (``get_price`` returned ``None`` —
+        no reference price at all), the ``'zero_price'`` skip (an
+        exact-zero price under a notional sizing mode, whose
+        divide-by-|price| is undefined; ``fixed_quantity`` is
+        price-independent and sizes normally at zero), and the
+        ``'warmup_forecast'`` skip (``get_forecast`` returns ``None``
+        before the strategy's first cached forecast).
         ``forecast == 0`` returns ``target_qty = 0.0`` with
         ``skip_reason = None`` — a valid flat target, not a skip.
 
@@ -196,7 +219,7 @@ class SimpleRiskManager(RiskManager):
         }
 
         price = self.portfolio.get_price(symbol)
-        if price is None or price == 0:
+        if price is None:
             out['skip_reason'] = 'no_price'
             return out
         out['price'] = price
@@ -213,14 +236,23 @@ class SimpleRiskManager(RiskManager):
 
         # Contract multiplier: dollar notional is qty * point_value * price,
         # so converting a target notional to contracts divides by
-        # point_value * |price|. fixed_quantity is already in contracts.
+        # point_value * |price|. fixed_quantity is already in contracts —
+        # price-independent, so it sizes fine even at an exact-zero price
+        # (e.g. a spread crossing zero); only the notional modes, whose
+        # divide is undefined at 0, skip with 'zero_price'.
         pv = self.instruments[symbol].point_value
         sign = 1.0 if forecast > 0 else -1.0
         if self.size_mode == 'fixed_notional':
+            if price == 0:
+                out['skip_reason'] = 'zero_price'
+                return out
             target_qty = sign * self.position_size / (pv * abs(price))
         elif self.size_mode == 'fixed_quantity':
             target_qty = sign * self.position_size
         elif self.size_mode == 'fixed_equity_pct':
+            if price == 0:
+                out['skip_reason'] = 'zero_price'
+                return out
             equity = self.portfolio.calculate_balance()
             target_qty = sign * (equity * self.position_size) / (pv * abs(price))
         else:

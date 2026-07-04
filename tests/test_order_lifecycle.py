@@ -72,7 +72,8 @@ class StubVol(VolEstimator):
 
 
 def _run_engine(closes, *, capital: float, vol: StubVol,
-                annual_target_vol: float = 100.0):
+                annual_target_vol: float = 100.0,
+                commission: float = 0.0):
     """Wire the real module graph over a synthetic single-symbol price
     series (10x leverage, 5% maintenance margin — the smoke-runner margin
     setup) and run it. Returns ``(portfolio, risk_manager, index)``."""
@@ -84,7 +85,7 @@ def _run_engine(closes, *, capital: float, vol: StubVol,
     instruments = uniform_registry(
         [SYM], point_value=1.0, fractional=True,
         slippage=SlippageModel('absolute', 0.0),
-        commission=CommissionModel('per_contract', 0.0),
+        commission=CommissionModel('per_contract', commission),
         margin=PortfolioMarginModel.from_leverage(
             10.0, maintenance_margin_rate=0.05,
         ),
@@ -121,29 +122,38 @@ def test_margin_call_bar_resizes_against_projected_position():
     """Crash bar: long 10, equity gap-down triggers the maintenance-margin
     call (liquidation SELL 10 in flight) while the vol spike shrinks the
     target to 4. The RM must size against the PROJECTED position (0) and
-    BUY 4 — ending the bar at the target, long 4. The old realized-only
-    diff submitted SELL 6 and ended the bar SHORT 6 with a +50 LONG
-    forecast."""
+    submit BUY 4 (the old realized-only diff submitted SELL 6 and ended
+    the bar SHORT 6 with a +50 LONG forecast). The portfolio then scales
+    the re-open to what the post-liquidation balance actually backs:
+    balance 20 × leverage 10 / price 51 = 200/51 ≈ 3.92 — an account
+    below its maintenance floor gets no free full-size re-open netted
+    against the in-flight liquidation."""
     closes = [100.0] * 40 + [51.0] * 3
     pf, rm, idx = _run_engine(
         closes, capital=510.0,
         vol=StubVol(base=10.0, spiked=25.0, crash_bar=41),
     )
     crash_ts = idx[40]
+    scaled_reopen = 510.0 - 490.0  # crash-bar balance …
+    scaled_reopen = scaled_reopen * 10.0 / 51.0  # × leverage / price ≈ 3.92
 
-    # End state: at the (post-spike) target, never wrong-sign.
-    assert pf.positions[SYM] == pytest.approx(4.0)  # = τ 100 / sigma 25
+    # End state: at the balance-backed size (< the post-spike target 4),
+    # never wrong-sign.
+    assert pf.positions[SYM] == pytest.approx(scaled_reopen)
     trades = pf.get_trade_log()
     crash_trades = trades[trades['timestamp'] == crash_ts]
-    assert list(crash_trades['position_after']) == [0.0, 4.0], (
-        "crash bar must liquidate to flat then re-establish AT TARGET, "
-        f"got {list(crash_trades['position_after'])}"
+    assert crash_trades['position_after'].tolist() == pytest.approx(
+        [0.0, scaled_reopen]
+    ), (
+        "crash bar must liquidate to flat then re-establish at the "
+        f"balance-backed size, got {list(crash_trades['position_after'])}"
     )
     assert (trades['position_after'] >= 0.0).all(), (
         "a long-forecast book must never go short"
     )
 
-    # Diagnostic decomposition on the crash-bar RM record.
+    # Diagnostic decomposition on the crash-bar RM record: the RM still
+    # ASKS for the full diff to target (4); the portfolio scales it.
     row = rm.get_records(SYM).loc[crash_ts]
     assert row['current_qty'] == pytest.approx(10.0)
     assert row['pending_mkt_order_quantity'] == pytest.approx(-10.0)
@@ -151,11 +161,14 @@ def test_margin_call_bar_resizes_against_projected_position():
     assert bool(row['submitted']) is True
 
 
-def test_deep_insolvency_voids_cancelled_resize_fill(caplog):
-    """Deep crash: even after liquidating, the account is under water, so
-    the second solvency check cancels the RM's same-bar resize order —
-    whose fill is already in the events queue. That fill must be VOIDED
-    (position stays flat), not booked."""
+def test_deep_insolvency_rejects_same_bar_resize_reopen(caplog):
+    """Deep crash: even after liquidating, the account is under water
+    (balance −440), so the RM's same-bar resize re-open is REJECTED at
+    submission — the margin budget for new exposure is zero, and an
+    insolvent account must not rebuild its position by netting against
+    the in-flight liquidation. (Straggler fills for orders cancelled by
+    the margin-call pass are still voided — pinned at the portfolio
+    level in test_portfolio.py.)"""
     closes = [100.0] * 40 + [5.0] * 3
     with caplog.at_level(logging.WARNING):
         pf, _, idx = _run_engine(
@@ -164,7 +177,69 @@ def test_deep_insolvency_voids_cancelled_resize_fill(caplog):
         )
     assert pf.positions[SYM] == pytest.approx(0.0)
     trades = pf.get_trade_log()
-    # Entry + liquidation only — the cancelled BUY 4 never books.
+    # Entry + liquidation only — the BUY 4 re-open never reaches the book.
     assert len(trades) == 2, trades
     assert not (trades['quantity'] == 4.0).any()
-    assert any('FILL VOIDED' in r.message for r in caplog.records)
+    orders = pf.get_order_log()
+    assert not (orders['direction'] == 'BUY').iloc[1:].any(), (
+        "the rejected re-open must not appear in the order log"
+    )
+    assert any('ORDER REJECTED' in r.message for r in caplog.records)
+
+
+def test_finalize_reconciles_final_equity_row_with_end_state():
+    """Fills for the FINAL bar's orders book after that bar's equity row
+    was appended; ``Backtester.run()`` must finalize the portfolio so the
+    curve's last row (and the last timestamp's per-symbol snapshot)
+    matches end-of-run state — otherwise the run's last commission and
+    realized deltas silently vanish from every curve-derived stat."""
+    # Constant price; a vol spike on the very last completed bar shrinks
+    # the target 10 → 4, forcing a SELL 6 resize that fills on the final
+    # bar's close ($1/contract commission makes the miss money-visible).
+    closes = [100.0] * 45
+    pf, _, idx = _run_engine(
+        closes, capital=1_000_000.0,
+        vol=StubVol(base=10.0, spiked=25.0, crash_bar=45),
+        commission=1.0,
+    )
+
+    assert pf.positions[SYM] == pytest.approx(4.0)
+    trades = pf.get_trade_log()
+    assert trades['timestamp'].iloc[-1] == idx[-1]  # final-bar fill exists
+
+    eq = pf.get_equity_curve()
+    last = eq.iloc[-1]
+    assert last['account_balance'] == pytest.approx(pf.calculate_balance())
+    assert last['cash'] == pytest.approx(pf.cash)
+    assert last['total_commission'] == pytest.approx(pf.total_commission)
+    assert last['positions'][SYM] == pytest.approx(4.0)
+    assert last['realized_pnl'][SYM] == pytest.approx(pf.realized_pnl[SYM])
+
+
+def test_margin_call_bar_reopen_scaled_no_phantom_churn():
+    """Crash bar with an UNCHANGED target (no vol spike): long 10, crash
+    to 51 leaves balance 20 below the maintenance floor 25.5 while the
+    Carver target stays 10. Regression for the netting free-pass: the
+    same-bar re-open used to fill at the FULL previous size on ~zero
+    equity, get margin-called again within the bar, and liquidate again —
+    a phantom full-size round trip per margin-call bar. Now the re-open
+    is scaled to the balance-backed 200/51 ≈ 3.92, the bar ends solvent
+    (maintenance 10 < balance 20), and no further liquidation or resize
+    fills occur."""
+    closes = [100.0] * 40 + [51.0] * 5
+    pf, _, idx = _run_engine(closes, capital=510.0, vol=StubVol(base=10.0))
+    crash_ts = idx[40]
+    scaled_reopen = 20.0 * 10.0 / 51.0  # balance × leverage / price
+
+    trades = pf.get_trade_log()
+    # Exactly 3 fills in the whole run: entry, liquidation, scaled re-open.
+    assert len(trades) == 3, trades
+    crash_trades = trades[trades['timestamp'] == crash_ts]
+    assert crash_trades['position_after'].tolist() == pytest.approx(
+        [0.0, scaled_reopen]
+    )
+    # No churn after the crash bar: position holds at the scaled size
+    # (subsequent resize attempts are rejected — zero margin headroom).
+    assert not (trades['timestamp'] > crash_ts).any()
+    assert pf.positions[SYM] == pytest.approx(scaled_reopen)
+    assert pf.calculate_balance() == pytest.approx(20.0)
