@@ -9,8 +9,9 @@ sys.path.insert(0, os.getcwd())
 from logging_setup import configure_logging
 configure_logging(level=logging.WARNING)
 
-from analytics import backtest_stats
+from analytics import backtest_stats, turnover_stats
 from config import BacktestConfig, uniform_registry
+from runlog import save_run
 from data import HistoricDataHandler
 from strategy import EWMACStrategy
 from portfolio import BacktestPortfolio, PortfolioMarginModel
@@ -52,7 +53,7 @@ config = BacktestConfig(
     days_convention='calendar',             # data-driven: crypto is 24/7 → 365 d/y
     timeframes={'1d': 500},
 
-    instrument_weight_mode='risk_parity',  # recommended default: 1/N weights, IDM still derived from rho
+    instrument_weight_mode='risk_parity',  # ERC weights (equal risk contribution); IDM derived from the same rho
     corr_mode='absolute_price_chg',         # futures default: .diff() correlations
     corr_lookback  = 256,
     corr_timeframe = '1d',
@@ -61,8 +62,6 @@ config = BacktestConfig(
     vol_target_mode='dollar_volatility',    # futures default: fixed annual $ vol budget
     annual_target_vol=1_000_000,        # $1M annual vol
     position_buffer=0.25,
-
-    fill_on='signal_close',
 )
 
 # Per-symbol economics (point_value, fractional, slippage, commission, margin)
@@ -98,11 +97,15 @@ data_handler = HistoricDataHandler(
 
 strategy = EWMACStrategy(
     data_handler, config.symbols,
-    lookback_pairs=[(4, 16), (16, 64), (32, 128)],
-    weights=[0.42, 0.16, 0.42],
+    variations={
+        '4_16': {'fast': 4, 'slow': 16},
+        '16_64': {'fast': 16, 'slow': 64},
+        '32_128': {'fast': 32, 'slow': 128},
+    },
+    weights={'4_16': 0.42, '16_64': 0.16, '32_128': 0.42},
     fdm=1.12,
     vol_lookback=25,
-    forecast_scalar_lookback=500,
+    forecast_scalar_lookback=256,
 )
 
 # The portfolio reads each symbol's point_value (PnL/margin) and MarginModel
@@ -141,7 +144,6 @@ risk_manager = VolTargetingRiskManager(
 execution = BacktestExecution(
     events_queue,
     instruments=instruments,
-    fill_on=config.fill_on,
 )
 
 bt = Backtester(events_queue, data_handler, strategy, portfolio,
@@ -149,6 +151,14 @@ bt = Backtester(events_queue, data_handler, strategy, portfolio,
 
 # --- Run ---
 bt.run()
+
+# --- Archive the run (raw tables first — a printing/plotting failure below
+# can never lose the archive) ---
+run_record = save_run(
+    portfolio=bt.portfolio, strategy=strategy, risk_manager=risk_manager,
+    config=config, instruments=instruments, label='ewmac-smoke',
+)
+print(f"Run archived: {run_record.path}")
 
 # --- Portfolio results ---
 portfolio = bt.portfolio
@@ -257,6 +267,20 @@ if not strategy_records.empty:
 if not riskmanager_records.empty:
     print(f"\n--- Risk-manager records: last 10 bars ({_fc_symbol}) ---")
     print(riskmanager_records.tail(10).to_string())
+
+# =====================================================================
+#  5. TURNOVER
+# =====================================================================
+print(f"\n{'='*80}")
+print("  TURNOVER")
+print(f"{'='*80}")
+
+turnover = turnover_stats(
+    equity_df, trade_df,
+    timeframe=config.base_timeframe,
+    days_convention=config.days_convention,
+)
+print(turnover.to_string())
 
 
 # import plotly.express as px

@@ -20,7 +20,6 @@ config = BacktestConfig(
     vol_target_mode='dollar_volatility',    # 'dollar_volatility' (fixed annual $ vol budget — default)
                                             # or 'percent_volatility' (fraction of equity, e.g. 0.25)
     position_buffer=0.25,         # Carver §10.7 dead-band (0.0 trades every gap)
-    fill_on='signal_close',       # 'signal_close' or 'next_open'
 )
 ```
 
@@ -189,8 +188,7 @@ risk_manager  = VolTargetingRiskManager(portfolio, strategy, vol_estimator,
                                               vol_target_mode=config.vol_target_mode,
                                               position_buffer=config.position_buffer)
 execution     = BacktestExecution(events_queue,
-                                  instruments=instruments,
-                                  fill_on=config.fill_on)
+                                  instruments=instruments)
 
 bt = Backtester(events_queue, data_handler, strategy, portfolio, risk_manager, execution)
 bt.run()

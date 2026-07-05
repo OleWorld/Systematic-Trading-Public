@@ -51,6 +51,15 @@ class DataHandler(abc.ABC):
             symbol: deque(maxlen=base_maxlen) for symbol in symbol_list
         }
 
+        # Timestamp of the last accepted COMPLETED bar per symbol — the
+        # duplicate gate in ``_append_bar``. Forming re-ticks never set it,
+        # so the live forming→completed finalization at the same timestamp
+        # is still accepted; only a second completed bar at the same
+        # timestamp (dirty input) is rejected.
+        self._last_completed_ts: Dict[str, Optional[datetime.datetime]] = {
+            symbol: None for symbol in symbol_list
+        }
+
         # HTF deques — one per (symbol, tf), only for non-base timeframes.
         # The LAST entry is the current forming HTF bar; earlier entries are
         # final. The forming bar is rebuilt (replaced) each time a new base
@@ -84,10 +93,21 @@ class DataHandler(abc.ABC):
         ``events_queue.put`` on the return value so a rejected bar never
         reaches downstream modules.
 
-        Upsert semantics: if the last entry of the base deque shares this
-        timestamp, replace it with a new ``Bar`` (tracking a forming bar
-        as it ticks in live — the stored ``Bar`` is immutable, but the
-        deque slot is overwritten). Otherwise append a new forming entry.
+        Upsert semantics apply to FORMING re-ticks only: if the last entry
+        of the base deque shares this timestamp, replace it with a new
+        ``Bar`` (tracking a forming bar as it ticks in live — the stored
+        ``Bar`` is immutable, but the deque slot is overwritten; the
+        completed emission that finalizes those forming ticks lands on the
+        same timestamp and takes the same replace path). Otherwise append
+        a new forming entry.
+
+        A SECOND completed bar at a timestamp that already accepted a
+        completed bar is dirty input (e.g. a duplicated row in a
+        caller-supplied frame) and is rejected like the NaN case: the
+        deque is left untouched (first bar wins), a WARNING is logged,
+        and the method returns ``False`` — so the duplicate never
+        re-enters the HTF volume accumulator and never emits a second
+        ``BarEvent``.
 
         HTF accumulation is gated on ``is_forming`` because live forming
         emissions carry cumulative OHLCV for the in-progress base bar —
@@ -98,12 +118,20 @@ class DataHandler(abc.ABC):
         -------
         bool
             ``True`` if the bar was accepted and stored; ``False`` if it was
-            rejected for NaN OHLC.
+            rejected for NaN OHLC or as a duplicate completed bar.
         """
         if pd.isna(o) or pd.isna(h) or pd.isna(l) or pd.isna(c):
             logger.warning(
                 "Dropping bar with NaN OHLC: symbol=%s ts=%s O=%s H=%s L=%s C=%s",
                 symbol, ts, o, h, l, c,
+            )
+            return False
+        if not is_forming and ts == self._last_completed_ts[symbol]:
+            logger.warning(
+                "Dropping duplicate completed bar: symbol=%s ts=%s "
+                "(a completed bar at this timestamp was already accepted; "
+                "first bar wins)",
+                symbol, ts,
             )
             return False
 
@@ -115,6 +143,7 @@ class DataHandler(abc.ABC):
             deq.append(bar)
 
         if not is_forming:
+            self._last_completed_ts[symbol] = ts
             for tf in self.timeframes:
                 if tf == self.base_timeframe:
                     continue
@@ -135,13 +164,19 @@ class DataHandler(abc.ABC):
         immutable, but the deque slot is overwritten so the forming bar
         is visible to ``get_latest_bars``. Aggregation is built only from
         completed base bars, which keeps volume correct.
+
+        NaN base volumes (allowed through by design — see ``_append_bar``)
+        are treated as ``0.0`` in the HTF volume sum: one flaky tick must
+        not poison the whole period's aggregate with NaN. The HTF volume
+        is therefore the sum of the period's *non-NaN* base volumes.
         """
         key = (symbol, timeframe)
         period_start = get_period_start(ts, timeframe)
         deq = self._htf_bar_data[key]
+        v_safe = 0.0 if pd.isna(v) else v
 
         if not deq or deq[-1].timestamp != period_start:
-            deq.append(Bar(period_start, o, h, l, c, v))
+            deq.append(Bar(period_start, o, h, l, c, v_safe))
         else:
             last = deq[-1]
             deq[-1] = Bar(
@@ -150,7 +185,7 @@ class DataHandler(abc.ABC):
                 high=max(last.high, h),
                 low=min(last.low, l),
                 close=c,
-                volume=last.volume + v,
+                volume=last.volume + v_safe,
             )
 
     # ── queries ──────────────────────────────────

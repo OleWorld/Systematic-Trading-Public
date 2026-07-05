@@ -135,7 +135,7 @@ class Strategy(ABC):
                 raw = extras['forecast']
                 # NaN forecasts (warmup) are recorded as-is for diagnostics
                 # but do NOT update the cached forecast — leave the prior
-                # cached value (default 0.0) untouched.
+                # cached value (default ``None`` — no forecast yet) untouched.
                 if raw is not None and not pd.isna(raw):
                     cap = Strategy.FORECAST_CAP
                     clamped = max(-cap, min(cap, float(raw)))

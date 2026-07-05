@@ -85,5 +85,10 @@ class Backtester:
                 else:
                     raise TypeError(f"Unknown event type: {type(event).__name__}")
 
+        # Post-run reconciliation: fills for the final bar's orders booked
+        # AFTER that bar's equity row was appended — let the portfolio
+        # re-snapshot its last row so the curve matches end-of-run state.
+        self.portfolio.finalize()
+
         clear_current_bar_timestamp()
         logger.info("Backtest complete.")

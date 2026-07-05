@@ -11,7 +11,7 @@ Run from the repo root:  pytest tests/test_execution.py -v
 """
 
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, List, Optional, Tuple
 
 import pytest
@@ -82,7 +82,6 @@ def _order(symbol: str = 'BTC', qty: float = 1.0,
 
 
 def _new_execution(
-    fill_on: str = 'signal_close',
     slippage: Tuple[str, float] = ('pct', 0.0),
     commission: Tuple[str, float] = ('per_contract', 0.0),
     point_value: float = 1.0,
@@ -106,7 +105,6 @@ def _new_execution(
     ex = BacktestExecution(
         events_queue=q,
         instruments=instruments,
-        fill_on=fill_on,
         exchange_name=exchange_name,
     )
     return ex, q
@@ -234,16 +232,15 @@ def test_execution_handler_abc_cannot_be_instantiated():
 # BacktestExecution — construction
 # ──────────────────────────────────────────────
 
-def test_init_invalid_fill_on_raises():
-    with pytest.raises(ValueError):
-        _new_execution(fill_on='bogus')
-
-
-def test_init_accepts_both_valid_fill_on_values():
-    ex1, _ = _new_execution(fill_on='signal_close')
-    ex2, _ = _new_execution(fill_on='next_open')
-    assert ex1.fill_on == 'signal_close'
-    assert ex2.fill_on == 'next_open'
+def test_init_rejects_removed_fill_on_parameter():
+    """The fill-timing mode knob was removed (orders always fill on the
+    signal bar); passing the old ``fill_on`` kwarg must fail loudly."""
+    with pytest.raises(TypeError):
+        BacktestExecution(
+            events_queue=FakeQueue(),
+            instruments=uniform_registry(['BTC']),
+            fill_on='signal_close',  # type: ignore[call-arg]
+        )
 
 
 def test_init_seeds_empty_pending_orders_and_current_bars():
@@ -267,7 +264,7 @@ def test_init_does_not_hold_portfolio_reference():
 # ──────────────────────────────────────────────
 
 def test_signal_close_mkt_fills_at_bar_close():
-    ex, q = _new_execution(fill_on='signal_close')
+    ex, q = _new_execution()
     ex.update_bar(_bar(open=100.0, high=101.0, low=99.0, close=100.5))
     ex.execute_order(_order(qty=1.0, direction=Direction.BUY,
                             order_type=OrderType.MKT))
@@ -278,29 +275,46 @@ def test_signal_close_mkt_fills_at_bar_close():
     assert ex.pending_orders == {}
 
 
-def test_signal_close_lmt_buy_satisfied_fills_at_limit_price():
-    ex, q = _new_execution(fill_on='signal_close')
-    ex.update_bar(_bar(open=100.0, high=101.0, low=98.0, close=100.5))
-    # limit = 99. bar.low = 98 -> satisfied. Fill at limit, NOT open/close/low.
-    ex.execute_order(_order(qty=2.0, direction=Direction.BUY,
-                            order_type=OrderType.LMT, price=99.0))
+def test_lmt_buy_rests_on_signal_bar_fills_next_bar_at_limit():
+    ex, q = _new_execution()
+    # Signal bar's range would satisfy limit=99 (low=98), but the order only
+    # comes into existence at the close — it must rest, not fill look-ahead.
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=100.0, high=101.0, low=98.0,
+                       close=100.5))
+    order = _order(qty=2.0, direction=Direction.BUY,
+                   order_type=OrderType.LMT, price=99.0, order_id='L1')
+    ex.execute_order(order)
+    assert q.items == []
+    assert 'L1' in ex.pending_orders
+    # Next bar trades through the limit without gapping (open above limit):
+    # fills at min(99, 100.2) = the limit price.
+    ex.update_bar(_bar(ts=DEFAULT_TS + timedelta(days=1),
+                       open=100.2, high=100.8, low=98.5, close=99.5))
     assert len(q.items) == 1
     assert math.isclose(q.items[0].fill_notional, 2.0 * 99.0)
     assert ex.pending_orders == {}
 
 
-def test_signal_close_lmt_sell_satisfied_fills_at_limit_price():
-    ex, q = _new_execution(fill_on='signal_close')
-    ex.update_bar(_bar(open=100.0, high=102.0, low=99.0, close=100.5))
-    ex.execute_order(_order(qty=1.0, direction=Direction.SELL,
-                            order_type=OrderType.LMT, price=101.0))
+def test_lmt_sell_rests_on_signal_bar_fills_next_bar_at_limit():
+    ex, q = _new_execution()
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=100.0, high=102.0, low=99.0,
+                       close=100.5))
+    order = _order(qty=1.0, direction=Direction.SELL,
+                   order_type=OrderType.LMT, price=101.0, order_id='L2')
+    ex.execute_order(order)
+    assert q.items == []
+    assert 'L2' in ex.pending_orders
+    # Next bar trades through the limit (open below it): fill at
+    # max(101, 100.5) = the limit price.
+    ex.update_bar(_bar(ts=DEFAULT_TS + timedelta(days=1),
+                       open=100.5, high=101.5, low=100.0, close=101.2))
     assert len(q.items) == 1
     assert math.isclose(q.items[0].fill_notional, 1.0 * 101.0)
     assert ex.pending_orders == {}
 
 
 def test_signal_close_lmt_buy_not_satisfied_falls_to_pending():
-    ex, q = _new_execution(fill_on='signal_close')
+    ex, q = _new_execution()
     ex.update_bar(_bar(open=100.0, high=101.0, low=99.0, close=100.5))
     order = _order(qty=1.0, direction=Direction.BUY,
                    order_type=OrderType.LMT, price=98.0, order_id='L1')
@@ -310,7 +324,7 @@ def test_signal_close_lmt_buy_not_satisfied_falls_to_pending():
 
 
 def test_signal_close_lmt_sell_not_satisfied_falls_to_pending():
-    ex, q = _new_execution(fill_on='signal_close')
+    ex, q = _new_execution()
     ex.update_bar(_bar(open=100.0, high=101.0, low=99.0, close=100.5))
     order = _order(qty=1.0, direction=Direction.SELL,
                    order_type=OrderType.LMT, price=102.0, order_id='L2')
@@ -320,96 +334,124 @@ def test_signal_close_lmt_sell_not_satisfied_falls_to_pending():
 
 
 def test_signal_close_no_current_bar_raises_runtime_error():
-    ex, _ = _new_execution(fill_on='signal_close')
+    ex, _ = _new_execution()
     with pytest.raises(RuntimeError):
         ex.execute_order(_order())  # no bar observed first
 
 
-def test_signal_close_does_not_apply_gap_favorable_pricing():
-    # On the SIGNAL bar, LMT BUY fills strictly at the limit price — gap-favorable
-    # min(limit, bar.open) only applies to orders already resting on the book
-    # at a LATER bar's open. Pin that distinction here.
-    ex, q = _new_execution(fill_on='signal_close')
-    ex.update_bar(_bar(open=95.0, high=101.0, low=94.0, close=100.0))
-    ex.execute_order(_order(qty=1.0, direction=Direction.BUY,
-                            order_type=OrderType.LMT, price=100.0))
-    # limit=100 satisfied (low<=100). Fills at 100, not at min(100, 95)=95.
+def test_lmt_never_fills_on_its_signal_bar_even_when_range_satisfies():
+    """Causality pin: the signal bar's high/low printed BEFORE the order
+    existed (it is decided at that bar's close), so a LMT must never fill
+    against its own signal bar's range — it rests, then fills on the next
+    bar with the standard gap-favorable resting-order pricing."""
+    ex, q = _new_execution()
+    # low=94 <= limit=100: the old same-bar model would have filled here.
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=95.0, high=101.0, low=94.0,
+                       close=100.0))
+    order = _order(qty=1.0, direction=Direction.BUY,
+                   order_type=OrderType.LMT, price=100.0, order_id='L1')
+    ex.execute_order(order)
+    assert q.items == []
+    assert 'L1' in ex.pending_orders
+    # Next bar gaps down through the limit: resting order fills at
+    # min(100, open=95) = 95 (gap-favorable — it was on the book at the open).
+    ex.update_bar(_bar(ts=DEFAULT_TS + timedelta(days=1),
+                       open=95.0, high=96.0, low=94.0, close=95.5))
     assert len(q.items) == 1
-    assert math.isclose(q.items[0].fill_notional, 1.0 * 100.0)
+    assert math.isclose(q.items[0].fill_notional, 1.0 * 95.0)
 
 
 # ──────────────────────────────────────────────
-# execute_order — next_open
+# execute_order — deferred cross-symbol orders (stale current bar)
 # ──────────────────────────────────────────────
 
-def test_next_open_mkt_queues_without_fill():
-    ex, q = _new_execution(fill_on='next_open')
-    ex.update_bar(_bar())  # even with a bar observed
-    order = _order(qty=1.0, order_type=OrderType.MKT, order_id='M1')
+def test_execute_order_defers_when_current_bar_predates_order():
+    """An order whose timestamp is NEWER than the symbol's last seen bar
+    (a cross-symbol submission, e.g. a margin-call liquidation decided
+    while another symbol's bar was processing) must NOT fill against the
+    stale bar's past price/timestamp — it defers to pending_orders."""
+    ex, q = _new_execution()
+    ex.update_bar(_bar(ts=DEFAULT_TS, close=100.5))
+    order = _order(qty=1.0, order_type=OrderType.MKT, order_id='M1',
+                   ts=DEFAULT_TS + timedelta(days=1))
     ex.execute_order(order)
     assert q.items == []
     assert 'M1' in ex.pending_orders
 
 
-def test_next_open_lmt_queues_without_fill():
-    # Even when this bar's range would satisfy the limit, next_open queues it.
-    ex, q = _new_execution(fill_on='next_open')
-    ex.update_bar(_bar(open=100.0, high=101.0, low=98.0, close=100.5))
-    order = _order(qty=1.0, direction=Direction.BUY,
-                   order_type=OrderType.LMT, price=99.0, order_id='L1')
-    ex.execute_order(order)
-    assert q.items == []
-    assert 'L1' in ex.pending_orders
+def test_deferred_mkt_fills_at_close_of_same_timestamp_bar():
+    """The symbol's own bar for the decision period (same timestamp,
+    arriving later in the timestamp group) fills the deferred MKT at its
+    CLOSE — signal-close semantics — stamped with that bar's timestamp."""
+    ex, q = _new_execution()
+    t1 = DEFAULT_TS + timedelta(days=1)
+    ex.update_bar(_bar(ts=DEFAULT_TS, close=100.0))
+    ex.execute_order(_order(qty=1.0, order_type=OrderType.MKT,
+                            order_id='M1', ts=t1))
+    assert 'M1' in ex.pending_orders
+    ex.update_bar(_bar(ts=t1, open=110.0, high=112.0, low=109.0, close=111.0))
+    assert len(q.items) == 1
+    assert math.isclose(q.items[0].fill_notional, 1.0 * 111.0)
+    assert q.items[0].timestamp == t1
+    assert 'M1' not in ex.pending_orders
 
 
-def test_next_open_execute_order_without_current_bar_does_not_raise():
-    ex, q = _new_execution(fill_on='next_open')
-    # Should NOT raise the RuntimeError that signal_close mode raises.
-    ex.execute_order(_order(order_id='X'))
-    assert 'X' in ex.pending_orders
+def test_deferred_mkt_fills_at_open_of_later_period_bar():
+    """If the symbol had no bar in the decision period, the deferred MKT
+    fills at the next bar's OPEN (effectively next-open for that symbol)."""
+    ex, q = _new_execution()
+    t1 = DEFAULT_TS + timedelta(days=1)
+    t2 = DEFAULT_TS + timedelta(days=2)
+    ex.update_bar(_bar(ts=DEFAULT_TS, close=100.0))
+    ex.execute_order(_order(qty=1.0, order_type=OrderType.MKT,
+                            order_id='M1', ts=t1))
+    ex.update_bar(_bar(ts=t2, open=123.0, high=124.0, low=122.0, close=123.5))
+    assert len(q.items) == 1
+    assert math.isclose(q.items[0].fill_notional, 1.0 * 123.0)
+    assert q.items[0].timestamp == t2
+    assert 'M1' not in ex.pending_orders
 
 
 # ──────────────────────────────────────────────
 # update_bar — fills pending orders
 # ──────────────────────────────────────────────
 
-def test_update_bar_fills_pending_mkt_at_bar_open():
-    ex, q = _new_execution(fill_on='next_open')
-    order = _order(qty=1.0, direction=Direction.BUY, order_type=OrderType.MKT,
-                   order_id='M1')
-    ex.execute_order(order)
-    ex.update_bar(_bar(open=123.0, high=124.0, low=122.0, close=123.5))
-    assert len(q.items) == 1
-    assert math.isclose(q.items[0].fill_notional, 1.0 * 123.0)
-    assert 'M1' not in ex.pending_orders
-
-
 def test_update_bar_fills_pending_lmt_buy_with_gap_favorable_pricing():
-    ex, q = _new_execution(fill_on='next_open')
+    ex, q = _new_execution()
+    # LMT BUY 100 not satisfied on the signal bar (low=101) — rests.
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=102.0, high=103.0, low=101.0,
+                       close=102.5))
     order = _order(qty=1.0, direction=Direction.BUY,
                    order_type=OrderType.LMT, price=100.0, order_id='L1')
     ex.execute_order(order)
+    assert 'L1' in ex.pending_orders
     # Gap-down open: bar.open=95, bar.low=94. limit=100 satisfied; fill at min(100, 95)=95.
-    ex.update_bar(_bar(open=95.0, high=96.0, low=94.0, close=95.5))
+    ex.update_bar(_bar(ts=DEFAULT_TS + timedelta(days=1),
+                       open=95.0, high=96.0, low=94.0, close=95.5))
     assert len(q.items) == 1
     assert math.isclose(q.items[0].fill_notional, 1.0 * 95.0)
     assert 'L1' not in ex.pending_orders
 
 
 def test_update_bar_fills_pending_lmt_sell_with_gap_favorable_pricing():
-    ex, q = _new_execution(fill_on='next_open')
+    ex, q = _new_execution()
+    # LMT SELL 100 not satisfied on the signal bar (high=99) — rests.
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=98.0, high=99.0, low=97.0,
+                       close=98.5))
     order = _order(qty=1.0, direction=Direction.SELL,
                    order_type=OrderType.LMT, price=100.0, order_id='L1')
     ex.execute_order(order)
+    assert 'L1' in ex.pending_orders
     # Gap-up open: bar.open=105, bar.high=106. limit=100 satisfied; fill at max(100, 105)=105.
-    ex.update_bar(_bar(open=105.0, high=106.0, low=104.5, close=105.5))
+    ex.update_bar(_bar(ts=DEFAULT_TS + timedelta(days=1),
+                       open=105.0, high=106.0, low=104.5, close=105.5))
     assert len(q.items) == 1
     assert math.isclose(q.items[0].fill_notional, 1.0 * 105.0)
 
 
 def test_update_bar_pending_lmt_not_satisfied_stays_pending():
     """LMT order never fills — stays pending across many bars, no FillEvent."""
-    ex, q = _new_execution(fill_on='signal_close')
+    ex, q = _new_execution()
     # Place LMT BUY at 50 when market is trading ~100 — nowhere near the book.
     ex.update_bar(_bar(open=100.0, high=101.0, low=99.0, close=100.5))
     order = _order(qty=1.0, direction=Direction.BUY,
@@ -426,22 +468,28 @@ def test_update_bar_pending_lmt_not_satisfied_stays_pending():
 
 
 def test_update_bar_ignores_orders_for_other_symbols():
-    ex, q = _new_execution(fill_on='next_open')
-    btc_order = _order(symbol='BTC', order_id='B1', order_type=OrderType.MKT)
-    ex.execute_order(btc_order)
+    ex, q = _new_execution()
+    t1 = DEFAULT_TS + timedelta(days=1)
+    ex.update_bar(_bar(symbol='BTC', ts=DEFAULT_TS))
+    btc_order = _order(symbol='BTC', order_id='B1', order_type=OrderType.MKT,
+                       ts=t1)
+    ex.execute_order(btc_order)  # deferred: BTC's current bar is stale
     # ETH bar arrives — must not touch the BTC pending order.
-    ex.update_bar(_bar(symbol='ETH'))
+    ex.update_bar(_bar(symbol='ETH', ts=t1))
     assert q.items == []
     assert 'B1' in ex.pending_orders
 
 
 def test_update_bar_fills_only_matching_symbol_leaves_others_pending():
-    ex, q = _new_execution(fill_on='next_open')
+    ex, q = _new_execution()
+    t1 = DEFAULT_TS + timedelta(days=1)
+    ex.update_bar(_bar(symbol='BTC', ts=DEFAULT_TS))
+    ex.update_bar(_bar(symbol='ETH', ts=DEFAULT_TS))
     ex.execute_order(_order(symbol='BTC', order_id='B1',
-                            order_type=OrderType.MKT))
+                            order_type=OrderType.MKT, ts=t1))
     ex.execute_order(_order(symbol='ETH', order_id='E1',
-                            order_type=OrderType.MKT))
-    ex.update_bar(_bar(symbol='BTC', open=100.0))
+                            order_type=OrderType.MKT, ts=t1))
+    ex.update_bar(_bar(symbol='BTC', ts=t1, open=100.0))
     assert len(q.items) == 1
     assert q.items[0].symbol == 'BTC'
     assert 'B1' not in ex.pending_orders
@@ -457,27 +505,32 @@ def test_update_bar_stores_current_bar_per_symbol():
 
 
 def test_update_bar_fills_multiple_pending_orders_in_one_bar():
-    ex, q = _new_execution(fill_on='next_open')
+    ex, q = _new_execution()
+    t1 = DEFAULT_TS + timedelta(days=1)
+    ex.update_bar(_bar(symbol='BTC', ts=DEFAULT_TS))
     ex.execute_order(_order(symbol='BTC', order_id='A',
-                            order_type=OrderType.MKT, qty=1.0))
+                            order_type=OrderType.MKT, qty=1.0, ts=t1))
     ex.execute_order(_order(symbol='BTC', order_id='B',
-                            order_type=OrderType.MKT, qty=2.0))
-    ex.update_bar(_bar(symbol='BTC', open=100.0))
+                            order_type=OrderType.MKT, qty=2.0, ts=t1))
+    ex.update_bar(_bar(symbol='BTC', ts=t1, open=100.0))
     assert len(q.items) == 2
     assert ex.pending_orders == {}
 
 
 def test_update_bar_removes_filled_orders_from_pending():
-    ex, q = _new_execution(fill_on='next_open')
-    ex.execute_order(_order(order_id='A', order_type=OrderType.MKT))
+    ex, q = _new_execution()
+    t1 = DEFAULT_TS + timedelta(days=1)
+    ex.update_bar(_bar(ts=DEFAULT_TS))
+    ex.execute_order(_order(order_id='A', order_type=OrderType.MKT, ts=t1))
     assert 'A' in ex.pending_orders
-    ex.update_bar(_bar(open=100.0))
+    ex.update_bar(_bar(ts=t1, open=100.0))
     assert 'A' not in ex.pending_orders
 
 
 def test_update_bar_preserves_unfilled_pending_across_many_bars():
     """Pin: no TTL — a pending LMT with an unreachable price sits forever."""
-    ex, _ = _new_execution(fill_on='next_open')
+    ex, _ = _new_execution()
+    ex.update_bar(_bar(open=100.0, high=101.0, low=99.0, close=100.5))
     ex.execute_order(_order(qty=1.0, direction=Direction.BUY,
                             order_type=OrderType.LMT, price=1.0,
                             order_id='GHOST'))
@@ -491,7 +544,7 @@ def test_update_bar_preserves_unfilled_pending_across_many_bars():
 # ──────────────────────────────────────────────
 
 def test_emit_fill_applies_slippage_to_base_price():
-    ex, q = _new_execution(fill_on='signal_close', slippage=('pct', 0.001))
+    ex, q = _new_execution(slippage=('pct', 0.001))
     ex.update_bar(_bar(open=100.0, high=101.0, low=99.0, close=100.0))
     ex.execute_order(_order(qty=1.0, direction=Direction.BUY,
                             order_type=OrderType.MKT))
@@ -499,10 +552,26 @@ def test_emit_fill_applies_slippage_to_base_price():
     assert math.isclose(q.items[0].fill_notional, 1.0 * 100.1)
 
 
+def test_emit_fill_applies_no_slippage_to_lmt_fills():
+    """Slippage models taker market impact — a LMT fills at its limit (or
+    gap-favorably better), never worse. Same slippage model as the MKT
+    test above; the (resting, next-bar) LMT fill must come through
+    unslipped."""
+    ex, q = _new_execution(slippage=('pct', 0.01))
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=100.0, high=101.0, low=98.0,
+                       close=100.5))
+    ex.execute_order(_order(qty=1.0, direction=Direction.BUY,
+                            order_type=OrderType.LMT, price=99.0))
+    assert q.items == []  # rests on the signal bar
+    ex.update_bar(_bar(ts=DEFAULT_TS + timedelta(days=1),
+                       open=100.0, high=100.5, low=98.5, close=99.2))
+    assert len(q.items) == 1
+    assert math.isclose(q.items[0].fill_notional, 1.0 * 99.0)
+
+
 def test_emit_fill_calls_commission_at_slipped_price():
     # commission rate 0.001 on notional = qty * slipped_price
-    ex, q = _new_execution(fill_on='signal_close',
-                           slippage=('pct', 0.001), commission=('rate', 0.001))
+    ex, q = _new_execution(slippage=('pct', 0.001), commission=('rate', 0.001))
     ex.update_bar(_bar(open=100.0, high=101.0, low=99.0, close=100.0))
     ex.execute_order(_order(qty=2.0, direction=Direction.BUY,
                             order_type=OrderType.MKT))
@@ -511,8 +580,7 @@ def test_emit_fill_calls_commission_at_slipped_price():
 
 
 def test_emit_fill_writes_fill_event_with_expected_fields():
-    ex, q = _new_execution(fill_on='signal_close',
-                           exchange_name='TESTEX', commission=('rate', 0.0004))
+    ex, q = _new_execution(exchange_name='TESTEX', commission=('rate', 0.0004))
     bar_ts = datetime(2026, 3, 15, 9, 30, 0)
     ex.update_bar(_bar(symbol='BTC', ts=bar_ts,
                        open=100.0, high=101.0, low=99.0, close=100.5))
@@ -531,14 +599,14 @@ def test_emit_fill_writes_fill_event_with_expected_fields():
 
 
 def test_emit_fill_uses_configured_exchange_name():
-    ex, q = _new_execution(fill_on='signal_close', exchange_name='FOOBAR')
+    ex, q = _new_execution(exchange_name='FOOBAR')
     ex.update_bar(_bar())
     ex.execute_order(_order())
     assert q.items[0].exchange == 'FOOBAR'
 
 
 def test_emit_fill_uses_bar_timestamp_not_order_timestamp():
-    ex, q = _new_execution(fill_on='signal_close')
+    ex, q = _new_execution()
     bar_ts = datetime(2026, 6, 1, 0, 0, 0)
     order_ts = datetime(2025, 1, 1, 0, 0, 0)
     ex.update_bar(_bar(ts=bar_ts))
@@ -552,7 +620,7 @@ def test_emit_fill_fills_at_full_requested_quantity():
     portfolio margin. Whatever quantity the order asks for, that's what
     the fill emits.
     """
-    ex, q = _new_execution(fill_on='signal_close')
+    ex, q = _new_execution()
     ex.update_bar(_bar(open=100.0, high=101.0, low=99.0, close=100.0))
     ex.execute_order(_order(qty=42.0, direction=Direction.BUY,
                             order_type=OrderType.MKT))
@@ -563,8 +631,7 @@ def test_emit_fill_fills_at_full_requested_quantity():
 def test_emit_fill_rate_commission_scales_by_point_value():
     """'rate' commission charges bps on the true dollar notional
     abs(qty * point_value * fill_price)."""
-    ex, q = _new_execution(fill_on='signal_close',
-                           commission=('rate', 0.001), point_value=1000.0)
+    ex, q = _new_execution(commission=('rate', 0.001), point_value=1000.0)
     ex.update_bar(_bar(symbol='BTC', open=50.0, high=51.0, low=49.0, close=50.0))
     ex.execute_order(_order(symbol='BTC', qty=2.0, direction=Direction.BUY,
                             order_type=OrderType.MKT))
@@ -580,7 +647,7 @@ def test_emit_fill_uses_per_symbol_slippage_and_commission():
         'ETH': InstrumentConfig(slippage=SlippageModel('absolute', 5.0),
                                 commission=CommissionModel('per_contract', 3.0)),
     }
-    ex, q = _new_execution(fill_on='signal_close', instruments=instruments)
+    ex, q = _new_execution(instruments=instruments)
     ex.update_bar(_bar(symbol='BTC', open=100.0, high=101.0, low=99.0, close=100.0))
     ex.update_bar(_bar(symbol='ETH', open=100.0, high=101.0, low=99.0, close=100.0))
     ex.execute_order(_order(symbol='BTC', qty=1.0, direction=Direction.BUY,

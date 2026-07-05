@@ -1,3 +1,4 @@
+import heapq
 import logging
 import queue as thread_queue
 from typing import Any, Dict, Generator, Iterator, List, Tuple
@@ -51,27 +52,34 @@ class HistoricDataHandler(DataHandler):
     def _merge_generators(self, generators: Dict[str, Iterator[Any]]) -> Generator[Tuple[str, Any], None, None]:
         """Merge multiple symbol generators into a single time-sorted stream.
 
-        Uses a current-heads dict to track the next row from each symbol,
-        always yielding the row with the earliest timestamp.
+        A heap of ``(timestamp, seq, symbol, row)`` heads yields the
+        earliest-timestamp row in O(log S) per bar (S = symbols with data
+        remaining). ``seq`` is the symbol's insertion index in
+        ``generators``, so equal timestamps break to the FIRST-inserted
+        symbol — exactly the tie-break the previous linear ``min()`` scan
+        over the heads dict produced. ``(timestamp, seq)`` is unique per
+        heap entry (one head per symbol), so the row itself is never
+        compared.
         """
-        current_heads: Dict[str, Any] = {}
-
-        for sym, gen in generators.items():
+        heap: List[Tuple[Any, int, str, Any]] = []
+        for seq, (sym, gen) in enumerate(generators.items()):
             try:
-                current_heads[sym] = next(gen)
+                row = next(gen)
             except StopIteration:
-                pass
+                continue
+            heap.append((row.Index, seq, sym, row))
+        heapq.heapify(heap)
 
-        while current_heads:
-            earliest_sym = min(current_heads, key=lambda s: current_heads[s].Index)
-            row = current_heads[earliest_sym]
+        while heap:
+            _, seq, sym, row = heapq.heappop(heap)
 
-            yield (earliest_sym, row)
+            yield (sym, row)
 
             try:
-                current_heads[earliest_sym] = next(generators[earliest_sym])
+                nxt = next(generators[sym])
             except StopIteration:
-                del current_heads[earliest_sym]
+                continue
+            heapq.heappush(heap, (nxt.Index, seq, sym, nxt))
 
     def update_bar(self) -> None:
         """Pushes the next bar to the queue."""

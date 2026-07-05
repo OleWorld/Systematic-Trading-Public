@@ -51,13 +51,14 @@ class BacktestPortfolio(Portfolio):
     pending orders may span symbols, the model and ``point_value`` are looked
     up per order.
 
-    Position baseline for new-order margin checks (``_projected_position``)
-    is realized + pending MKT orders only; LMT pendings are excluded
-    because they may never fill, so a pending LMT must not be allowed to
-    pre-credit margin freedom for sizing other orders. The risk-increasing
-    portion of any pending order — MKT or LMT — is still reserved via
-    ``_reserved_margin``, so a pending LMT that *adds* to a position keeps
-    its capital committed; only the *freeing* assumption is dropped.
+    Position baseline for new-order margin checks (``projected_position``,
+    also the baseline risk managers size against) is realized + pending MKT
+    orders only; LMT pendings are excluded because they may never fill, so
+    a pending LMT must not be allowed to pre-credit margin freedom for
+    sizing other orders. The risk-increasing portion of any pending order —
+    MKT or LMT — is still reserved via ``_reserved_margin``, so a pending
+    LMT that *adds* to a position keeps its capital committed; only the
+    *freeing* assumption is dropped.
 
     Solvency / margin call: the portfolio is solvent while
     ``account_balance >= total maintenance margin`` (the sum of the
@@ -73,20 +74,34 @@ class BacktestPortfolio(Portfolio):
     market exposure from making things worse, not to magically restore equity.
     ``available_balance`` going negative is tolerated — it just means existing
     positions are sitting at unrealized loss and no new opening orders can be
-    placed. (Liquidate-all-worst-first is kept; partial liquidation — closing
-    only enough to restore the maintenance floor — is future work.)
+    placed. While it is negative, the risk-neutral margin-check shortcut is
+    also revoked: an order that merely *replaces* margin demand (e.g. a
+    same-bar re-open netted against an in-flight liquidation) is scaled to
+    what the balance actually backs instead of passing at full size —
+    pure risk-reduction still always passes in full. (Liquidate-all-
+    worst-first is kept; partial liquidation — closing only enough to
+    restore the maintenance floor — is future work.)
 
     Fill-time margin trade-off: margin is reserved at submission price.
-    Between submission and fill the price can move arbitrarily — a pending
-    MKT BUY queued at $100 under ``fill_on='next_open'`` may fill at $200
-    on a gap-up — and the FIFO reservation walk does NOT re-validate at
-    fill time. The triggering fill itself can therefore drive
+    Between submission and fill the price can move — a resting LMT, or a
+    deferred cross-symbol MKT (e.g. a margin-call liquidation waiting for
+    its symbol's own bar), may fill on a later bar at a very different
+    price — and the FIFO reservation walk does NOT re-validate at fill
+    time. The triggering fill itself can therefore drive
     ``account_balance`` below zero in one bar; ``check_solvency`` catches
     this *after* the fill is booked (cash and realized PnL have already
     moved) and liquidates from there. This is acceptable for backtesting
     under conservative slippage models, but ``LiveExecution`` must
     implement its own pre-fill margin gating (in real markets the exchange
     rejects orders that would breach margin at fill time).
+
+    Cancelled orders: ``cancel_order`` and the margin-call cancel pass
+    remove an order from this portfolio's ledger and release its reserved
+    margin, but the simulated exchange holds its own pending book and an
+    already-emitted ``OrderEvent`` cannot be recalled from the events
+    queue. Any ``FillEvent`` that later arrives for a cancelled order id
+    is therefore **voided** in ``update_fill`` (WARNING log, no state
+    change) so a cancelled order can never move positions or cash.
     """
 
     def __init__(self, events_queue: _EventsQueueLike,
@@ -117,6 +132,14 @@ class BacktestPortfolio(Portfolio):
 
         # Pending order tracking (for margin reservation)
         self.pending_orders: Dict[str, OrderEvent] = {}
+
+        # Order ids cancelled via cancel_order / the margin-call cancel
+        # pass. The simulated exchange may still emit a fill for such an
+        # order (its book and the events queue are not recalled);
+        # update_fill voids those fills instead of booking them. An id is
+        # discarded once its fill has been voided (at most one fill per
+        # order id), keeping the set small.
+        self._cancelled_order_ids: set = set()
 
         # Per-symbol unrealized P&L (updated each bar)
         self.unrealized_pnl: Dict[str, float] = {s: 0.0 for s in symbol_list}
@@ -167,23 +190,23 @@ class BacktestPortfolio(Portfolio):
             self.positions[event.symbol], event.close, cfg.point_value,
         )
 
-        self._refresh_snapshot()
+        # Per-event fast path: only THIS symbol's price changed since the
+        # last event, so only its unrealized entry needs recomputing —
+        # identical numbers to a full-universe recompute at O(1) instead
+        # of O(N) (see _update_symbol_unrealized's invariant note).
+        self._update_symbol_unrealized(event.symbol)
+        self._refresh_balances()
 
         prior_balance = (
             self.equity_curve[-1]['account_balance']
             if self.equity_curve
             else self.initial_capital
         )
-        if prior_balance > 0:
-            simple_return = (self.account_balance - prior_balance) / prior_balance
-            log_return = (
-                math.log(self.account_balance / prior_balance)
-                if self.account_balance > 0
-                else float('nan')
-            )
-        else:
-            simple_return = float('nan')
-            log_return = float('nan')
+        simple_return, log_return = self._period_returns(prior_balance)
+
+        # Computed once per event, shared by the equity row and the
+        # solvency trigger below (no state mutates in between).
+        maintenance_margin = self._maintenance_margin()
 
         # Lightweight per-event row: account-level scalars only.
         self.equity_curve.append({
@@ -194,7 +217,7 @@ class BacktestPortfolio(Portfolio):
             'simple_return': simple_return,
             'log_return': log_return,
             'position_margin': self._position_margin(),
-            'maintenance_margin': self._maintenance_margin(),
+            'maintenance_margin': maintenance_margin,
             'available_balance': self.available_balance,
             'total_commission': self.total_commission,
         })
@@ -209,7 +232,10 @@ class BacktestPortfolio(Portfolio):
             'margin_requirements': dict(self.margin_requirements),
         }
 
-        self.check_solvency(event.timestamp)
+        # Caches are fresh (refreshed above) — skip the public wrapper's
+        # redundant full refresh and reuse the maintenance margin.
+        self._enforce_solvency(event.timestamp,
+                               maintenance_margin=maintenance_margin)
 
     # ── Order submission ──────────────────────
 
@@ -322,7 +348,22 @@ class BacktestPortfolio(Portfolio):
 
         Cash changes only by realized P&L minus commission (futures model).
         After applying the fill, run a solvency check.
+
+        Fills for cancelled orders are **voided**: the portfolio cancelled
+        the order (releasing its reserved margin), but the simulated
+        exchange's book / the events queue may still deliver the fill —
+        booking it would resurrect an order the account no longer backs.
         """
+        if (event.order_id is not None
+                and event.order_id in self._cancelled_order_ids):
+            self._cancelled_order_ids.discard(event.order_id)
+            logger.warning(
+                "[FILL VOIDED] %s %.6f %s | id=%s | Reason: order was cancelled",
+                event.direction.value, event.quantity, event.symbol,
+                event.order_id,
+            )
+            return
+
         symbol = event.symbol
         cfg = self.instruments[symbol]
         pv = cfg.point_value
@@ -364,7 +405,12 @@ class BacktestPortfolio(Portfolio):
             'order_id': event.order_id,
         })
 
-        self.check_solvency(event.timestamp)
+        # Only this symbol's position/avg-cost changed — incremental
+        # refresh, then the solvency check (skipping the public wrapper's
+        # redundant full recompute).
+        self._update_symbol_unrealized(symbol)
+        self._refresh_balances()
+        self._enforce_solvency(event.timestamp)
 
     def _apply_fill_to_position(self, symbol: str, qty: float, direction: Direction,
                                 fill_price: float, fill_notional: float
@@ -447,7 +493,7 @@ class BacktestPortfolio(Portfolio):
         the only difference is the reference price (current safe price
         for MKT, limit price for LMT, which the caller resolves).
         """
-        pos = self._projected_position(symbol)
+        pos = self.projected_position(symbol)
         return self._scale_qty_to_margin(
             symbol, pos, qty, direction, price, exclude_order_id=None,
         )
@@ -460,6 +506,17 @@ class BacktestPortfolio(Portfolio):
         against the baseline ``max(realized_margin, projected_margin_now)``
         and scale down if the available balance can't cover it.
 
+        A risk-neutral-or-reducing order (``delta <= 0``) is approved at
+        full size only while ``available >= 0``. Below the floor the
+        order goes through the scaling branch like any other: pure
+        risk-reduction still passes in full (``max_qty >= |pos|`` even at
+        a zero budget — liquidations are never blocked), but the
+        re-open/flip portion is capped by what the balance actually
+        backs. Without that gate, a margin-call bar's in-flight
+        liquidation nets the projected position to 0 and a same-bar
+        full-size re-open scores ``delta == 0`` — a free pass for an
+        insolvent account.
+
         Same formula for MKT and LMT — the worst-case
         ``max(abs(new_pos), qty)`` clause for LMT has been removed.
         """
@@ -471,13 +528,23 @@ class BacktestPortfolio(Portfolio):
         new_margin_raw = self._calculate_new_margin(symbol, pos, qty, direction, price)
         delta = max(realized_margin, new_margin_raw) - baseline
 
-        if delta <= 0:
-            return qty  # Risk-neutral or reducing
-
         available = (self.calculate_balance()
                      - self._position_margin()
                      - self._reserved_margin(exclude_order_id=exclude_order_id))
-        if delta <= available:
+        if delta <= 0:
+            if available >= 0:
+                return qty  # Risk-neutral or reducing; account above its floor
+            # Below the floor (negative available), the risk-neutral free
+            # pass is revoked: netting against an in-flight liquidation
+            # makes a same-bar full-size RE-OPEN look risk-neutral
+            # (projected position 0, new margin == old margin), which
+            # would let an insolvent account rebuild its position for
+            # free. Fall through to the scaling branch instead — it still
+            # grants any pure risk-reduction in full (``max_qty =
+            # max_abs_new_pos + |pos| >= |pos|`` covers a full close even
+            # at a zero margin budget, so liquidations are never blocked)
+            # but balance-caps the re-open/flip portion.
+        elif delta <= available:
             return qty
 
         # Scale down so the new symbol margin tops out at baseline + available.
@@ -499,22 +566,30 @@ class BacktestPortfolio(Portfolio):
 
     # ── Margin calculations ───────────────────
 
-    def _projected_position(self, symbol: str,
-                            exclude_order_id: Optional[str] = None) -> float:
+    def projected_position(self, symbol: str,
+                           exclude_order_id: Optional[str] = None) -> float:
         """
         Realized position plus signed quantities of all pending **MKT**
-        orders for this symbol (optionally excluding one order). LMT
-        pendings are intentionally excluded: they are conditional fills
-        (price may never reach the limit), so projecting them would let
-        an unfilled LMT pre-credit margin freedom that may never
-        materialize. MKT pendings are guaranteed to fill on the next
-        eligible bar by construction, so they are safe to project.
+        orders for this symbol (optionally excluding one order — an
+        internal hook used by the margin checks) — i.e. the position the
+        account will hold once in-flight MKT orders (e.g. a same-bar
+        margin-call liquidation) fill. LMT pendings are intentionally
+        excluded: they are conditional fills (price may never reach the
+        limit), so projecting them would let an unfilled LMT pre-credit
+        margin freedom that may never materialize. MKT pendings are
+        guaranteed to fill on the next eligible bar by construction, so
+        they are safe to project. Unknown symbols project ``0.0``.
 
-        Used as the position baseline for forward-looking margin checks
-        so that same-bar order sequences (e.g. FLATTEN + OPEN_OPPOSITE,
-        which are emitted as MKT) are evaluated against their projected
-        end-state. Risk-increasing LMT pendings still consume capital
-        via ``_reserved_margin``; this method only governs the position
+        Consumers: the forward-looking margin checks use it as the
+        position baseline so same-bar order sequences (e.g. FLATTEN +
+        OPEN_OPPOSITE, which are emitted as MKT) are evaluated against
+        their projected end-state; risk managers size their resize diff
+        against it so an in-flight liquidation is never double-traded.
+        NOTE for any future LMT-emitting risk manager: because resting
+        LMT orders are excluded here, sizing diffs against this baseline
+        would double-count them — such an RM must track its own resting
+        orders. Risk-increasing LMT pendings still consume capital via
+        ``_reserved_margin``; this method only governs the position
         baseline, not the reservation ledger.
         """
         proj = self.positions.get(symbol, 0.0)
@@ -546,6 +621,10 @@ class BacktestPortfolio(Portfolio):
         Pending orders for which no safe price is available contribute
         zero (reservation deferred until a price is known).
         """
+        if not self.pending_orders:
+            # Common case (no in-flight orders): skip the O(N)
+            # positions-dict copy below — the sum is 0 regardless.
+            return 0.0
         running_pos: Dict[str, float] = dict(self.positions)
         reserved = 0.0
         for oid, order in self.pending_orders.items():
@@ -621,10 +700,29 @@ class BacktestPortfolio(Portfolio):
         Liquidation at mark price does not recover ``account_balance`` (it
         only converts unrealized loss into realized loss), so the loop's
         exit condition is "no positions left," not "balance restored."
-        Called from ``update_bar`` and ``update_fill``.
+
+        This public entry point performs a FULL cache refresh first, so it
+        is safe to call after arbitrary direct state mutation (tests,
+        research hooks). The engine-driven hot paths (``update_bar`` /
+        ``update_fill``) keep their caches fresh incrementally and call
+        ``_enforce_solvency`` directly, skipping the redundant refresh.
         """
         self._refresh_snapshot()
-        maintenance_margin = self._maintenance_margin()
+        self._enforce_solvency(timestamp)
+
+    def _enforce_solvency(self, timestamp: Any,
+                          maintenance_margin: Optional[float] = None) -> None:
+        """Margin-call trigger + liquidation flow, assuming FRESH caches.
+
+        Callers must guarantee ``unrealized_pnl`` / ``account_balance``
+        reflect current prices and positions (the hot paths refresh
+        incrementally before calling; the public ``check_solvency`` does a
+        full refresh). ``maintenance_margin`` may be passed when the
+        caller already computed it this event (``update_bar`` shares it
+        with the equity row) — state must not have mutated since.
+        """
+        if maintenance_margin is None:
+            maintenance_margin = self._maintenance_margin()
         if self.account_balance >= maintenance_margin:
             return
 
@@ -638,15 +736,114 @@ class BacktestPortfolio(Portfolio):
         self._refresh_snapshot()
 
     def _refresh_snapshot(self) -> None:
-        """Recompute unrealized PnL, account_balance, and available_balance."""
+        """Recompute unrealized PnL (full universe), account_balance, and
+        available_balance — the self-healing full refresh. Used by the
+        public ``check_solvency``, the post-liquidation re-sync, and
+        ``finalize``; the per-event hot paths use the incremental
+        ``_update_symbol_unrealized`` + ``_refresh_balances`` pair instead."""
         self._calculate_unrealized_pnl()
+        self._refresh_balances()
+
+    def _refresh_balances(self) -> None:
+        """Recompute ``account_balance`` / ``available_balance`` from the
+        (already-current) per-symbol ``unrealized_pnl`` cache — the summing
+        half of ``_refresh_snapshot`` without the O(N) per-symbol
+        unrealized recompute."""
         self.account_balance = self.calculate_balance()
         self.available_balance = (self.account_balance
                                   - self._position_margin()
                                   - self._reserved_margin())
 
+    def _update_symbol_unrealized(self, symbol: str) -> None:
+        """Recompute ``unrealized_pnl[symbol]`` only — O(1) per event.
+
+        Same formula as ``_calculate_unrealized_pnl`` restricted to one
+        symbol. INVARIANT this relies on: a symbol's unrealized inputs
+        (``positions``, ``avg_cost``, ``_latest_prices``) mutate only at
+        that symbol's own ``update_bar`` (price) and ``update_fill``
+        (position / avg cost), and both call this method immediately —
+        so every OTHER symbol's cached value is already current and a
+        full-universe recompute would produce identical numbers at O(N)
+        cost. Code that mutates portfolio state directly (tests, research
+        hooks) must re-sync via ``_refresh_snapshot`` or go through the
+        public ``check_solvency``.
+        """
+        qty = self.positions[symbol]
+        if qty != 0:
+            price = self.get_price(symbol)
+            if price is None:
+                return  # Keep previous unrealized_pnl for this symbol
+            pv = self.instruments[symbol].point_value
+            self.unrealized_pnl[symbol] = qty * pv * (price - self.avg_cost[symbol])
+        else:
+            self.unrealized_pnl[symbol] = 0.0
+
+    def _period_returns(self, prior_balance: float) -> tuple:
+        """``(simple_return, log_return)`` of the current ``account_balance``
+        against ``prior_balance``.
+
+        Both are NaN when the prior balance is non-positive; ``log_return``
+        is additionally NaN when the current balance is non-positive.
+        Shared by ``update_bar`` (prior = previous equity row) and
+        ``finalize`` (prior = second-to-last row) so the two stay
+        lock-stepped.
+        """
+        if prior_balance > 0:
+            simple_return = (self.account_balance - prior_balance) / prior_balance
+            log_return = (
+                math.log(self.account_balance / prior_balance)
+                if self.account_balance > 0
+                else float('nan')
+            )
+            return simple_return, log_return
+        return float('nan'), float('nan')
+
+    def finalize(self) -> None:
+        """Reconcile the final equity row with end-of-run portfolio state.
+
+        Fills for the last bar's orders book AFTER that bar's equity row
+        was appended (the engine drains Bar → Order → Fill), so without
+        this hook the curve's final row — and every stat derived from it —
+        permanently misses the run's last realized PnL, slippage, and
+        commission. Called once by ``Backtester.run()`` after the event
+        loop drains: refreshes the account snapshot, overwrites the LAST
+        equity row's scalars (returns recomputed against the same
+        prior-row baseline), and rewrites the final timestamp's per-symbol
+        snapshot. No-op when no bars were processed.
+        """
+        if not self.equity_curve:
+            return
+        self._refresh_snapshot()
+        last = self.equity_curve[-1]
+        prior_balance = (
+            self.equity_curve[-2]['account_balance']
+            if len(self.equity_curve) >= 2
+            else self.initial_capital
+        )
+        simple_return, log_return = self._period_returns(prior_balance)
+        last.update({
+            'cash': self.cash,
+            'account_balance': self.account_balance,
+            'simple_return': simple_return,
+            'log_return': log_return,
+            'position_margin': self._position_margin(),
+            'maintenance_margin': self._maintenance_margin(),
+            'available_balance': self.available_balance,
+            'total_commission': self.total_commission,
+        })
+        self._pnl_snapshots[last['timestamp']] = {
+            'positions': dict(self.positions),
+            'unrealized_pnl': dict(self.unrealized_pnl),
+            'realized_pnl': dict(self.realized_pnl),
+            'margin_requirements': dict(self.margin_requirements),
+        }
+
     def _cancel_pending_non_liquidation(self) -> None:
-        """Cancel every pending order that isn't a liquidation order, FIFO."""
+        """Cancel every pending order that isn't a liquidation order, FIFO.
+
+        Cancelled ids are registered so a fill the simulated exchange may
+        still emit for them is voided by ``update_fill``.
+        """
         for oid in list(self.pending_orders.keys()):
             order = self.pending_orders[oid]
             if order.is_liquidation:
@@ -657,6 +854,7 @@ class BacktestPortfolio(Portfolio):
                 order.direction.value, oid,
             )
             del self.pending_orders[oid]
+            self._cancelled_order_ids.add(oid)
 
     def _liquidate_all_positions(self, timestamp: Any) -> None:
         """
@@ -668,11 +866,11 @@ class BacktestPortfolio(Portfolio):
 
         Caveat on the duplicate-submission guard: the guard is "any pending
         liquidation for this symbol blocks a new one." If a prior liquidation
-        is stuck pending — e.g. queued under ``fill_on='next_open'`` and the
-        next bars are all NaN-skipped, or the position has grown via direct
-        state mutation in a test — no replacement order is enqueued. There
-        is no automatic re-arm; in production this would require operator
-        intervention.
+        is stuck pending — e.g. deferred to the symbol's next bar (its bar
+        for the decision period had not streamed yet) and the symbol never
+        prints again, or the position has grown via direct state mutation
+        in a test — no replacement order is enqueued. There is no automatic
+        re-arm; in production this would require operator intervention.
         """
         symbols_with_pending_liquidation = {
             o.symbol for o in self.pending_orders.values() if o.is_liquidation
@@ -715,7 +913,7 @@ class BacktestPortfolio(Portfolio):
 
         Caller passes the appropriate baseline (raw realized position via
         ``self.positions[symbol]`` or the projected-through-pending position
-        via ``self._projected_position(symbol, ...)``) depending on use case.
+        via ``self.projected_position(symbol, ...)``) depending on use case.
 
         Uniform formula for MKT and LMT: the model's initial margin on the
         projected position.
@@ -765,9 +963,15 @@ class BacktestPortfolio(Portfolio):
     # ── Order management ──────────────────────
 
     def cancel_order(self, order_id: str) -> None:
-        """Cancel a pending order and release its reserved margin."""
+        """Cancel a pending order and release its reserved margin.
+
+        The id is registered as cancelled so a fill the simulated exchange
+        may still emit for it is voided by ``update_fill`` instead of
+        booked.
+        """
         if order_id in self.pending_orders:
             del self.pending_orders[order_id]
+            self._cancelled_order_ids.add(order_id)
 
     # ── Record getters ────────────────────────
 

@@ -22,22 +22,50 @@ Public surface:
   ``analytics._portfolio_optimizer`` for the shared contract
   (label-aligned inputs, per-scheme constraints, corr-vs-covariance
   equivalence).
+* ``validate_named_weights(weights, labels)`` — validate / default a
+  label→weight mapping (``None`` → equal weight; else keys set-equal to
+  ``labels``, finite, non-negative, sum→1). The one shared entry point
+  for weight validation across the allocation hierarchy (instrument,
+  strategy, and forecast-variation weights).
 * ``backtest_stats(equity_curve, trade_log, *, initial_capital,
   timeframe, days_convention)`` — post-run summary statistics (drawdowns,
   Sharpe/Sortino/Calmar, volatility, trade stats) as an ordered
   ``pd.Series``; dollar-first with percentage twins where meaningful.
+* ``pnl_attribution(equity_curve, system, *, eps=1e-6)`` — post-run
+  decomposition of the actual per-bar PnL (gross of commission) across
+  an ``Orchestrator``'s strategies and their variations, by signed
+  forecast-contribution shares (one-bar lag). Returns a
+  ``PnLAttributionResult`` whose ``by('strategy')`` /
+  ``by('strategy', 'variation')`` / ``by('symbol', ...)`` views all sum
+  per bar to ``result.total``.
+* ``turnover_stats(equity_curve, trade_log, *, timeframe,
+  days_convention)`` — per-instrument Carver turnover table (avg
+  |position| in contracts, round trips/year, avg holding days over the
+  first-fill→end active window) plus an ``'Average'`` row carrying only
+  the holding-period mean.
 """
 
+from analytics._attribution import PnLAttributionResult, pnl_attribution
 from analytics._correlation import correlation_matrix
 from analytics._diversification_multiplier import diversification_multiplier
-from analytics._portfolio_optimizer import equal_weight, min_variance, risk_parity
+from analytics._portfolio_optimizer import (
+    equal_weight,
+    min_variance,
+    risk_parity,
+    validate_named_weights,
+)
 from analytics._stats import backtest_stats
+from analytics._turnover import turnover_stats
 
 __all__ = [
+    'PnLAttributionResult',
     'backtest_stats',
     'correlation_matrix',
     'diversification_multiplier',
     'equal_weight',
     'min_variance',
+    'pnl_attribution',
     'risk_parity',
+    'turnover_stats',
+    'validate_named_weights',
 ]

@@ -394,11 +394,30 @@ def test_append_bar_distinct_timestamps_extend_deque():
     assert deq[0].timestamp == t0 and deq[1].timestamp == t1
 
 
-def test_append_bar_same_timestamp_replaces_last_entry():
+def test_append_bar_duplicate_completed_timestamp_rejected(caplog):
+    """A second COMPLETED bar at an already-accepted timestamp is dirty
+    input: dropped with a WARNING, deque untouched (first bar wins)."""
     h = _new_stub()
     t0 = datetime.datetime(2026, 1, 1, 0, tzinfo=UTC)
-    h._append_bar('BTC', t0, 1, 2, 0, 1.5, 10)
-    h._append_bar('BTC', t0, 1, 5, 0, 4.0, 25)
+    assert h._append_bar('BTC', t0, 1, 2, 0, 1.5, 10) is True
+    with caplog.at_level(logging.WARNING, logger='data._base'):
+        accepted = h._append_bar('BTC', t0, 1, 5, 0, 4.0, 25)
+    assert accepted is False
+    assert any('duplicate completed bar' in rec.message for rec in caplog.records)
+    deq = h._base_bar_data['BTC']
+    assert len(deq) == 1
+    bar = deq[0]
+    assert bar.timestamp == t0
+    assert (bar.open, bar.high, bar.low, bar.close, bar.volume) == (1, 2, 0, 1.5, 10)
+
+
+def test_append_bar_same_timestamp_forming_retick_replaces_last_entry():
+    """Forming re-ticks at the same timestamp keep the upsert semantics
+    (the live tick-by-tick path) — only completed duplicates are rejected."""
+    h = _new_stub()
+    t0 = datetime.datetime(2026, 1, 1, 0, tzinfo=UTC)
+    h._append_bar('BTC', t0, 1, 2, 0, 1.5, 10, is_forming=True)
+    h._append_bar('BTC', t0, 1, 5, 0, 4.0, 25, is_forming=True)
     deq = h._base_bar_data['BTC']
     assert len(deq) == 1
     bar = deq[0]
@@ -650,6 +669,34 @@ def test_append_bar_accepts_nan_volume():
     assert len(h._base_bar_data['BTC']) == 1
 
 
+def test_nan_volume_does_not_poison_htf_volume_sum():
+    """A NaN base volume counts as 0.0 in the HTF volume accumulation —
+    one flaky tick must not turn the whole period's aggregate into NaN
+    (regression: ``last.volume + NaN`` used to stick as NaN forever)."""
+    h = _new_stub(base='1h', timeframes={'1h': 50, '4h': 50})
+    t0 = datetime.datetime(2026, 1, 1, 0, tzinfo=UTC)
+    h._append_bar('BTC', t0, 1.0, 2.0, 0.5, 1.5, 10.0)
+    h._append_bar('BTC', t0 + datetime.timedelta(hours=1),
+                  1.5, 2.5, 1.0, 2.0, NAN)
+    h._append_bar('BTC', t0 + datetime.timedelta(hours=2),
+                  2.0, 3.0, 1.5, 2.5, 30.0)
+    htf = h._htf_bar_data[('BTC', '4h')]
+    assert len(htf) == 1
+    assert htf[0].volume == 40.0  # 10 + 0 (NaN treated as 0) + 30
+
+
+def test_nan_volume_seeding_new_htf_period_starts_at_zero():
+    """A NaN-volume base bar that OPENS a new HTF period seeds the HTF
+    volume at 0.0, not NaN."""
+    h = _new_stub(base='1h', timeframes={'1h': 50, '4h': 50})
+    t0 = datetime.datetime(2026, 1, 1, 0, tzinfo=UTC)
+    h._append_bar('BTC', t0, 1.0, 2.0, 0.5, 1.5, NAN)
+    h._append_bar('BTC', t0 + datetime.timedelta(hours=1),
+                  1.5, 2.5, 1.0, 2.0, 20.0)
+    htf = h._htf_bar_data[('BTC', '4h')]
+    assert htf[0].volume == 20.0
+
+
 def test_append_bar_returns_true_for_valid_bar():
     h = _new_stub()
     ts = datetime.datetime(2026, 1, 1, tzinfo=UTC)
@@ -742,6 +789,73 @@ def test_historic_handler_drains_two_symbols_in_time_order():
     assert first_btc.period == '1h'
     assert first_btc.close == 100.0
     assert first_btc.volume == 1.0
+
+
+def test_historic_handler_duplicate_row_dropped_htf_volume_counted_once(caplog):
+    """A duplicated row in the caller's frame must not double-count HTF
+    volume or emit a second BarEvent (regression: the duplicate used to
+    re-enter the HTF accumulator — daily volume 500 instead of 300)."""
+    ts = pd.Timestamp('2026-01-01 00:00', tz='UTC')
+    idx = pd.DatetimeIndex([ts, ts + pd.Timedelta(hours=1),
+                            ts + pd.Timedelta(hours=1)])  # duplicate 01:00
+    df = pd.DataFrame({
+        'Open': [10.0, 11.0, 11.0], 'High': [12.0, 15.0, 15.0],
+        'Low': [9.0, 10.0, 10.0], 'Close': [11.0, 14.0, 14.0],
+        'Volume': [100.0, 200.0, 200.0],
+    }, index=idx)
+
+    q = FakeQueue()
+    h = HistoricDataHandler(
+        events_queue=q,
+        symbol_list=['BTC_USDT'],
+        base_timeframe='1h',
+        timeframes={'1h': 50, '1d': 10},
+        data={'BTC_USDT': df},
+    )
+    with caplog.at_level(logging.WARNING, logger='data._base'):
+        while h.continue_backtest:
+            h.update_bar()
+
+    assert len(q.items) == 2                      # duplicate emits no event
+    assert len(h._base_bar_data['BTC_USDT']) == 2
+    daily = h.get_latest_bars('BTC_USDT', 10, timeframe='1d')
+    assert len(daily) == 1
+    assert daily[-1].volume == 300.0              # 100 + 200, counted once
+    assert any('duplicate completed bar' in rec.message
+               for rec in caplog.records)
+
+
+def test_historic_handler_equal_timestamp_tie_break_is_insertion_order():
+    """Symbols sharing a timestamp emit in ``data`` dict insertion order.
+
+    Pins the merge tie-break: on equal timestamps the FIRST-inserted symbol
+    wins, NOT alphabetical order. The data dict below is deliberately
+    non-alphabetical so an accidental symbol-name tie-break fails loudly.
+    """
+    closes = [100, 101, 102]
+    data = {
+        'ZEC_USDT': _make_ohlcv(closes, start='2026-01-01 00:00', freq='1h'),
+        'ADA_USDT': _make_ohlcv(closes, start='2026-01-01 00:00', freq='1h'),
+        'MID_USDT': _make_ohlcv(closes, start='2026-01-01 00:00', freq='1h'),
+    }
+
+    q = FakeQueue()
+    h = HistoricDataHandler(
+        events_queue=q,
+        symbol_list=list(data.keys()),
+        base_timeframe='1h',
+        timeframes={'1h': 50},
+        data=data,
+    )
+    while h.continue_backtest:
+        h.update_bar()
+
+    assert len(q.items) == 9
+    timestamps = [b.timestamp for b in q.items]
+    assert timestamps == sorted(timestamps)
+    # Within each shared timestamp: dict insertion order, every period.
+    assert [b.symbol for b in q.items] == \
+        ['ZEC_USDT', 'ADA_USDT', 'MID_USDT'] * 3
 
 
 def test_historic_handler_appends_to_internal_deque():

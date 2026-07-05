@@ -56,7 +56,12 @@ import cvxpy as cp
 import numpy as np
 import pandas as pd
 
-__all__ = ['equal_weight', 'min_variance', 'risk_parity']
+__all__ = [
+    'equal_weight',
+    'validate_named_weights',
+    'min_variance',
+    'risk_parity',
+]
 
 _VolsLike = Union[Mapping[str, float], pd.Series]
 _SYMMETRY_TOL = 1e-9
@@ -112,6 +117,69 @@ def equal_weight(labels: Sequence[str]) -> Dict[str, float]:
         raise ValueError(f"labels contain duplicates: {duplicates}")
     n = len(labels)
     return {label: 1.0 / n for label in labels}
+
+
+def validate_named_weights(
+    weights: Optional[Mapping[str, float]],
+    labels: Sequence[str],
+    *,
+    sum_tol: float = 1e-9,
+) -> Dict[str, float]:
+    """Validate / default a label→weight mapping against ``labels``.
+
+    The full-investment long-only convention shared across the allocation
+    hierarchy: instrument weights (risk manager), strategy weights
+    (orchestrator), and forecast-variation weights (strategies) all pass
+    through here so the accepted shape is identical everywhere.
+
+    Parameters
+    ----------
+    weights
+        ``None`` → equal weight ``1/N`` via :func:`equal_weight`. Otherwise
+        a mapping whose keys **set-equal** ``labels`` (order irrelevant) and
+        whose values are finite, non-negative, and sum to ``1.0`` within
+        ``sum_tol``.
+    labels
+        Component names the weights are keyed by. Must be non-empty and free
+        of duplicates (enforced by :func:`equal_weight` on the default path;
+        the explicit path compares against them as a set).
+    sum_tol
+        Absolute tolerance on the sum-to-one check. Default ``1e-9``.
+
+    Returns
+    -------
+    Dict[str, float]
+        A fresh dict ordered by ``labels`` with ``float`` values.
+
+    Raises
+    ------
+    ValueError
+        If the keys do not match ``labels``, a value is non-finite or
+        negative, or the values do not sum to ``1.0`` within ``sum_tol``
+        (or, on the default path, if ``labels`` is empty / has duplicates).
+    """
+    labels = list(labels)
+    if weights is None:
+        return equal_weight(labels)
+    if set(weights.keys()) != set(labels):
+        raise ValueError(
+            f"weights keys must match the labels exactly; "
+            f"labels={sorted(labels)}, weights={sorted(weights)}"
+        )
+    out: Dict[str, float] = {}
+    for label in labels:
+        w = weights[label]
+        if not (np.isfinite(w) and w >= 0):
+            raise ValueError(
+                f"weight for {label!r} must be finite and >= 0, got {w}"
+            )
+        out[label] = float(w)
+    total = sum(out.values())
+    if abs(total - 1.0) > sum_tol:
+        raise ValueError(
+            f"weights must sum to 1.0 within {sum_tol}, got {total}"
+        )
+    return out
 
 
 def min_variance(

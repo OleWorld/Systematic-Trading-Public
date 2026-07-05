@@ -8,13 +8,13 @@ give the size:
     # vol_target_mode='dollar_volatility' (default — institutional futures
     # convention: a fixed annual $ vol budget, like a drawdown limit that
     # resets yearly instead of compounding with the account):
-    annual_cash_target = IDM × strategy_weight × instrument_weight
+    annual_cash_target = IDM × instrument_weight
                                 × annual_target_vol × (forecast / TARGET_AVG_ABS_FORECAST)
 
     # vol_target_mode='percent_volatility' (Carver's original form — the
     # vol budget is a fraction of *current* account equity, so position
     # sizes compound as the account grows/shrinks):
-    annual_cash_target = capital × IDM × strategy_weight × instrument_weight
+    annual_cash_target = capital × IDM × instrument_weight
                                 × annual_target_vol × (forecast / TARGET_AVG_ABS_FORECAST)
 
     daily_cash_target  = annual_cash_target / sqrt(days_per_year)
@@ -24,7 +24,6 @@ give the size:
 where:
     capital                = portfolio.calculate_balance()              (account equity)
     IDM                    = instrument diversification multiplier      (constructor)
-    strategy_weight        = per-strategy capital weight                (self.strategy_weight)
     instrument_weight      = per-symbol capital weight                  (self.instrument_weight)
     annual_target_vol  = annualized vol target                      (constructor; REQUIRED —
                              $ amount in dollar mode, e.g. 250_000;
@@ -56,31 +55,63 @@ Carver's vol-target notional. At ``|forecast| = FORECAST_CAP`` (= 2 ×
 target by design) the factor is 2.0, doubling the size. At
 ``forecast = 0`` the target is zero (flat).
 
-Weights are owned by the risk manager (no external allocator
+Instrument weights are owned by the risk manager (no external allocator
 dependency). ``self.instrument_weight: Dict[str, float]`` spreads
 capital across symbols and defaults to equal-weight ``1/N`` across
-``strategy.symbol_list``. ``self.strategy_weight: Dict[str, float]``
-spreads capital across strategies and is a placeholder today —
-``{strategy_class_name: 1.0}`` for the single bound strategy. Both
-dicts are populated at ``__init__`` by ``calculate_instrument_weight()``
-/ ``calculate_strategy_weight()``; either method can be re-called later
-(or its dict overwritten directly) to refresh weights — e.g. monthly
-rebalances, correlation-driven weight schemes — without per-bar wiring.
+``strategy.symbol_list``; it is populated at ``__init__`` by
+``calculate_instrument_weight()``, which can be re-called later (or the
+dict overwritten directly) to refresh weights — e.g. monthly rebalances,
+correlation-driven weight schemes — without per-bar wiring. **Strategy
+weighting is not a risk-manager concern**: with multiple strategies an
+``orchestrator.Orchestrator`` owns the per-strategy weights and bakes
+them into the single combined forecast it hands the risk manager (the
+``strategy`` parameter accepts a single ``Strategy`` or an
+``Orchestrator`` interchangeably). The risk manager's job is purely
+forecast → order quantity.
 
-**Universe liveness gating**: with staggered listings, symbols do not
-share the full price history, so weights are computed over the **live
-subset** only. A symbol is *live* when (1) it has the full
-``corr_lookback`` bars at ``corr_timeframe`` (data gate — every live
-member contributes the complete correlation window, so the estimation
-window never shrinks) and (2) ``strategy.is_warmed_up(symbol)`` is True
-(strategy gate — the measured flag the ``Strategy`` base sets when the
-first non-NaN forecast is cached). Non-live symbols are absent from
-``instrument_weight`` and skip sizing with a ``skip_reason`` naming the
-warmup stage they're in (``'warmup_forecast'`` / ``'warmup_correlation'``
-/ ``'warmup_weight'`` — see ``_classify_warmup_reason``); live weights
-sum to 1 across the live subset. The live set is monotone
-non-decreasing during a backtest. Delisting/universe-exit handling is
-future work.
+**Explicit tradable universe**: the manager owns one ``UniverseStatus``
+record per symbol (``self._universe``) — the source of truth behind
+``get_live_symbols()`` and the sizing skip ladder. Each record carries
+two derived axes plus a reason list:
+
+* ``live`` — measured gate liveness: True iff no liveness reason is
+  present. The gates: (1) the full ``corr_lookback`` bars at
+  ``corr_timeframe`` (data gate — every live member contributes the
+  complete correlation window, so the estimation window never shrinks;
+  unmet → reason ``'warmup_correlation'``) and (2)
+  ``strategy.is_warmed_up(symbol)`` (strategy gate — the measured flag
+  the ``Strategy`` base sets when the first non-NaN forecast is cached;
+  unmet → reason ``'warmup_forecast'``).
+* ``excluded`` — policy layer: ``'constant_price'`` (a symbol whose
+  closes were constant across the corr window at the latest recalc has
+  no defined correlation, so it is excluded from that recalc's ρ and
+  weights (WARNING) and re-enters automatically at a later recalc once
+  it moves again — hold-and-warn: a held position is NOT flattened) and
+  ``'removed'`` (manual, permanent — ``remove_symbol(symbol)`` is the
+  delisting primitive: the weight is popped and a held position is
+  flattened on the symbol's next bar, ahead of the sigma checks so a
+  dead sigma cannot block the exit). Exclusion reasons are also
+  liveness reasons: excluded ⇒ not live.
+* ``reasons`` — every cause the symbol can't be sized this bar
+  (multiple allowed); empty ⇔ sizable (live AND weighted). A live
+  symbol still awaiting the walk-forward recalc for a weight carries
+  ``'waiting_weight_recalc'`` — informational, coexists with
+  ``live=True`` (the live set feeds the recalc, so waiting symbols stay
+  in it).
+
+Statuses are refreshed per-bar for the event symbol and for all symbols
+at each recalc; transitions are INFO-logged. Weights are computed over
+the **live subset** only and sum to 1 across it; non-live/unweighted
+symbols skip sizing with ``skip_reason`` set to the symbol's **primary
+recorded reason itself** — the first entry of the canonically-ordered
+reason list (``'warmup_forecast'`` / ``'warmup_correlation'`` /
+``'constant_price'`` / ``'waiting_weight_recalc'``, plus ``'removed'``
+once a removed symbol is flat); there is no separate label vocabulary,
+and the full list is exposed per-row in the ``universe_reasons``
+diagnostic column. The live set grows monotonically
+during a backtest EXCEPT for explicit exclusions (constant-price until
+re-entry; removal permanently). ``universe_status(symbol)`` is the
+introspection hook. Automatic delisting *detection* is future work.
 
 The manager performs **walk-forward** weight estimation in every mode:
 at each recalc point it re-assesses liveness and derives ρ from a
@@ -117,10 +148,16 @@ case); ``self.idm`` is left untouched in this branch.
 On every completed bar the manager:
 1. Updates the vol estimator.
 2. Computes the target quantity per the formula above.
-3. Submits a MKT order for ``target_qty - current_qty`` if the diff is
-   above the configured dead-band (``position_buffer``, Carver §10.7).
+3. Submits a MKT order for ``target_qty - (current_qty +
+   pending_mkt_order_quantity)`` — the diff against the *projected*
+   position (realized + in-flight MKT orders, e.g. a same-bar
+   margin-call liquidation), so an order already on its way to fill is
+   never double-traded — if the diff is above the configured dead-band
+   (``position_buffer``, Carver §10.7).
 
-Skips on warmup (``sigma is None``), zero vol, or forming bars. A zero
+Skips on warmup (``sigma is None``), zero/negligible vol (``sigma <
+_MIN_SIGMA_REL × |close|`` — guards the EWMA estimator's asymptotic
+decay on a flat symbol), or forming bars. A zero
 combined weight is NOT a skip — it is a target of 0, so a held position
 is flattened (a flat one is simply labelled ``'zero_weight'``). Any skip
 that would strand a *held* position emits a WARNING. Idempotent: a
@@ -130,7 +167,8 @@ position matches the target.
 
 import datetime
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -145,7 +183,8 @@ from analytics import (
 from data import get_period_start
 from event import BarEvent, OrderType, Direction
 from riskmanager._base import (
-    RiskManager, _DataHandlerLike, _PortfolioLike, _StrategyLike,
+    RiskManager, _DataHandlerLike, _OrchestratorLike, _PortfolioLike,
+    _StrategyLike,
 )
 from strategy import Strategy
 from volatility import VolEstimator
@@ -158,11 +197,70 @@ logger = logging.getLogger(__name__)
 # logs a WARNING and falls back to equal-weight (the ρ=1 degenerate case).
 _MIN_CORR_OBS = 30
 
+# Relative negligible-volatility floor: an annualized sigma below this
+# fraction of the bar's ``|close|`` is treated as zero vol (``'zero_vol'``
+# skip). Guards the EWMA estimator's geometric decay, which approaches —
+# but never reaches — exact 0.0 on a flat-after-activity symbol; without
+# a floor the near-zero divisor would explode the target to the
+# margin-capped maximum. 1e-6 (annualized vol of 0.0001 % of price) is
+# orders of magnitude below any tradable instrument's vol, so real-data
+# sizing is unaffected. At ``close == 0`` the relative term collapses to
+# the exact-zero check.
+_MIN_SIGMA_REL = 1e-6
+
+# ── Tradable-universe reason vocabulary ──────────────────────────────
+# Every cause a symbol can't be sized this bar is recorded in its
+# ``UniverseStatus.reasons`` list (multiple allowed, not one
+# precedence-picked label). LIVENESS reasons make the symbol not-live;
+# the EXCLUSION subset additionally marks a policy exclusion.
+# ``'waiting_weight_recalc'`` is deliberately NOT a liveness reason: it
+# marks the recalc-lag state (gates passed, awaiting the walk-forward
+# recalc for a weight) and coexists with ``live=True`` — the live set
+# feeds the recalc, so waiting symbols must stay in it.
+_LIVENESS_REASONS = (
+    'warmup_forecast',       # strategy gate unmet (transient)
+    'warmup_correlation',    # corr_lookback data gate unmet (transient)
+    'constant_price',        # zero-variance excluded at the latest recalc
+    'removed',               # manual removal (permanent)
+)
+_EXCLUSION_REASONS = ('constant_price', 'removed')
+# Per-reason flatten policy: exclusion reasons in this set flatten a HELD
+# position (target 0 ahead of the sigma ladder — a dead sigma must not
+# block the exit). 'constant_price' keeps hold-and-warn semantics:
+# flattening on temporary constancy would churn; if flatten-on-constant
+# is ever wanted it is a one-entry policy change made deliberately.
+_FLATTEN_ON = frozenset({'removed'})
+
+
+@dataclass
+class UniverseStatus:
+    """Per-symbol tradable-universe record — two orthogonal axes + reasons.
+
+    ``live`` (measured gate liveness) and ``excluded`` (policy layer) are
+    **derived** by the update rule (``_refresh_symbol_status``) and never
+    set independently, so contradictory states cannot exist:
+
+    * ``live``     == no reason in ``_LIVENESS_REASONS`` is present
+    * ``excluded`` == a reason in ``_EXCLUSION_REASONS`` is present
+    * ``reasons == []`` ⇔ sizable (live AND present in
+      ``instrument_weight``) — the self-maintained invariant; a direct
+      ``instrument_weight`` overwrite can violate it externally, which
+      the recalc-time consistency check WARNs about (never raises).
+
+    Mutate only through the risk manager's own transitions (the per-bar
+    and per-recalc refreshes, ``remove_symbol``); the public introspection
+    hook ``universe_status(symbol)`` returns a defensive copy.
+    """
+
+    live: bool
+    excluded: bool
+    reasons: List[str]
+
 
 class VolTargetingRiskManager(RiskManager):
     """Forecast-aware cash-vol-targeting sizer (Carver's framework).
 
-    Owns two weight dicts:
+    Owns one weight dict:
 
     - ``instrument_weight``: per-symbol capital weight, populated at
       construction by ``calculate_instrument_weight()`` (default 1/N
@@ -170,12 +268,13 @@ class VolTargetingRiskManager(RiskManager):
       ``'risk_parity'`` derived inline from a trailing window of
       returns pulled from ``self.data_handler`` and optimized by the
       ``analytics`` portfolio optimizers).
-    - ``strategy_weight``: per-strategy capital weight, populated at
-      construction by ``calculate_strategy_weight()`` (default
-      ``{strategy_class_name: 1.0}`` — placeholder until multi-strategy
-      lands).
 
-    Either ``calculate_*`` method can be re-called or its dict
+    Strategy weighting is **not** a risk-manager concern — an
+    ``orchestrator.Orchestrator`` (passed in the ``strategy`` slot in
+    place of a single ``Strategy``) owns the per-strategy weights and
+    bakes them into the combined forecast.
+
+    ``calculate_instrument_weight`` can be re-called or its dict
     overwritten directly to refresh weights without per-bar wiring.
     With a corr-based mode (``'min_variance'`` / ``'risk_parity'``)
     and ``corr_step_size > 0``,
@@ -190,31 +289,46 @@ class VolTargetingRiskManager(RiskManager):
     completed bar appends one row to ``self._records[symbol]`` and emits
     a DEBUG log line. Columns capture all sizing inputs and
     intermediates (``forecast``, ``sigma``, ``instrument_weight``,
-    ``strategy_weight``, ``capital``, ``idm``, ``annual_target_vol``,
+    ``capital``, ``idm``, ``annual_target_vol``,
     ``position_buffer``, ``annual_cash_target``, ``target_qty``,
-    ``current_qty``, ``trade_qty``, ``buffer_threshold``) plus
+    ``current_qty`` (realized position), ``pending_mkt_order_quantity``
+    (signed sum of in-flight MKT orders — the resize diff targets
+    ``current_qty + pending_mkt_order_quantity``, the projected
+    position), ``trade_qty``, ``buffer_threshold``) plus
     ``submitted`` (bool) and ``skip_reason`` — ``None`` when an order
-    was submitted, otherwise one of the warmup labels
-    ``'warmup_volatility'`` (sigma not ready), ``'warmup_forecast'``
-    (strategy has no forecast yet), ``'warmup_correlation'`` (fewer than
-    ``corr_lookback`` bars), ``'warmup_weight'`` (ready but no weight
-    assigned yet — recalc lag); or the substantive skips ``'zero_vol'``,
+    was submitted; ``'warmup_volatility'`` when sigma is not ready; for
+    a symbol outside the weighted universe, the symbol's **primary
+    universe reason itself**: ``'warmup_forecast'`` (strategy has no
+    forecast yet — also fires post-weighting when a *weighted* symbol's
+    forecast cache is still empty, e.g. after a direct
+    ``instrument_weight`` overwrite that bypassed the liveness gate),
+    ``'warmup_correlation'`` (fewer than ``corr_lookback`` bars),
+    ``'constant_price'`` (excluded at the latest recalc — zero variance
+    over the corr window), or ``'waiting_weight_recalc'`` (both gates
+    pass, awaiting the walk-forward recalc for a weight); the
+    substantive skips ``'zero_vol'``,
     ``'dead_band'``, ``'at_target'``, and ``'zero_weight'`` — the last
     meaning a zero combined weight with the position *already flat* (a
     *held* position at zero weight is instead flattened, so it records
-    ``submitted=True`` / ``skip_reason=None``). A skip that strands a
-    held position (``'zero_vol'`` / the ``warmup_*`` family) additionally
+    ``submitted=True`` / ``skip_reason=None``); or ``'removed'`` — a
+    manually removed symbol that is already flat (a *held* removed
+    position is flattened first, ahead of the sigma checks). A skip that
+    strands a
+    held position (``'zero_vol'`` / any warmup or universe reason)
+    additionally
     emits a WARNING. Symbols absent
     from ``instrument_weight`` (outside the tradable universe per the
-    liveness gate) carry one of the three universe warmup labels with
-    ``instrument_weight`` left ``None``. Read via
-    ``risk_manager.get_records(symbol)``.
+    liveness gate) leave the row's
+    ``instrument_weight`` ``None``. Each row also carries the
+    universe state: ``universe_live`` (bool) and ``universe_reasons``
+    (the symbol's full reason list, comma-joined; ``''`` == sizable).
+    Read via ``risk_manager.get_records(symbol)``.
     """
 
     def __init__(
         self,
         portfolio: _PortfolioLike,
-        strategy: _StrategyLike,
+        strategy: Union[_StrategyLike, _OrchestratorLike],
         vol_estimator: VolEstimator,
         data_handler: _DataHandlerLike,
         instruments: Optional[Dict[str, "InstrumentConfig"]] = None,
@@ -237,9 +351,12 @@ class VolTargetingRiskManager(RiskManager):
         portfolio
             Portfolio surface (positions, balance, submit_order).
         strategy
-            Strategy exposing ``get_forecast(symbol)`` and ``symbol_list``.
-            Read on every completed bar (forecast) and at construction
-            (symbol_list, for the equal-weight default).
+            Forecast source — a single ``Strategy`` or a multi-strategy
+            ``orchestrator.Orchestrator`` (both expose
+            ``get_forecast(symbol)``, ``symbol_list`` and
+            ``is_warmed_up(symbol)``). Read on every completed bar
+            (forecast) and at construction (symbol_list, for the
+            equal-weight default).
         vol_estimator
             ``VolEstimator`` providing ``get_annual_vol(symbol)`` in
             price (cash) units. Updated by ``update_bar`` on every
@@ -356,16 +473,17 @@ class VolTargetingRiskManager(RiskManager):
         corr_floor
             Element-wise lower bound applied to the inline-derived
             correlation matrix (see ``_derive_corr_matrix``) before it
-            feeds the optimizer and the IDM. Default ``0.0`` — Carver's
-            practice: negative correlations estimated from a short
+            feeds the optimizer and the IDM. Default ``None`` — no
+            flooring (the shrunk sample correlations feed through as
+            estimated). ``0.0`` is the recommended Carver-style
+            setting: negative correlations estimated from a short
             window are mostly sampling noise, and trusting them both
             overweights spuriously anti-correlated instruments
             (min-variance treats them as a free hedge) and inflates the
-            IDM. With the default floor and long-only weights the
-            pre-cap IDM is bounded by ``sqrt(N)``. ``None`` disables
-            flooring. Must be in ``[-1.0, 1.0]`` when not ``None``.
-            NOT applied to an explicitly passed ``corr_matrix`` — the
-            caller owns that matrix.
+            IDM; with a ``0.0`` floor and long-only weights the pre-cap
+            IDM is bounded by ``sqrt(N)``. Must be in ``[-1.0, 1.0]``
+            when not ``None``. NOT applied to an explicitly passed
+            ``corr_matrix`` — the caller owns that matrix.
         corr_shrinkage
             Shrinkage estimator applied when deriving the inline
             correlation matrix (see ``_derive_corr_matrix``). Default
@@ -518,14 +636,21 @@ class VolTargetingRiskManager(RiskManager):
         self._periods_since_recalc: int = 0
         self._last_seen_period_start: Optional[datetime.datetime] = None
 
-        # Per-symbol / per-strategy capital weights. Populated by the
-        # ``calculate_*`` methods below; either may be re-called or its
+        # Per-symbol capital weights. Populated by
+        # ``calculate_instrument_weight`` below; may be re-called or the
         # dict overwritten directly to refresh weights without per-bar
-        # wiring.
+        # wiring. (Strategy weighting is owned by the orchestrator, not
+        # the risk manager.)
         self.instrument_weight: Dict[str, float] = {}
-        self.strategy_weight: Dict[str, float] = {}
+        # Explicit tradable-universe state: one ``UniverseStatus`` per
+        # symbol, the source of truth behind ``get_live_symbols`` and the
+        # sizing skip ladder. Initialized here by one evaluation pass —
+        # in a backtest the deques are empty and no forecast is cached,
+        # so every symbol starts with both warmup reasons set.
+        self._universe: Dict[str, UniverseStatus] = {}
+        for s in self.strategy.symbol_list:
+            self._refresh_symbol_status(s, log=False)
         self.calculate_instrument_weight()
-        self.calculate_strategy_weight()
 
     def _data_gate_met(self, symbol: str) -> bool:
         """True once ``symbol`` carries the full ``corr_lookback`` bars at
@@ -537,46 +662,148 @@ class VolTargetingRiskManager(RiskManager):
             symbol, timeframe=self.corr_timeframe,
         ) >= self.corr_lookback
 
-    def _classify_warmup_reason(self, symbol: str) -> str:
-        """Classify why a symbol absent from ``instrument_weight`` cannot be
-        sized, in precedence order **forecast → correlation → weight**:
+    def _refresh_symbol_status(self, symbol: str,
+                               log: bool = True) -> UniverseStatus:
+        """Recompute ``symbol``'s ``UniverseStatus`` — the single writer.
 
-        * ``'warmup_forecast'`` — the strategy has not cached a forecast
-          yet (``not is_warmed_up``); the most fundamental prerequisite,
-          checked first.
-        * ``'warmup_correlation'`` — forecast ready but the data gate is
-          unmet (fewer than ``corr_lookback`` bars at ``corr_timeframe``).
-        * ``'warmup_weight'`` — both gates pass but no weight is assigned
-          yet (the periodic walk-forward recalc hasn't picked the symbol
-          up, or the universe is still empty at construction).
-
-        Swap the first two checks to flip the precedence.
+        Re-measures the two gate reasons (``'warmup_forecast'`` via
+        ``strategy.is_warmed_up``; ``'warmup_correlation'`` via the O(1)
+        ``_data_gate_met``), preserves any policy (exclusion) reasons,
+        re-derives ``live``/``excluded`` (never set independently), and
+        refreshes ``'waiting_weight_recalc'`` from ``symbol in
+        instrument_weight`` — so the status is always fresh at the
+        decision point and self-heals within one bar after a direct
+        weights overwrite. Creates the record on first sight (initial
+        evaluation, not logged as a transition); otherwise mutates it in
+        place and, when ``log`` is True, INFO-logs a live flip / reason
+        change once per transition. Recalc-time callers pass
+        ``log=False`` — net changes across a recalc are logged once
+        against the pre-recalc snapshot instead, so the provisional
+        constant-price re-assessment cannot double-log.
         """
+        reasons: List[str] = []
         if not self.strategy.is_warmed_up(symbol):
-            return 'warmup_forecast'
+            reasons.append('warmup_forecast')
         if not self._data_gate_met(symbol):
-            return 'warmup_correlation'
-        return 'warmup_weight'
+            reasons.append('warmup_correlation')
+        old = self._universe.get(symbol)
+        if old is not None:
+            reasons.extend(r for r in _EXCLUSION_REASONS if r in old.reasons)
+        # Only liveness reasons can be present at this point, so ``live``
+        # is simply "no reason yet"; the waiting marker is then appended
+        # for live-but-unweighted symbols (it does not affect liveness).
+        live = not reasons
+        if live and symbol not in self.instrument_weight:
+            reasons.append('waiting_weight_recalc')
+        excluded = any(r in _EXCLUSION_REASONS for r in reasons)
+        if old is None:
+            status = UniverseStatus(live=live, excluded=excluded,
+                                    reasons=reasons)
+            self._universe[symbol] = status
+            return status
+        if log:
+            self._log_status_transition(symbol, old.live, old.reasons,
+                                        live, reasons)
+        old.live = live
+        old.excluded = excluded
+        old.reasons = reasons
+        return old
+
+    @staticmethod
+    def _log_status_transition(symbol: str, old_live: bool,
+                               old_reasons: List[str], live: bool,
+                               reasons: List[str]) -> None:
+        """INFO-log a universe transition (live flip, or reason change at
+        unchanged liveness). Silent when nothing changed."""
+        if old_live != live:
+            logger.info(
+                "%s universe: %s -> %s %s", symbol,
+                'live' if old_live else 'not live',
+                'live' if live else 'not live', reasons,
+            )
+        elif old_reasons != reasons:
+            logger.info(
+                "%s universe: reasons %s -> %s", symbol, old_reasons, reasons,
+            )
+
+    def _status(self, symbol: str) -> UniverseStatus:
+        """Stored status for ``symbol``, lazily evaluated (and stored) on
+        first access — covers symbols added to ``strategy.symbol_list``
+        after construction."""
+        status = self._universe.get(symbol)
+        if status is None:
+            status = self._refresh_symbol_status(symbol, log=False)
+        return status
+
+    def universe_status(self, symbol: str) -> UniverseStatus:
+        """Introspection hook: ``symbol``'s universe record as of its last
+        evaluation point (its own bars, each weight recalc, removal).
+        Returns a defensive copy — universe state is mutated only through
+        the risk manager's own transitions."""
+        status = self._status(symbol)
+        return UniverseStatus(live=status.live, excluded=status.excluded,
+                              reasons=list(status.reasons))
+
+    def remove_symbol(self, symbol: str) -> None:
+        """Permanently remove ``symbol`` from the tradable universe — the
+        manual delisting primitive.
+
+        Adds the exclusion reason ``'removed'`` (⇒ ``live=False``,
+        ``excluded=True``), pops the symbol's instrument weight (the
+        remaining weights renormalize at the next walk-forward recalc —
+        the same lag every weight change already has), and excludes it
+        from all future ρ derivations and weight recalcs. A HELD position
+        is flattened on the symbol's **next bar** via the normal submit
+        path — the flatten runs ahead of the sigma ladder, so a dead
+        sigma cannot block the exit; once flat, the symbol's rows record
+        ``skip_reason='removed'``. Idempotent.
+
+        Honest limitation: the risk manager only acts in
+        ``update_bar(event)`` for the symbol, so a symbol that never
+        prints another bar cannot be flattened in the sim (no price, no
+        fill) — true delisting settlement remains out of scope.
+
+        Raises ``ValueError`` when ``symbol`` is not in
+        ``strategy.symbol_list``.
+        """
+        if symbol not in self.strategy.symbol_list:
+            raise ValueError(
+                f"Cannot remove unknown symbol {symbol!r}: not in "
+                f"strategy.symbol_list"
+            )
+        status = self._status(symbol)
+        if 'removed' in status.reasons:
+            return                                      # idempotent re-call
+        status.reasons.append('removed')
+        self.instrument_weight.pop(symbol, None)
+        self._refresh_symbol_status(symbol, log=False)  # canonicalize + re-derive
+        logger.info(
+            "%s universe: removed — permanently excluded (reasons %s); "
+            "weight popped, a held position flattens on the symbol's "
+            "next bar", symbol, status.reasons,
+        )
 
     def get_live_symbols(self) -> List[str]:
-        """Return the symbols currently in the tradable universe.
+        """Return the symbols currently in the tradable universe — a view
+        over the explicit universe state, and the input set the weight
+        recalc consumes.
 
-        A symbol is *live* when both gates pass:
+        A symbol is *live* when both gates pass — (1) **data gate**: the
+        full ``corr_lookback`` bars at ``corr_timeframe``
+        (``_data_gate_met``); (2) **strategy gate**:
+        ``strategy.is_warmed_up(symbol)`` — AND it is not excluded
+        (``'constant_price'`` at the latest recalc, or ``'removed'``).
+        Live symbols still awaiting a weight
+        (``'waiting_weight_recalc'``) are INCLUDED: the recalc must see
+        them or they could never be weighted.
 
-        1. **Data gate** — ``_data_gate_met``: it has the full
-           ``corr_lookback`` bars at ``corr_timeframe``.
-        2. **Strategy gate** — ``strategy.is_warmed_up(symbol)``: the
-           strategy has cached its first non-NaN forecast for the
-           symbol, so it can actually trade it.
-
-        Order follows ``strategy.symbol_list``. The result is monotone
-        non-decreasing during a backtest (deques only grow; the warmup
-        flag never resets).
+        Order follows ``strategy.symbol_list``. The result grows
+        monotonically during a backtest (deques only grow; the warmup
+        flag never resets) EXCEPT for explicit exclusions: a
+        constant-price symbol drops out until a later recalc re-admits
+        it, and a removed symbol drops out permanently.
         """
-        return [
-            s for s in self.strategy.symbol_list
-            if self._data_gate_met(s) and self.strategy.is_warmed_up(s)
-        ]
+        return [s for s in self.strategy.symbol_list if self._status(s).live]
 
     def calculate_instrument_weight(
         self,
@@ -596,8 +823,17 @@ class VolTargetingRiskManager(RiskManager):
 
         Weights cover the **live subset** only (see ``get_live_symbols``)
         and sum to 1 across it; non-live symbols are absent from the
-        dict and skip sizing with a ``warmup_*`` ``skip_reason`` naming
-        the stage they're in (see ``_classify_warmup_reason``).
+        dict and skip sizing with their primary recorded universe reason
+        as ``skip_reason`` (see ``UniverseStatus``). The method is also
+        the recalc-time
+        universe bookkeeping point: gate reasons are re-measured for
+        every symbol on entry (constant-price marks are provisionally
+        cleared — constancy is re-measured by the inline derivation, so
+        an excluded symbol re-enters automatically when its window moves
+        again), ``'waiting_weight_recalc'`` is refreshed for every symbol
+        after the weights land, net status transitions are INFO-logged
+        once, and an ``instrument_weight`` that strays outside the live
+        set (a direct overwrite) draws a WARNING — never a raise.
 
         Parameters
         ----------
@@ -625,11 +861,18 @@ class VolTargetingRiskManager(RiskManager):
             instrument's σ.
         corr_matrix
             Optional explicit correlation matrix — the manual/research
-            hook. When supplied (corr-based modes), the **caller owns
-            the universe**: the liveness gate is NOT applied, and the
-            matrix labels must be a non-empty subset of
-            ``self.strategy.symbol_list`` (row order is taken from the
-            matrix). When ``None``, ρ is derived inline from the data
+            hook. When supplied (corr-based modes), the caller owns the
+            **matrix** (no shrinkage / floor / PSD hygiene is applied)
+            but NOT the universe: the labels must be a non-empty subset
+            of ``self.strategy.symbol_list`` and are then **intersected
+            with the live universe** (``get_live_symbols``) — non-live
+            labels are dropped with a WARNING, and the optimizer and the
+            IDM consume the principal submatrix over the survivors (row
+            order is taken from the matrix). An intersection left empty
+            behaves like the empty inline universe (empty weight dict +
+            INFO log, ``idm`` untouched); a single survivor yields
+            ``{symbol: 1.0}`` with ``idm = 1.0``.
+            When ``None``, ρ is derived inline from the data
             handler over the live subset (see ``_derive_corr_matrix``):
             an empty live set — always the case at construction time in
             a backtest since deques are empty — yields an empty weight
@@ -665,6 +908,27 @@ class VolTargetingRiskManager(RiskManager):
         """
         if mode is None:
             mode = self.instrument_weight_mode
+        # Universe bookkeeping wraps the weight recalc: re-measure gates
+        # (+ provisional constant-price clear + incoming consistency
+        # check) before, refresh waiting markers + diff-log net
+        # transitions + outgoing consistency check after — also on an
+        # exception path, so the universe never holds a half-updated
+        # state.
+        snapshot = {
+            s: (st.live, list(st.reasons)) for s, st in self._universe.items()
+        }
+        self._reassess_universe_for_recalc()
+        try:
+            self._recalc_weights(mode, corr_matrix)
+        finally:
+            self._finalize_universe_after_recalc(snapshot)
+
+    def _recalc_weights(self, mode: str,
+                        corr_matrix: Optional[pd.DataFrame]) -> None:
+        """Weight-scheme dispatch — the body of
+        ``calculate_instrument_weight`` (see its docstring for the full
+        contract), split out so the universe snapshot / finalize wrapper
+        around it stays flat."""
         if mode == 'equal_weight':
             live = self.get_live_symbols()
             if not live:
@@ -677,7 +941,6 @@ class VolTargetingRiskManager(RiskManager):
                 self.instrument_weight = {live[0]: 1.0}
                 self.idm = 1.0
                 return
-            self.instrument_weight = equal_weight(live)
             # Equal weights are scheme-final, but the IDM still measures the
             # book's diversification: derive rho over the live subset and set
             # idm = 1/sqrt(w'rho w) so a large decorrelated universe earns its
@@ -685,13 +948,19 @@ class VolTargetingRiskManager(RiskManager):
             # constructor value. The IDM scalar is robust to correlation noise
             # (unlike min_variance corner weights). An explicitly passed
             # corr_matrix is ignored here (equal_weight owns no estimation
-            # hook); rho is always derived inline.
+            # hook); rho is always derived inline — and FIRST, because it
+            # also fixes the weighted universe: constant-price symbols are
+            # dropped from rho (undefined correlation) and must be equally
+            # absent from the weights, or the DM's label check would raise.
             corr_matrix = self._derive_corr_matrix(mode, live)
             if corr_matrix is None:
-                # Data-gap shortfall — keep the equal weights (already set);
-                # leave self.idm untouched (rho=1 degenerate case), mirroring
-                # the corr-based equal-weight fallback.
+                # Data-gap / degenerate shortfall — equal weights over the
+                # full live subset; leave self.idm untouched (rho=1
+                # degenerate case), mirroring the corr-based fallback.
+                self.instrument_weight = equal_weight(live)
                 return
+            self._mark_constant_price_exclusions(live, corr_matrix.index)
+            self.instrument_weight = equal_weight(list(corr_matrix.index))
             self._update_idm_from_corr(corr_matrix)
         elif mode in ('min_variance', 'risk_parity'):
             if corr_matrix is None:
@@ -713,14 +982,54 @@ class VolTargetingRiskManager(RiskManager):
                     # left untouched.
                     self.instrument_weight = equal_weight(live)
                     return
-            if len(corr_matrix.index) == 0:
-                raise ValueError("corr_matrix must not be empty")
-            extra = set(corr_matrix.index) - set(self.strategy.symbol_list)
-            if extra:
-                raise ValueError(
-                    f"corr_matrix labels must be a subset of "
-                    f"strategy.symbol_list; extra={sorted(extra)}"
-                )
+                self._mark_constant_price_exclusions(live, corr_matrix.index)
+            else:
+                # Explicit-matrix hook (manual/research). The caller owns
+                # the MATRIX (no shrink/floor/PSD hygiene), but the RM owns
+                # the UNIVERSE: the labels are intersected with the live
+                # set so weights can never land on a symbol whose forecast
+                # or corr window isn't ready — un-gated, a weighted
+                # symbol with an empty forecast cache reaches sizing and
+                # only the None-forecast backstop stands between it and a
+                # TypeError.
+                if len(corr_matrix.index) == 0:
+                    raise ValueError("corr_matrix must not be empty")
+                extra = set(corr_matrix.index) - set(self.strategy.symbol_list)
+                if extra:
+                    raise ValueError(
+                        f"corr_matrix labels must be a subset of "
+                        f"strategy.symbol_list; extra={sorted(extra)}"
+                    )
+                live_set = set(self.get_live_symbols())
+                kept = [s for s in corr_matrix.index if s in live_set]
+                dropped = [s for s in corr_matrix.index if s not in live_set]
+                if dropped:
+                    logger.warning(
+                        "%s: dropping %d non-live symbol(s) from the "
+                        "explicit corr_matrix (liveness requires %d bars "
+                        "at '%s' plus a warmed-up strategy forecast): %s",
+                        mode, len(dropped), self.corr_lookback,
+                        self.corr_timeframe, dropped,
+                    )
+                if not kept:
+                    self._log_empty_universe(mode)
+                    self.instrument_weight = {}
+                    return
+                if len(kept) == 1:
+                    # Single live instrument after intersection: full
+                    # weight, no diversification credit (mirrors the
+                    # inline singleton path).
+                    self.instrument_weight = {kept[0]: 1.0}
+                    self.idm = 1.0
+                    return
+                if dropped:
+                    # Principal submatrix over the surviving labels —
+                    # PSD-ness is preserved under principal sub-selection,
+                    # so no re-repair is needed. Skipped when nothing was
+                    # dropped so an invalid caller matrix (e.g. index !=
+                    # columns) still reaches the optimizer's validators
+                    # untouched.
+                    corr_matrix = corr_matrix.loc[kept, kept]
             if mode == 'min_variance':
                 self.instrument_weight = min_variance(corr_matrix)
             elif mode == 'risk_parity':
@@ -745,6 +1054,101 @@ class VolTargetingRiskManager(RiskManager):
             mode, self.corr_lookback, self.corr_timeframe,
         )
 
+    def _reassess_universe_for_recalc(self) -> None:
+        """Start-of-recalc universe pass.
+
+        Re-measures both gate reasons for every symbol in
+        ``strategy.symbol_list`` (so gate changes made outside the bar
+        stream — e.g. research code mutating history between manual
+        recalcs — are picked up) and provisionally clears
+        ``'constant_price'`` marks: constancy is a per-recalc measurement
+        re-taken by the inline derivation, so a previously-excluded
+        symbol re-enters the candidate live set here and the mark
+        re-lands only if its window is still constant. ``'removed'`` is
+        permanent and survives. Ends with the consistency check on the
+        INCOMING state — a directly-overwritten ``instrument_weight``
+        holding non-live symbols draws a WARNING before it is rebuilt.
+
+        No transition logging here: net changes across the whole recalc
+        are logged once by ``_finalize_universe_after_recalc``, so the
+        provisional clear of a still-constant symbol stays invisible.
+        """
+        for s in self.strategy.symbol_list:
+            status = self._universe.get(s)
+            if status is not None and 'constant_price' in status.reasons:
+                status.reasons = [
+                    r for r in status.reasons if r != 'constant_price'
+                ]
+            self._refresh_symbol_status(s, log=False)
+        self._warn_if_weights_outside_live()
+
+    def _mark_constant_price_exclusions(self, live: List[str],
+                                        kept_labels) -> None:
+        """Mark symbols dropped from a successful inline ρ derivation
+        (constant closes over the corr window → undefined correlation) as
+        excluded with reason ``'constant_price'``.
+
+        Mutation only (the WARNING already fired inside
+        ``_derive_corr_matrix``; the net transition is logged by
+        ``_finalize_universe_after_recalc``). Only called when a ρ was
+        actually produced: the degenerate fallbacks weight the FULL live
+        subset — constants included — so recording an exclusion there
+        would contradict the weights.
+        """
+        kept = set(kept_labels)
+        for s in live:
+            if s not in kept:
+                status = self._universe[s]
+                if 'constant_price' not in status.reasons:
+                    status.reasons.append('constant_price')
+                status.live = False
+                status.excluded = True
+
+    def _finalize_universe_after_recalc(
+        self, snapshot: Dict[str, Any],
+    ) -> None:
+        """End-of-recalc universe pass.
+
+        Refreshes every symbol's status against the (possibly rebuilt)
+        weight dict — newly-weighted symbols shed
+        ``'waiting_weight_recalc'``, still-unweighted live symbols keep
+        it, and the constant-price marks land in canonical reason order —
+        re-runs the consistency check on the OUTGOING state, and
+        INFO-logs each symbol whose ``(live, reasons)`` net-changed
+        versus the pre-recalc ``snapshot``.
+        """
+        for s in self.strategy.symbol_list:
+            self._refresh_symbol_status(s, log=False)
+        self._warn_if_weights_outside_live()
+        for s in self.strategy.symbol_list:
+            old = snapshot.get(s)
+            if old is None:
+                continue        # first sighting — initial state, no transition
+            status = self._universe[s]
+            self._log_status_transition(s, old[0], old[1],
+                                        status.live, status.reasons)
+
+    def _warn_if_weights_outside_live(self) -> None:
+        """Consistency check: every weighted symbol should be live.
+
+        WARNING, never raise — the documented direct-overwrite convention
+        (callers may assign ``instrument_weight`` themselves) must
+        survive; the check just makes the resulting liveness-gate bypass
+        loud. Sizing still proceeds for such symbols, guarded by the
+        None-forecast backstop in ``_compute_target_qty``.
+        """
+        stray = [
+            s for s in self.instrument_weight
+            if s not in self._universe or not self._universe[s].live
+        ]
+        if stray:
+            logger.warning(
+                "instrument_weight contains %d non-live symbol(s) %s — "
+                "likely a direct overwrite bypassing the liveness gate; "
+                "sizing proceeds under the None-forecast backstop",
+                len(stray), stray,
+            )
+
     def _derive_corr_matrix(
         self, mode: str, symbols: List[str],
     ) -> Optional[pd.DataFrame]:
@@ -756,25 +1160,31 @@ class VolTargetingRiskManager(RiskManager):
         via ``self.data_handler.get_latest_bars``, computes per-bar
         price changes per ``self.corr_mode``
         (``'simple_return'`` → ``.pct_change().dropna()``;
-        ``'absolute_price_chg'`` → ``.diff().dropna()``), and calls
-        ``analytics.correlation_matrix`` on the result, forwarding
-        ``self.corr_shrinkage`` (Ledoit-Wolf by default; the fitted
-        intensity is DEBUG-logged). When ``self.corr_floor`` is not
-        ``None``, the matrix is then element-wise floored at
-        ``corr_floor``; since element-wise clipping does not preserve
-        positive-semidefiniteness in general, the floored matrix passes
-        through ``_nearest_psd_correlation`` before being returned, so
-        the optimizer and the IDM always consume the same valid
-        correlation matrix. (All three transforms are estimation
-        hygiene: they apply to this inline path only, never to an
-        explicitly passed ``corr_matrix``.)
+        ``'absolute_price_chg'`` → ``.diff().dropna()``), **drops
+        zero-variance (constant-price) columns** — their correlation to
+        anything is undefined (NaN) and would crash the PSD repair /
+        optimizers; the excluded symbols are WARNING-logged and the
+        returned matrix's labels are then a strict subset of
+        ``symbols`` — and calls ``analytics.correlation_matrix`` on the
+        result, forwarding ``self.corr_shrinkage`` (Ledoit-Wolf by
+        default; the fitted intensity is DEBUG-logged). When
+        ``self.corr_floor`` is not ``None``, the matrix is then
+        element-wise floored at ``corr_floor``; since element-wise
+        clipping does not preserve positive-semidefiniteness in general,
+        the floored matrix passes through ``_nearest_psd_correlation``
+        before being returned, so the optimizer and the IDM always
+        consume the same valid correlation matrix. (All three
+        transforms are estimation hygiene: they apply to this inline
+        path only, never to an explicitly passed ``corr_matrix``.)
 
         Returns ``None`` — after logging a WARNING that names ``mode`` —
         when fewer than ``_MIN_CORR_OBS`` (=30) valid observations
         survive (only reachable via data gaps, since every live symbol
-        carries the full lookback); the caller falls back to
-        equal-weight over the live subset. Raises ``ValueError`` on an
-        unexpected ``self.corr_mode``.
+        carries the full lookback), when fewer than 2 non-constant
+        columns remain, or when the computed matrix still contains NaN
+        (safety net); the caller falls back to equal-weight over the
+        live subset. Raises ``ValueError`` on an unexpected
+        ``self.corr_mode``.
         """
         closes = {
             s: self.data_handler.get_latest_bars_df(
@@ -805,6 +1215,30 @@ class VolTargetingRiskManager(RiskManager):
                 mode, len(returns), _MIN_CORR_OBS,
             )
             return None
+        # Constant-price symbols have a zero-variance change series — their
+        # correlation to anything is undefined (NaN off-diagonals), which
+        # would crash the PSD repair / optimizers. Exclude them from this
+        # recalc (they re-enter at a later recalc if they move again); an
+        # excluded symbol is absent from the weights, skips sizing as
+        # 'constant_price', and a held position triggers the
+        # stranded-position WARNING.
+        variances = returns.var(ddof=0)
+        constant = [c for c in returns.columns if variances[c] == 0.0]
+        if constant:
+            logger.warning(
+                "%s: excluding %d constant-price symbol(s) from this "
+                "recalc (zero variance over the corr window): %s",
+                mode, len(constant), constant,
+            )
+            returns = returns.drop(columns=constant)
+        if returns.shape[1] < 2:
+            logger.warning(
+                "%s: fewer than 2 non-constant symbols in the corr "
+                "window; falling back to equal-weight (rho=1 degenerate "
+                "case)",
+                mode,
+            )
+            return None
         corr = correlation_matrix(returns, shrinkage=self.corr_shrinkage)
         if self.corr_shrinkage is not None:
             logger.debug(
@@ -812,6 +1246,16 @@ class VolTargetingRiskManager(RiskManager):
                 mode, self.corr_shrinkage,
                 corr.attrs.get('lw_shrinkage', float('nan')), len(returns),
             )
+        if corr.isna().any().any():
+            # Safety net: never hand NaN to the PSD repair (LinAlgError) or
+            # the optimizers (ValueError). Zero-variance filtering above
+            # should make this unreachable; data pathologies fall back.
+            logger.warning(
+                "%s: correlation matrix contains NaN entries despite "
+                "zero-variance filtering; falling back to equal-weight",
+                mode,
+            )
+            return None
         if self.corr_floor is not None:
             # Element-wise floor (Carver: zero out spurious negative
             # correlations before weighting). Clipping preserves symmetry
@@ -864,35 +1308,41 @@ class VolTargetingRiskManager(RiskManager):
             idm = min(idm, self.idm_cap)
         self.idm = idm
 
-    def calculate_strategy_weight(self) -> None:
-        """Populate ``self.strategy_weight`` with the single-strategy placeholder.
-
-        ``analytics.equal_weight`` over the one bound strategy —
-        ``{strategy_class_name: 1.0}``. Will become a real ``1/M`` (or
-        correlation-driven) allocation once the risk manager holds
-        multiple strategies. Mutates in place; safe to re-call any time.
-        """
-        name = self.strategy.__class__.__name__
-        self.strategy_weight = equal_weight([name])
-
     def update_bar(self, event: BarEvent) -> None:
         """Update sizing inputs and resize the position to the Carver target.
 
         Skips forming bars (one resize per completed bar). Delegates
         target-qty derivation (and *target-derivation* skip reasons —
-        the ``'warmup_*'`` family / ``'zero_vol'``) to
-        ``_compute_target_qty``; owns *post-target* concerns
-        (``'at_target'`` / ``'dead_band'`` / ``'zero_weight'`` relabel /
-        submit). A target-derivation skip that strands a *held* position
+        ``'warmup_volatility'`` / ``'zero_vol'`` / the universe reasons)
+        to ``_compute_target_qty``; owns *post-target* concerns
+        (``'at_target'`` / ``'dead_band'`` / ``'zero_weight'`` and
+        ``'removed'`` relabels / submit). A target-derivation skip that
+        strands a *held* position
         emits a WARNING (the RM is never silently blind to an open
         position). A zero combined weight is not a skip here — it arrives
         as ``target_qty = 0`` and flattens a held position via the submit
-        path. Records one diagnostic row per *completed* bar — including
+        path; a **removed** symbol arrives the same way (ahead of the
+        sigma ladder) so a dead sigma cannot block the exit, and its flat
+        rows are relabelled ``'removed'``. Refreshes the event symbol's
+        ``UniverseStatus`` first (gate state only changes on a symbol's
+        own bars, and the strategy has already processed this event, so
+        the status is exactly as fresh as the old inline gate checks).
+        Records one diagnostic row per *completed* bar — including
         every early-exit branch — into ``self._records[symbol]`` via
-        ``_record_row``, which also emits a DEBUG log line.
+        ``_record_row``, which also emits a DEBUG log line; each row
+        carries the universe state as ``universe_live`` (bool) and
+        ``universe_reasons`` (the full reason list, comma-joined).
         """
         if event.is_forming:
             return
+
+        symbol = event.symbol
+        # Per-bar universe refresh for the event symbol — right before the
+        # sizing decision, so the status (incl. 'waiting_weight_recalc')
+        # is always fresh at the decision point and self-heals within one
+        # bar after a direct instrument_weight overwrite. The recalc block
+        # below refreshes ALL symbols whenever it fires.
+        self._refresh_symbol_status(symbol)
 
         # Walk-forward weight recompute on a fixed cadence, measured in
         # ``corr_timeframe`` periods (not raw bar events). Each event is
@@ -916,10 +1366,21 @@ class VolTargetingRiskManager(RiskManager):
         # Update vol estimator first so sigma reflects this bar.
         self.vol_estimator.update(event)
 
-        symbol = event.symbol
+        # Re-read after the recalc block: a recalc that just landed a
+        # weight (or marked an exclusion) has already updated this status.
+        status = self._universe[symbol]
         forecast = self.strategy.get_forecast(symbol)
         capital = self.portfolio.calculate_balance()
         current_qty = self.portfolio.positions.get(symbol, 0.0)
+        # Signed sum of in-flight (pending) MKT orders — e.g. a same-bar
+        # margin-call liquidation submitted by the portfolio earlier in
+        # this bar's processing. The resize diff targets the projected
+        # end-state ``current_qty + pending_mkt_order_quantity`` so an
+        # order already on its way to fill is never double-traded. The
+        # two components are recorded separately for debuggability.
+        pending_mkt_order_quantity = (
+            self.portfolio.projected_position(symbol) - current_qty
+        )
 
         # Seed the diagnostic row with always-known inputs;
         # _compute_target_qty supplies sigma / weights /
@@ -930,7 +1391,6 @@ class VolTargetingRiskManager(RiskManager):
             'forecast': forecast,
             'sigma': None,
             'instrument_weight': None,
-            'strategy_weight': None,
             'capital': capital,
             'idm': self.idm,
             'annual_target_vol': self.annual_target_vol,
@@ -939,27 +1399,36 @@ class VolTargetingRiskManager(RiskManager):
             'annual_cash_target': None,
             'target_qty': None,
             'current_qty': current_qty,
+            'pending_mkt_order_quantity': pending_mkt_order_quantity,
             'trade_qty': None,
             'buffer_threshold': None,
             'submitted': False,
             'skip_reason': None,
+            'universe_live': status.live,
+            # Comma-joined string, not the list itself: a list column
+            # would trip runlog's sanitize_frame repr fallback; a plain
+            # string is parquet-native. '' == sizable (no reasons).
+            'universe_reasons': ','.join(status.reasons),
         }
         row.update(self._compute_target_qty(event))
 
         if row['skip_reason'] is not None:
-            # A target-derivation skip (warmup_volatility / zero_vol /
-            # warmup_forecast|correlation|weight) means we cannot compute a
+            # A target-derivation skip (warmup_volatility / zero_vol / a
+            # universe reason) means we cannot compute a
             # well-defined target this bar. Harmless when flat, but if we are
             # HOLDING a position the risk manager is leaving it unmanaged —
             # surface it loudly so it can never go unnoticed. (zero_weight no
             # longer lands here: it flows through as target_qty=0 and flattens
             # via the submit path. Flatten-on-universe-exit is deferred to the
             # delisting work; here the target is undefined, so we warn.)
-            if current_qty != 0:
+            # A position with a liquidation already in flight projects to 0
+            # (current + pending) — it is being managed, so no warning.
+            if current_qty + pending_mkt_order_quantity != 0:
                 logger.warning(
-                    "%s: holding %s contracts but skipping resize (%s) — "
-                    "position is unmanaged this bar",
-                    symbol, current_qty, row['skip_reason'],
+                    "%s: holding %s contracts (%s pending) but skipping "
+                    "resize (%s) — position is unmanaged this bar",
+                    symbol, current_qty, pending_mkt_order_quantity,
+                    row['skip_reason'],
                 )
             self._record_row(symbol, row)
             return
@@ -973,7 +1442,7 @@ class VolTargetingRiskManager(RiskManager):
         if not self.instruments[symbol].fractional:
             target_qty = float(round(target_qty))
             row['target_qty'] = target_qty
-        trade_qty = target_qty - current_qty
+        trade_qty = target_qty - (current_qty + pending_mkt_order_quantity)
         buffer_threshold = self.position_buffer * abs(target_qty)
         row['trade_qty'] = trade_qty
         row['buffer_threshold'] = buffer_threshold
@@ -986,13 +1455,17 @@ class VolTargetingRiskManager(RiskManager):
         # flat; otherwise the dead-band collapses to zero and any nonzero
         # current position triggers a flatten via the submit path.
         if abs(trade_qty) < 1e-12:                # already at target
-            # When the zero came from a zero weight (rather than a genuine
-            # at-target), surface it as 'zero_weight' — more informative
-            # than 'at_target' (the position is flat *because* it carries
-            # no weight). Both factors are populated floats here: a symbol
-            # absent from instrument_weight returned earlier with a
-            # warmup_* reason.
-            if row['instrument_weight'] == 0 or row['strategy_weight'] == 0:
+            # Relabel the flat case by its cause, most specific first: a
+            # REMOVED symbol's zero target is the permanent exclusion
+            # (its row weight is None — it was popped); a zero instrument
+            # weight is more informative than the generic 'at_target'
+            # (the position is flat *because* it carries no weight).
+            # instrument_weight is a populated float in the zero-weight
+            # case: a symbol absent from instrument_weight returned
+            # earlier with its universe reason.
+            if 'removed' in status.reasons:
+                row['skip_reason'] = 'removed'
+            elif row['instrument_weight'] == 0:
                 row['skip_reason'] = 'zero_weight'
             else:
                 row['skip_reason'] = 'at_target'
@@ -1016,17 +1489,36 @@ class VolTargetingRiskManager(RiskManager):
         """Carver cash-vol target-qty pipeline.
 
         target_qty = annual_cash_target / annual_price_vol, where
-        annual_cash_target = IDM × strategy_weight × instrument_weight
+        annual_cash_target = IDM × instrument_weight
         × annual_target_vol × (forecast / TARGET_AVG_ABS_FORECAST),
         additionally scaled by ``capital`` (current account equity) under
         ``vol_target_mode='percent_volatility'`` — see the module
         docstring for the two forms.
 
-        Owns the *target-derivation* skip ladder: ``'warmup_volatility'``
-        (sigma not ready) / ``'zero_vol'`` / the universe warmup labels
-        from ``_classify_warmup_reason`` (``'warmup_forecast'`` /
-        ``'warmup_correlation'`` / ``'warmup_weight'``). A zero combined
-        weight (``iw * sw == 0``) is **not** a skip — it returns
+        Owns the *target-derivation* skip ladder, in order:
+
+        1. **Removal flatten** (``_FLATTEN_ON`` exclusion reasons, i.e.
+           ``'removed'``) — returns ``target_qty = 0`` with no skip,
+           AHEAD of the sigma checks: a flatten needs no sigma, and a
+           delisted symbol's sigma is typically dead (``'zero_vol'``),
+           which would otherwise strand the exit. ``update_bar``
+           relabels the already-flat case ``'removed'``.
+        2. Sigma checks — ``'warmup_volatility'`` (not ready) /
+           ``'zero_vol'``.
+        3. Unweighted symbol — skip with the symbol's primary recorded
+           universe reason itself (the first entry of the
+           canonically-ordered reason list: ``'warmup_forecast'`` /
+           ``'warmup_correlation'`` / ``'constant_price'`` /
+           ``'waiting_weight_recalc'``); the full
+           reason list is in the row's ``universe_reasons`` column.
+        4. None-forecast backstop — ``'warmup_forecast'`` can also fire
+           *post-weighting*: a weighted symbol whose forecast cache is
+           still empty (``get_forecast`` → ``None`` — e.g. weights
+           overwritten directly, bypassing the liveness gate) skips here
+           instead of feeding ``None`` into the formula.
+
+        A zero instrument
+        weight (``iw == 0``) is **not** a skip — it returns
         ``target_qty = 0`` (with ``skip_reason`` left ``None``) so a held
         position is flattened by ``update_bar``'s submit path and a flat
         one is relabelled ``'zero_weight'`` there. The returned dict is
@@ -1039,33 +1531,53 @@ class VolTargetingRiskManager(RiskManager):
         out: Dict[str, Any] = {
             'target_qty': None, 'skip_reason': None,
             'sigma': None, 'instrument_weight': None,
-            'strategy_weight': None, 'annual_cash_target': None,
+            'annual_cash_target': None,
         }
+
+        status = self._status(symbol)
+        if _FLATTEN_ON.intersection(status.reasons):
+            # Removed symbol: flatten policy — a zero target flows through
+            # the normal submit path exactly like the zero-weight case
+            # (no skip), so a held position exits even when sigma is dead.
+            out['annual_cash_target'] = 0.0
+            out['target_qty'] = 0.0
+            return out
 
         sigma = self.vol_estimator.get_annual_vol(symbol)
         if sigma is None:
             out['skip_reason'] = 'warmup_volatility'
             return out
         out['sigma'] = sigma
-        if sigma == 0:
+        # Zero OR negligible vol: the relative term catches the EWMA
+        # estimator's asymptotic decay on a flat symbol (never exactly 0)
+        # before the divide below can explode the target.
+        if sigma == 0 or sigma < _MIN_SIGMA_REL * abs(event.close):
             out['skip_reason'] = 'zero_vol'
             return out
 
         if symbol not in self.instrument_weight:
-            # Absent from the tradable universe — classify which warmup
-            # stage (forecast → correlation → weight) the symbol is still
-            # in. ``instrument_weight`` stays None in the diagnostic row —
-            # truthful, vs. recording a synthetic 0.0.
-            out['skip_reason'] = self._classify_warmup_reason(symbol)
+            # Outside the weighted universe — the recorded reason list
+            # (refreshed by update_bar just before) names every cause and
+            # is built in precedence order (forecast → correlation →
+            # exclusions → waiting), so its first entry IS the primary
+            # cause; store it directly. The empty-list fallback is
+            # defensive only: the per-bar refresh guarantees an unweighted
+            # symbol carries at least 'waiting_weight_recalc'.
+            # ``instrument_weight`` stays None in the diagnostic row —
+            # truthful, vs. recording a synthetic 0.0. Note the trigger is
+            # weight-membership, not the reason list: a directly
+            # overwritten weight on a non-live symbol still sizes (the
+            # documented gate bypass, WARNed at the next recalc), guarded
+            # by the None-forecast backstop below.
+            out['skip_reason'] = (status.reasons[0] if status.reasons
+                                  else 'waiting_weight_recalc')
             return out
         iw = self.instrument_weight[symbol]
-        sw = self.strategy_weight.get(self.strategy.__class__.__name__, 0.0)
         out['instrument_weight'] = iw
-        out['strategy_weight'] = sw
-        if iw * sw == 0:
-            # A zero instrument or strategy weight means a target of 0 —
-            # NOT a reason to skip. Flow through as target_qty=0 so a held
-            # position is flattened by the normal submit path (exactly like
+        if iw == 0:
+            # A zero instrument weight means a target of 0 — NOT a reason
+            # to skip. Flow through as target_qty=0 so a held position is
+            # flattened by the normal submit path (exactly like
             # forecast=0), instead of being silently stranded. ``update_bar``
             # relabels the flat case as 'zero_weight' for diagnostics.
             out['annual_cash_target'] = 0.0
@@ -1073,13 +1585,23 @@ class VolTargetingRiskManager(RiskManager):
             return out
 
         forecast = self.strategy.get_forecast(symbol)
+        if forecast is None:
+            # No forecast cached yet (warmup) despite the symbol carrying a
+            # weight — reachable when ``instrument_weight`` is overwritten
+            # directly (the documented convention bypasses the liveness
+            # gate) or a matrix hook weighted a symbol whose strategy gate
+            # is unmet. Skip before the formula, which would raise on None
+            # (``None / TARGET_AVG_ABS_FORECAST`` is a TypeError). Mirrors
+            # SimpleRiskManager's guard.
+            out['skip_reason'] = 'warmup_forecast'
+            return out
         if self.vol_target_mode == 'percent_volatility':
             # Carver's original form: τ is a fraction of *current*
             # account equity, so the cash target compounds with the
             # account.
             capital = self.portfolio.calculate_balance()
             annual_cash_target = (
-                capital * self.idm * sw * iw * self.annual_target_vol
+                capital * self.idm * iw * self.annual_target_vol
                 * (forecast / Strategy.TARGET_AVG_ABS_FORECAST)
             )
         elif self.vol_target_mode == 'dollar_volatility':
@@ -1087,7 +1609,7 @@ class VolTargetingRiskManager(RiskManager):
             # futures convention: the risk limit is a dollar number, not
             # a compounding fraction of equity).
             annual_cash_target = (
-                self.idm * sw * iw * self.annual_target_vol
+                self.idm * iw * self.annual_target_vol
                 * (forecast / Strategy.TARGET_AVG_ABS_FORECAST)
             )
         else:
@@ -1107,10 +1629,10 @@ class VolTargetingRiskManager(RiskManager):
         super()._record_row(symbol, row)
         action = 'submit' if row['submitted'] else row['skip_reason']
         logger.debug(
-            "[CARVER] %s fc=%s sigma=%s iw=%s sw=%s cap=%.2f "
-            "target=%s cur=%.6f trade=%s action=%s",
+            "[CARVER] %s fc=%s sigma=%s iw=%s cap=%.2f "
+            "target=%s cur=%.6f pend=%s trade=%s action=%s",
             symbol, row['forecast'], row['sigma'],
-            row['instrument_weight'], row['strategy_weight'],
+            row['instrument_weight'],
             row['capital'], row['target_qty'], row['current_qty'],
-            row['trade_qty'], action,
+            row['pending_mkt_order_quantity'], row['trade_qty'], action,
         )

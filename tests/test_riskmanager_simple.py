@@ -12,8 +12,8 @@ convention). Two sections, mirroring that file's layout:
    short↔long, constructor + ABC validation.
 2. **Per-bar diagnostics (``get_records`` / ``_records`` / ``skip_reason``)**
    — empty frame for unknown symbol / forming bar, one row per completed
-   bar, and the ``skip_reason`` ladder
-   (``'no_price'`` / ``'warmup_forecast'`` / ``'at_target'`` / ``None``).
+   bar, and the ``skip_reason`` ladder (``'no_price'`` / ``'zero_price'``
+   / ``'warmup_forecast'`` / ``'at_target'`` / ``None``).
 
 Uses minimal FakePortfolio + FakeStrategy stubs so the risk-manager logic
 is tested in isolation.
@@ -52,6 +52,10 @@ class FakePortfolio:
 
     def calculate_balance(self) -> float:
         return self._balance
+
+    def projected_position(self, symbol: str) -> float:
+        # No pending-order ledger in the double: projected == realized.
+        return self.positions.get(symbol, 0.0)
 
     def submit_order(self, symbol, quantity, direction, timestamp,
                      order_type, price=None):
@@ -122,15 +126,49 @@ def _make(
 # no order submitted AND no diagnostic row recorded.)
 # ──────────────────────────────────────────────
 
-def test_update_bar_skips_when_price_is_zero():
-    # Exact zero is treated like a missing price (margin scaling would
-    # divide by it) → 'no_price' skip, no order.
+def test_update_bar_zero_price_notional_mode_skips_zero_price():
+    # A notional mode divides by |price| — undefined at exactly 0, so it
+    # skips with the dedicated 'zero_price' reason (NOT 'no_price': a
+    # zero price is a real futures price, e.g. a spread crossing zero).
     pf = FakePortfolio(price=0.0, positions={'BTC': 0.0})
     strat = FakeStrategy({'BTC': 100.0})
-    rm = SimpleRiskManager(pf, strat)
+    rm = SimpleRiskManager(pf, strat, size_mode='fixed_notional')
     rm.update_bar(_bar())
     assert pf.submitted == []
+    assert rm.get_records('BTC').iloc[0]['skip_reason'] == 'zero_price'
+
+
+def test_update_bar_zero_price_fixed_quantity_still_sizes():
+    # fixed_quantity is price-independent — an exact-zero price must not
+    # block sizing (zero-price tolerance, mirroring the portfolio/margin
+    # layer's WTI-2020 convention).
+    pf = FakePortfolio(price=0.0, positions={'BTC': 0.0})
+    strat = FakeStrategy({'BTC': 100.0})
+    rm = SimpleRiskManager(pf, strat, size_mode='fixed_quantity',
+                           position_size=5.0)
+    rm.update_bar(_bar())
+    assert len(pf.submitted) == 1
+    call = pf.submitted[0]
+    assert call['direction'] == Direction.BUY
+    assert math.isclose(call['quantity'], 5.0)
+    row = rm.get_records('BTC').iloc[0]
+    assert row['skip_reason'] is None
+    assert row['price'] == 0.0
+
+
+def test_update_bar_skip_with_held_position_emits_stranded_warning(caplog):
+    # A skip that leaves a HELD position unmanaged must be loud
+    # (mirrors VolTargetingRiskManager's stranded-position WARNING).
+    import logging
+    pf = FakePortfolio(price=None, positions={'BTC': 3.0})
+    strat = FakeStrategy({'BTC': 100.0})
+    rm = SimpleRiskManager(pf, strat, size_mode='fixed_notional')
+    with caplog.at_level(logging.WARNING,
+                         logger='riskmanager._simple_riskmanager'):
+        rm.update_bar(_bar())
+    assert pf.submitted == []
     assert rm.get_records('BTC').iloc[0]['skip_reason'] == 'no_price'
+    assert any('unmanaged' in rec.message for rec in caplog.records)
 
 
 # ──────────────────────────────────────────────

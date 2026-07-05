@@ -51,6 +51,7 @@ def backtest_stats(
     initial_capital: float,
     timeframe: str,
     days_convention: str,
+    start: Optional[Any] = None,
 ) -> pd.Series:
     """Summarize a backtest into an ordered ``pd.Series`` of statistics.
 
@@ -83,6 +84,18 @@ def backtest_stats(
         ``'calendar'`` (365 days/year) or ``'business'`` (252 trading
         days/year); also fixes the days-per-year used to rescale
         per-bar volatility to the daily lines.
+    start
+        Optional trim point (anything ``pd.Timestamp`` accepts; must be
+        tz-compatible with the curve's UTC index). When given, the
+        collapsed equity curve and the trade log are restricted to
+        ``timestamp >= start`` before any statistic is computed —
+        intended to drop the **flat warmup head** (see the warmup-
+        dilution note below), e.g.
+        ``start=trade_log['timestamp'].min()``. ``initial_capital``
+        stays the PnL/drawdown baseline, which is exact for a flat head
+        (balance still equals initial capital at the first fill);
+        trimming a NON-flat head shifts what the baseline means — the
+        pre-``start`` PnL silently folds into the first kept bar.
 
     Returns
     -------
@@ -103,7 +116,9 @@ def backtest_stats(
         If ``equity_curve`` or ``trade_log`` is not a DataFrame.
     ValueError
         If ``initial_capital <= 0``, ``days_convention``/``timeframe`` is
-        invalid, or a non-empty ``equity_curve`` lacks required columns.
+        invalid, a non-empty ``equity_curve`` lacks required columns, or
+        ``start`` is given while a non-empty ``trade_log`` lacks a
+        ``timestamp`` column.
 
     Notes
     -----
@@ -119,6 +134,13 @@ def backtest_stats(
       episode is **included** in the max/avg depth and duration as a
       lower bound on its true value. An episode underwater from the
       first bar measures its duration from the first equity timestamp.
+
+    Warmup dilution: under the vol-targeting stack's universe liveness
+    gate the book stays flat for roughly ``corr_lookback`` + strategy
+    warmup bars at the start of a run. Those zero-PnL bars are included
+    here by default, diluting Sharpe/vol (each by ~√(active fraction))
+    and stretching CAGR's year count. Pass ``start`` (e.g. the first
+    fill's timestamp) to compute the table over the active window only.
     """
     if not isinstance(equity_curve, pd.DataFrame):
         raise TypeError(
@@ -143,6 +165,17 @@ def backtest_stats(
             )
 
     eq = _collapse_equity(equity_curve)
+    if start is not None:
+        start = pd.Timestamp(start)
+        if not eq.empty:
+            eq = eq.loc[eq.index >= start]
+        if not trade_log.empty:
+            if 'timestamp' not in trade_log.columns:
+                raise ValueError(
+                    "start= requires a 'timestamp' column on a non-empty "
+                    "trade_log to trim it consistently with the curve"
+                )
+            trade_log = trade_log[trade_log['timestamp'] >= start]
     empty = eq.empty
     if empty:
         logger.debug("backtest_stats: empty equity curve — NaN output")

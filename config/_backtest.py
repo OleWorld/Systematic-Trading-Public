@@ -20,6 +20,9 @@ class BacktestConfig:
 
     # --- Data ---
     symbols: List[str]
+    # start_date / end_date are informational metadata only (run labeling,
+    # manifests): the engine streams exactly the data supplied in the
+    # {symbol: DataFrame} dict — windowing is the caller's responsibility.
     start_date: str
     end_date: str
     base_timeframe: str                                         # streaming TF (e.g. '1m')
@@ -45,7 +48,7 @@ class BacktestConfig:
     corr_step_size: int = 30              # auto-recalc cadence in completed bars; 0 disables
     corr_timeframe: str = '1d'            # data-handler timeframe to read closes from
     corr_mode: str = 'absolute_price_chg' # 'absolute_price_chg' (futures-safe: negative/zero prices) or 'simple_return' (positive-price assets)
-    corr_floor: Optional[float] = None    # element-wise floor on the inline-derived rho; None disables (Carver: zero out spurious negative correlations)
+    corr_floor: Optional[float] = None    # element-wise floor on the inline-derived rho; None (default) disables; 0.0 is the recommended Carver-style setting (zero out spurious negative correlations; bounds pre-cap IDM by sqrt(N))
     corr_shrinkage: Optional[str] = 'ledoit_wolf'  # shrinkage on the inline-derived rho ('ledoit_wolf' — well-conditioned at high N); None disables (raw sample corr)
     idm_cap: Optional[float] = 2.5       # cap on the auto-updated IDM; None disables (Carver's 2.5; >= 1.0 since DM >= 1 for long-only sum-to-1 weights)
 
@@ -56,9 +59,9 @@ class BacktestConfig:
     position_size: float = 10_000.0
 
     # --- Execution ---
-    # NOTE: slippage / commission are per-symbol (InstrumentConfig). Only the
-    # run-level fill-timing model lives here.
-    fill_on: str = 'signal_close'       # 'signal_close' or 'next_open'
+    # NOTE: slippage / commission are per-symbol (InstrumentConfig). There is
+    # no run-level fill-timing knob: orders fill on the signal bar (MKT at
+    # close, LMT at the limit if touched) — see execution/_backtest.py.
 
     def __post_init__(self):
         if not self.symbols:
@@ -84,11 +87,6 @@ class BacktestConfig:
                     f"base_timeframe '{self.base_timeframe}'."
                 )
 
-        if self.fill_on not in ('signal_close', 'next_open'):
-            raise ValueError(
-                f"Unknown fill_on: '{self.fill_on}'. "
-                "Must be 'signal_close' or 'next_open'."
-            )
         if self.size_mode not in ('fixed_notional', 'fixed_quantity', 'fixed_equity_pct'):
             raise ValueError(
                 f"Unknown size_mode: '{self.size_mode}'. "

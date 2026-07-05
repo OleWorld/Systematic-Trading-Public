@@ -351,3 +351,58 @@ def test_missing_required_columns_rejected():
     with pytest.raises(ValueError, match="account_balance"):
         backtest_stats(bad, _trade_log([]), initial_capital=100_000.0,
                        timeframe='1d', days_convention='calendar')
+
+
+# ──────────────────────────────────────────────
+# start= trim (warmup-dilution control)
+# ──────────────────────────────────────────────
+
+def test_start_none_is_default_full_window():
+    balances = [100_000.0] * 4 + [110_000.0]
+    full = _stats(balances)
+    explicit = _stats(balances, start=None)
+    assert full.equals(explicit)
+
+
+def test_start_trims_flat_head_and_shifts_window():
+    # 6 flat warmup bars, then activity. Trimming the flat head must move
+    # Start/Duration to the active window and shrink the annualization
+    # year-count, while Net PnL (baseline = initial_capital, exact for a
+    # flat head) is unchanged.
+    balances = [100_000.0] * 6 + [101_000.0, 99_000.0, 102_000.0]
+    active_start = pd.Timestamp('2024-01-07', tz='UTC')  # first non-flat bar
+    full = _stats(balances)
+    trimmed = _stats(balances, start=active_start)
+
+    assert trimmed['Start'] == active_start
+    assert trimmed['End'] == full['End']
+    assert trimmed['Duration'] < full['Duration']
+    assert trimmed['Net PnL [$]'] == full['Net PnL [$]']
+    # The flat head's zero-PnL bars diluted per-bar vol; the trimmed
+    # window's vol must be strictly higher.
+    assert trimmed['Volatility (Ann.) [$]'] > full['Volatility (Ann.) [$]']
+
+
+def test_start_trims_trade_log_consistently():
+    # 5 fills, one per day from Jan 1; trimming at Jan 4 keeps 2.
+    balances = [100_000.0] * 5
+    trimmed = _stats(balances, pnls=[0.0, 10.0, -5.0, 20.0, 0.0],
+                     start=pd.Timestamp('2024-01-04', tz='UTC'))
+    assert trimmed['# Fills'] == 2
+    assert trimmed['# Closing Trades'] == 1  # only the +20 fill remains
+
+
+def test_start_after_all_data_yields_empty_nan_path():
+    stats = _stats([100_000.0, 101_000.0],
+                   start=pd.Timestamp('2030-01-01', tz='UTC'))
+    assert pd.isna(stats['Equity Final [$]'])
+    assert stats['Start'] is pd.NaT
+
+
+def test_start_with_timestampless_trade_log_rejected():
+    eq = _equity_curve([100_000.0, 101_000.0])
+    bad_trades = pd.DataFrame({'realized_pnl': [5.0]})
+    with pytest.raises(ValueError, match="timestamp"):
+        backtest_stats(eq, bad_trades, initial_capital=100_000.0,
+                       timeframe='1d', days_convention='calendar',
+                       start=pd.Timestamp('2024-01-01', tz='UTC'))

@@ -41,3 +41,16 @@ class Portfolio(ABC):
     @abstractmethod
     def update_fill(self, event: FillEvent) -> None:
         raise NotImplementedError
+
+    def finalize(self) -> None:
+        """Post-run reconciliation hook, called once by ``Backtester.run()``
+        after the event loop drains.
+
+        Fills for the final bar's orders book *after* that bar's equity
+        row is recorded, so implementations that keep an equity curve
+        should re-snapshot their last row here — otherwise the curve
+        permanently misses the run's last realized PnL, slippage, and
+        commission. Default is a no-op (concrete, not abstract, so
+        stubs and live placeholders need not override it).
+        """
+        return None

@@ -971,7 +971,7 @@ def test_submit_order_pending_mkt_still_projects_for_same_bar_flip():
 
 def test_submit_order_pending_lmt_risk_increasing_still_reserves_capital():
     """
-    Excluding LMT from `_projected_position` must NOT exclude it from
+    Excluding LMT from `projected_position` must NOT exclude it from
     `_reserved_margin`. A pending LMT that ADDS exposure still consumes
     capital, so a new order is sized against the smaller available
     headroom.
@@ -1155,8 +1155,8 @@ def test_check_solvency_cancels_non_liquidation_pending_fifo():
 
 def test_check_solvency_liquidation_orders_exempt_from_fifo_cancel():
     """
-    A liquidation order queued on a previous tick (e.g. under
-    fill_on='next_open' before it has filled) must not be cancelled by
+    A liquidation order queued on a previous tick (e.g. deferred to the
+    symbol's next bar before it has filled) must not be cancelled by
     the FIFO cancel pass that fires when account_balance is again < 0.
     """
     pf, _, _ = _new_portfolio(capital=100.0, leverage=1.0, prices={'BTC': 100.0})
@@ -1196,6 +1196,11 @@ def test_check_solvency_liquidates_worst_pnl_first_with_two_positions():
     # Drive update via a bar on either symbol so check_solvency fires.
     # account_balance = 200 - 50 - 150 = 0... need it < 0. Push ETH harder.
     pf._latest_prices['ETH'] = 400.0  # ETH unrealized = -200; account = 200 - 50 - 200 = -50.
+    # State was injected directly (bypassing update_bar/update_fill), so
+    # re-sync the per-symbol unrealized cache: the per-event hot path only
+    # refreshes the event symbol's entry and would leave injected BTC
+    # state stale (see _update_symbol_unrealized's invariant note).
+    pf._refresh_snapshot()
     pf.update_bar(_bar(symbol='ETH', close=400.0))
     liq_orders = [item for item in q.items
                   if isinstance(item, OrderEvent) and item.is_liquidation]
@@ -1326,8 +1331,9 @@ def test_fill_at_worse_price_than_submission_can_drive_insolvency_and_triggers_l
     order = pf.submit_order('BTC', quantity=1.0, direction=Direction.BUY,
                             timestamp=DEFAULT_TS, order_type=OrderType.MKT)
     assert order is not None and order.quantity == 1.0
-    # Simulate a gap-up: the actual fill price is 300 (3x submission), simulating
-    # a `fill_on='next_open'` gap. No re-validation happens — fill is booked.
+    # Simulate a gap-up: the actual fill price is 300 (3x submission) — a
+    # deferred fill landing on a later, gapped bar. No re-validation
+    # happens — the fill is booked.
     pf.update_fill(_fill(qty=1.0, direction=Direction.BUY, fill_price=300.0,
                          order_id=order.order_id))
     # Cash unchanged by opening fill (futures model — no commission here).
@@ -1372,6 +1378,89 @@ def test_cancel_order_unknown_id_is_noop():
     pf, _, _ = _new_portfolio()
     pf.cancel_order('does-not-exist')  # must not raise
     assert pf.pending_orders == {}
+
+
+# ──────────────────────────────────────────────
+# Cancelled-order fills are voided
+# ──────────────────────────────────────────────
+
+def test_fill_for_cancelled_order_is_voided(caplog):
+    """A fill arriving for an order the portfolio has cancelled (its margin
+    reservation already released) must be VOIDED: no position, cash,
+    commission, or trade-log change — the simulated exchange's book and
+    the events queue cannot be recalled, so the guard lives here."""
+    pf, _, _ = _new_portfolio(capital=10_000.0, prices={'BTC': 100.0})
+    order = pf.submit_order('BTC', quantity=2.0, direction=Direction.BUY,
+                            timestamp=DEFAULT_TS, order_type=OrderType.MKT)
+    assert order is not None
+    pf.cancel_order(order.order_id)
+
+    with caplog.at_level('WARNING'):
+        pf.update_fill(_fill(qty=2.0, direction=Direction.BUY,
+                             fill_price=100.0, commission=5.0,
+                             order_id=order.order_id))
+    assert pf.positions['BTC'] == 0.0
+    assert pf.cash == 10_000.0
+    assert pf.total_commission == 0.0
+    assert pf.trade_log == []
+    assert any('FILL VOIDED' in r.message for r in caplog.records)
+
+
+def test_fill_for_cancelled_order_voided_after_margin_call_cancel_pass():
+    """The margin-call FIFO cancel pass registers the cancelled ids the
+    same way ``cancel_order`` does, so a straggler fill is voided."""
+    pf, _, _ = _new_portfolio(capital=100.0, leverage=1.0, prices={'BTC': 100.0})
+    pf.positions['BTC'] = -1.0
+    pf.avg_cost['BTC'] = 100.0
+    pf.margin_requirements['BTC'] = 100.0
+    # Pending non-liquidation order that the cancel pass will remove.
+    p = _order(qty=1.0, direction=Direction.BUY, order_type=OrderType.LMT,
+               price=90.0, order_id='TP')
+    pf.pending_orders = {'TP': p}
+    pf.update_bar(_bar(close=250.0))  # insolvency -> cancel pass fires
+    assert 'TP' not in pf.pending_orders
+    cash_before = pf.cash
+    pos_before = pf.positions['BTC']
+    pf.update_fill(_fill(qty=1.0, direction=Direction.BUY, fill_price=90.0,
+                         order_id='TP'))
+    assert pf.positions['BTC'] == pos_before
+    assert pf.cash == cash_before
+
+
+def test_fill_with_unknown_order_id_still_books():
+    """Only ids explicitly cancelled are voided — synthetic fills with an
+    unknown order_id (unit-test convenience) book normally."""
+    pf, _, _ = _new_portfolio(prices={'BTC': 100.0})
+    pf.update_fill(_fill(qty=1.0, direction=Direction.BUY, fill_price=100.0,
+                         order_id='never-submitted'))
+    assert pf.positions['BTC'] == 1.0
+
+
+# ──────────────────────────────────────────────
+# projected_position
+# ──────────────────────────────────────────────
+
+def test_projected_position_includes_pending_mkt_orders():
+    pf, _, _ = _new_portfolio(capital=10_000.0, prices={'BTC': 100.0})
+    pf.positions['BTC'] = 10.0
+    sell = pf.submit_order('BTC', quantity=4.0, direction=Direction.SELL,
+                           timestamp=DEFAULT_TS, order_type=OrderType.MKT)
+    assert sell is not None
+    assert pf.projected_position('BTC') == pytest.approx(6.0)
+
+
+def test_projected_position_excludes_pending_lmt_orders():
+    pf, _, _ = _new_portfolio(capital=10_000.0, prices={'BTC': 100.0})
+    pf.positions['BTC'] = 10.0
+    lmt = _order(qty=4.0, direction=Direction.SELL,
+                 order_type=OrderType.LMT, price=110.0, order_id='L1')
+    pf.pending_orders = {'L1': lmt}
+    assert pf.projected_position('BTC') == pytest.approx(10.0)
+
+
+def test_projected_position_unknown_symbol_is_zero():
+    pf, _, _ = _new_portfolio()
+    assert pf.projected_position('UNKNOWN') == 0.0
 
 
 # ──────────────────────────────────────────────
