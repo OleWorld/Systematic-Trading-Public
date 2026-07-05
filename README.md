@@ -157,7 +157,7 @@ data = {sym: g.set_index('timestamp')[['Open', 'High', 'Low', 'Close', 'Volume']
 
 The trader instantiates each module explicitly, passes them into
 `Backtester(...)`, and calls `run()`. The full pattern lives in
-[backtests/test_ewmac.py](backtests/test_ewmac.py); the condensed shape is:
+[backtests/sample_backtest/backtest_ewmac_crypto.py](backtests/sample_backtest/backtest_ewmac_crypto.py); the condensed shape is:
 
 ```python
 import queue

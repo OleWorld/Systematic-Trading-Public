@@ -3,7 +3,8 @@ Unit tests for the ``Backtester`` event-loop engine.
 
 The engine is the orchestration heart of the system — it drains the
 events queue and routes each event to the right consumer — but it was
-previously exercised only by the ``backtests/test_ewmac.py`` smoke
+previously exercised only by the
+``backtests/sample_backtest/backtest_ewmac_crypto.py`` smoke
 script, which pytest does not collect. A regression in the wiring (wrong
 processing order, a mis-routed event, a swallowed unknown event, a
 leaked bar-timestamp context) would pass the rest of the suite.

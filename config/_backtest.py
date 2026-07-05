@@ -15,7 +15,8 @@ class BacktestConfig:
     slippage, commission, margin/leverage) live in ``InstrumentConfig``
     (``config/_instrument.py``), supplied as a registry to the portfolio,
     execution, and risk manager. Callers read the fields off this object as
-    they wire each module manually (see ``backtests/test_ewmac.py``).
+    they wire each module manually (see
+    ``backtests/sample_backtest/backtest_ewmac_crypto.py``).
     """
 
     # --- Data ---

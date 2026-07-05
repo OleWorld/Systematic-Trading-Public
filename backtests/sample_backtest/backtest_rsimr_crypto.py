@@ -13,7 +13,7 @@ from analytics import backtest_stats, turnover_stats
 from config import BacktestConfig, uniform_registry
 from runlog import save_run
 from data import HistoricDataHandler
-from strategy import EWMACStrategy
+from strategy import RSIMRStrategy
 from portfolio import BacktestPortfolio, PortfolioMarginModel
 from execution import BacktestExecution, SlippageModel, CommissionModel
 from volatility import EWMAVolEstimator, bars_per_year
@@ -26,7 +26,7 @@ from plotting import plot_strategy
 # The user supplies their own data as a {symbol: DataFrame} dict. Here we load a
 # bundled CSV of daily bars; each frame is indexed by a tz-aware DatetimeIndex
 # with Open/High/Low/Close/Volume columns. Built in config.symbols order.
-sample_csv = os.path.join(os.path.dirname(__file__), 'sample_data', 'crypto_1d.csv')
+sample_csv = os.path.join(os.path.dirname(__file__), '..', 'sample_data', 'crypto_1d.csv')
 _raw = pd.read_csv(sample_csv)
 _raw['timestamp'] = pd.to_datetime(_raw['timestamp'], utc=True)
 _grouped = {sym: g for sym, g in _raw.groupby('symbol')}
@@ -36,15 +36,15 @@ for sym in stables:
 _symbols = list(str(x) for x in _grouped.keys())
 
 # --- Config (validated parameter holder) ---
-# EWMAC defaults need ~512 daily bars of warmup (256-day slow EMA + 256-bar
-# forecast-scalar SMA). The 2021-01 → 2026-04 window gives ~1939 daily bars —
-# plenty for warmup AND post-warmup signal emission.
+# RSIMR needs only a short signal warmup (max RSI window + forecast-scalar SMA;
+# ~28 + 256 ≈ 285 daily bars with the defaults below). The 2021-01 → 2026-04
+# window gives ~1939 daily bars — plenty for warmup AND post-warmup trading.
 #
 # This smoke run exercises the engine's FUTURES-FIRST defaults (dollar vol
 # target, absolute-price-change correlations, absolute slippage, per-contract
-# commission) on the bundled crypto basket. Only days_convention is data-driven:
-# crypto trades 24/7, so 'calendar' (365 d/y) is required for correct vol
-# annualization regardless of the futures-style sizing knobs.
+# commission) on the bundled crypto basket, now driven by the RSI mean-reverter
+# instead of EWMAC. Only days_convention is data-driven: crypto trades 24/7, so
+# 'calendar' (365 d/y) is required for correct vol annualization.
 config = BacktestConfig(
     symbols=_symbols,
     start_date='2021-01-01',
@@ -53,7 +53,7 @@ config = BacktestConfig(
     days_convention='calendar',             # data-driven: crypto is 24/7 → 365 d/y
     timeframes={'1d': 500},
 
-    instrument_weight_mode='risk_parity',  # ERC weights (equal risk contribution); IDM derived from the same rho
+    instrument_weight_mode='risk_parity',  # recommended default: 1/N weights, IDM still derived from rho
     corr_mode='absolute_price_chg',         # futures default: .diff() correlations
     corr_lookback  = 256,
     corr_timeframe = '1d',
@@ -65,17 +65,16 @@ config = BacktestConfig(
 )
 
 # Per-symbol economics (point_value, fractional, slippage, commission, margin)
-# now live in an InstrumentConfig registry, NOT BacktestConfig. The crypto
-# basket is homogeneous, so a uniform registry is a one-liner: point_value=1
-# and fractional=True reproduce the simplified crypto-perp accounting, with
-# 10x leverage / 5% maintenance margin and zero slippage/commission (a fixed
-# tick or per-contract fee can't fit BTC & DOGE scales at once).
+# live in an InstrumentConfig registry, NOT BacktestConfig. The crypto basket is
+# homogeneous, so a uniform registry is a one-liner: point_value=1 and
+# fractional=True reproduce the simplified crypto-perp accounting, with 10x
+# leverage / 5% maintenance margin and a 0.1% rate commission.
 instruments = uniform_registry(
     config.symbols,
     point_value=1.0,
     fractional=True,
     slippage=SlippageModel('absolute', 0.0),     # futures default: $ per unit
-    commission=CommissionModel('per_contract', 0.0),  # futures default: $ per contract
+    commission=CommissionModel('per_contract', 0.0),   # futures default: $ per contract
     margin=PortfolioMarginModel.from_leverage(10.0, maintenance_margin_rate=0.05),
 )
 
@@ -95,16 +94,18 @@ data_handler = HistoricDataHandler(
     data=data,
 )
 
-strategy = EWMACStrategy(
+# RSI mean-reverter: three RSI speeds (fast/medium/slow) mapped through arctanh
+# into a [-100, +100] forecast (oversold → long, overbought → short), with the
+# same dynamic forecast scalar EWMAC uses to drive avg |f| toward 50.
+strategy = RSIMRStrategy(
     data_handler, config.symbols,
     variations={
-        '4_16': {'fast': 4, 'slow': 16},
-        '16_64': {'fast': 16, 'slow': 64},
-        '32_128': {'fast': 32, 'slow': 128},
+        '3': {'window': 3},
+        '14': {'window': 14},
+        '28': {'window': 28},
     },
-    weights={'4_16': 0.42, '16_64': 0.16, '32_128': 0.42},
-    fdm=1.12,
-    vol_lookback=25,
+    weights={'3': 0.50, '14': 0.25, '28': 0.25},
+    fdm=1.0,
     forecast_scalar_lookback=256,
 )
 
@@ -156,7 +157,7 @@ bt.run()
 # can never lose the archive) ---
 run_record = save_run(
     portfolio=bt.portfolio, strategy=strategy, risk_manager=risk_manager,
-    config=config, instruments=instruments, label='ewmac-smoke',
+    config=config, instruments=instruments, label='rsimr-smoke',
 )
 print(f"Run archived: {run_record.path}")
 
@@ -284,43 +285,9 @@ print(turnover.to_string())
 
 
 # import plotly.express as px
-# import pandas as pd
 # symbol = 'DOGE_USDT:USDT'
 # df = bt.strategy.get_records(symbol)
 # fig = plot_strategy(df,
-#                     indicators={'fast_ema_16_64': 1, 'slow_ema_16_64': 1,
-#                                 'forecast': 2},
-#                     title=f'{symbol} EWMAC', timeframe='1d')
+#                     indicators={'rsi_14': 1, 'forecast': 2},
+#                     title=f'{symbol} RSI mean-reversion', timeframe='1d')
 # fig.show(config=dict({'scrollZoom':True}), renderer='browser')
-
-# import plotly.express as px
-# total = (
-#     pd.DataFrame(equity_df['realized_pnl'].tolist(),   index=equity_df.index)
-#     + pd.DataFrame(equity_df['unrealized_pnl'].tolist(), index=equity_df.index)
-# )
-# pnl_by_instrument = total.groupby(level=0).last()   # one row per timestamp
-# fig = px.line(pnl_by_instrument)
-# fig.show(renderer='browser')
-# fig = px.line(equity_df[['account_balance', 'available_balance']].resample('d').last())
-# fig.show(renderer='browser')
-
-# import plotly.express as px
-# list_weights = []
-# for x in bt.risk_manager.get_live_symbols():
-#     weight = bt.risk_manager.get_records(x)['instrument_weight'].astype(float)
-#     weight.name = x
-#     list_weights.append( weight )
-# df_weight = pd.concat(list_weights, axis=1)
-# fig = px.line(df_weight)
-# fig.show(renderer='browser')
-
-# from analytics import correlation_matrix
-# list_close = []
-# for x in bt.risk_manager.get_live_symbols():
-#     close = bt.strategy.get_records(x)['close'].astype(float)
-#     close.name = x
-#     list_close.append( close )
-# df_close = pd.concat(list_close, axis=1)
-# corr_matrix = correlation_matrix(df_close.diff().dropna(), lookback=60)
-# corr_matrix = correlation_matrix(df_close.diff().dropna(), lookback=60, shrinkage='ledoit_wolf')
-# display(corr_matrix)
