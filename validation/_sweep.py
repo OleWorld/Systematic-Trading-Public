@@ -312,9 +312,9 @@ class _CellCache:
     Per-cell disk cache under ``root``: ``manifest.json`` (sweep identity;
     written on first use, compared strictly on reuse) + ``cells/<slug>/``
     with ``equity.parquet`` / ``trades.parquet`` / ``cell.json`` (params,
-    initial_capital, runtime_s, created_utc — written last inside a staged
-    ``<slug>.tmp`` dir that is atomically renamed, so a crash never leaves a
-    half-visible cell).
+    initial_capital, runtime_s, n_trades, created_utc — written last inside
+    a staged ``<slug>.tmp`` dir that is atomically renamed, so a crash never
+    leaves a half-visible cell).
     """
 
     def __init__(self, root, *, grid: Dict[str, list], timeframe: str,
@@ -352,6 +352,8 @@ class _CellCache:
             os.replace(tmp, manifest_path)
 
     def _cell_dir(self, params: Dict[str, Any]) -> Path:
+        """The cell's on-disk directory (slugged params, not necessarily
+        existing yet)."""
         return self.cells_dir / _slug_params(params)
 
     def has(self, params: Dict[str, Any]) -> bool:

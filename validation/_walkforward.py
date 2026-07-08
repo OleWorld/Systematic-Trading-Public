@@ -37,10 +37,16 @@ _STITCHED_LABELS = ['Sharpe Ratio', 'Sortino Ratio', 'Net PnL [$]',
 class WalkForwardResult:
     """
     ``folds``: one row per fold — IS/OOS bounds, the winner's params, its IS
-    selection score, and its OOS Sharpe / Net PnL / Max Drawdown.
+    selection score, and its OOS Sharpe / Net PnL / Max Drawdown. ``oos_end``
+    is the last actual bar in the window, or the exclusive window edge when
+    the winner's OOS slice is empty (Timedelta folds over gapped data).
     ``stitched_pnl``: the concatenated winners' OOS PnL (the honest OOS
     series). ``stitched_stats``: reduced stats over the stitched path
-    (percent metrics NaN unless every cell shares one initial capital).
+    (percent metrics NaN unless every cell shares one initial capital) —
+    when computable, the baseline for those percent stats is the cells'
+    shared ``initial_capital`` AT THE STITCH START, not the balance actually
+    entering the first OOS window (the stitched series starts at the first
+    fold's OOS window, which may be well after the backtest's true start).
     ``oos_matrix(metric)``: every cell's OOS window stat per fold — one
     column per cell (fixed-config consistency = read one column).
     """

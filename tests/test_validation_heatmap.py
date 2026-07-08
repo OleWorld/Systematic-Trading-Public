@@ -124,3 +124,13 @@ def test_all_nan_metric_has_no_best_cell():
     hm = _sweep().heatmap('Profit Factor')
     assert hm.best_cell is None
     assert hm.heatmap.isna().all().all()
+
+
+def test_non_numeric_metric_raises_clearly():
+    with pytest.raises(ValueError, match='not numeric'):
+        _sweep().heatmap('Start')
+
+
+def test_styled_all_nan_smoke():
+    styler = _sweep().heatmap('Profit Factor').styled()
+    assert 'Profit Factor' in styler.to_html()   # renders without gradient

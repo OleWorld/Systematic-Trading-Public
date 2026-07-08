@@ -115,7 +115,9 @@ def deflated_sharpe(sweep, *, n_trials: Optional[int] = None
     first kept bar (see ``window_pnl``). ``n_trials`` defaults to the cell
     count (conservative — correlated cells overstate the trial count);
     N<=1 or V=0 degrades SR0 to 0 (plain PSR). Raises on an empty sweep or
-    ``n_trials < 1``; an all-degenerate sweep yields ``dsr=NaN`` (data law).
+    ``n_trials < 1``; an all-degenerate sweep (no cell has a finite Sharpe)
+    yields ``dsr=NaN`` with ``winner_params`` set arbitrarily to the first
+    cell (grid order) and ``n_bars=0`` (data law).
     """
     keys = sweep.keys()
     if not keys:

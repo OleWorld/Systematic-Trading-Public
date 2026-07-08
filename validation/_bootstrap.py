@@ -56,7 +56,10 @@ def politis_white_block_length(values: np.ndarray) -> float:
     ``G = 2*sum(lam_k * k * gamma_k)`` and
     ``D = 2*(gamma_0 + 2*sum(lam_k * gamma_k))^2`` over flat-top weights
     ``lam_k``. Clamped to ``[1, min(3*sqrt(T), T/3)]``. Series shorter than
-    3 observations or constant return 1.0.
+    3 observations or constant return 1.0. This is the stationary-bootstrap
+    optimum; ``bootstrap_stats`` also applies it as the expected block
+    length for ``method='circular'``, whose own theoretical constant differs
+    by a factor of ~1.14x (accepted approximation, not re-derived here).
     """
     x = np.asarray(values, dtype=float)
     t = len(x)
@@ -99,7 +102,7 @@ def politis_white_block_length(values: np.ndarray) -> float:
 
 def _iid_indices(rng, t: int, b: int) -> np.ndarray:
     """IID resampling with replacement: (b, t) index matrix."""
-    return rng.integers(0, t, size=(b, t))
+    return rng.integers(0, t, size=(b, t)).astype(np.int32, copy=False)
 
 
 def _circular_indices(rng, t: int, b: int, block_length: float) -> np.ndarray:
@@ -109,7 +112,7 @@ def _circular_indices(rng, t: int, b: int, block_length: float) -> np.ndarray:
     starts = rng.integers(0, t, size=(b, n_blocks))
     offsets = np.arange(length)
     idx = (starts[:, :, None] + offsets[None, None, :]) % t
-    return idx.reshape(b, -1)[:, :t]
+    return idx.reshape(b, -1)[:, :t].astype(np.int32, copy=False)
 
 
 def _stationary_indices(rng, t: int, b: int, mean_block: float) -> np.ndarray:
@@ -125,7 +128,8 @@ def _stationary_indices(rng, t: int, b: int, mean_block: float) -> np.ndarray:
     block_start_pos = np.maximum.accumulate(
         np.where(new_block, pos, -1), axis=1)
     start_vals = np.take_along_axis(starts, block_start_pos, axis=1)
-    return (start_vals + (pos - block_start_pos)) % t
+    return ((start_vals + (pos - block_start_pos)) % t).astype(np.int32,
+                                                                copy=False)
 
 
 def _resample_indices(rng, t: int, b: int, method: str,
@@ -265,8 +269,10 @@ def bootstrap_stats(
     lo_q, hi_q = (1.0 - ci) / 2.0, (1.0 + ci) / 2.0
     for label in _METRIC_LABELS:
         d = dist[label]
-        table.loc[label, 'ci_low'] = float(np.nanquantile(d, lo_q))
-        table.loc[label, 'ci_high'] = float(np.nanquantile(d, hi_q))
+        d = d[~np.isnan(d)]
+        if len(d):
+            table.loc[label, 'ci_low'] = float(np.quantile(d, lo_q))
+            table.loc[label, 'ci_high'] = float(np.quantile(d, hi_q))
         estimate = table.loc[label, 'estimate']
         if label in _P_VALUE_METRICS and not pd.isna(estimate):
             nd = null[label]

@@ -66,11 +66,13 @@ class ParamHeatmap:
                 f"{k}={v}" for k, v in sorted(self.fixed.items())))
         bits.append(f"stats from {self.stats_start}"
                     if self.stats_start is not None else "stats: full history")
-        return (self.heatmap.style
-                .format('{:,.2f}', na_rep='—')
-                .background_gradient(cmap=cmap, axis=None)
-                .apply(_highlight, axis=None)
-                .set_caption(" — ".join(bits)))
+        styler = (self.heatmap.style
+                  .format('{:,.2f}', na_rep='—')
+                  .apply(_highlight, axis=None)
+                  .set_caption(" — ".join(bits)))
+        if self.best_cell is not None:      # all-NaN: gradient would warn
+            styler = styler.background_gradient(cmap=cmap, axis=None)
+        return styler
 
 
 def build_param_heatmap(sweep, *, metric: str, x: Optional[str],
@@ -131,7 +133,11 @@ def build_param_heatmap(sweep, *, metric: str, x: Optional[str],
         frame = (sub.set_index(x)[metric]
                  .reindex(sweep.grid[x]).to_frame().T)
         frame.index = [metric]
-    frame = frame.astype(float)
+    try:
+        frame = frame.astype(float)
+    except (TypeError, ValueError):
+        raise ValueError(f"metric {metric!r} is not numeric — heatmaps "
+                         f"require a numeric stats column")
 
     best_cell = None
     values = frame.to_numpy(dtype=float)

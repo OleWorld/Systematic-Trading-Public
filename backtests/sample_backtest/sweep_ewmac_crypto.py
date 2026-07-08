@@ -43,6 +43,8 @@ _counts = pd.Series({sym: len(g) for sym, g in _grouped.items()})
 # deterministic selection: row count desc, ties broken alphabetically (58
 # symbols share the max history in the bundled CSV — an unstable sort would
 # pick an implementation-dependent 10)
+# (selection order: count desc; SYMBOLS is then re-sorted alphabetically for
+# presentation)
 _by_history = sorted(_counts.index, key=lambda s: (-_counts[s], s))
 SYMBOLS = sorted(_by_history[:10])
 DATA = {
