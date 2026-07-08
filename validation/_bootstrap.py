@@ -139,3 +139,138 @@ def _resample_indices(rng, t: int, b: int, method: str,
         return _iid_indices(rng, t, b)
     else:
         raise ValueError(f"Unexpected method: {method!r}")
+
+
+@dataclass(frozen=True)
+class BootstrapResult:
+    """
+    Result of ``bootstrap_stats``: ``table`` is indexed by metric label with
+    columns ``estimate`` (from the real series — identical to
+    ``analytics.backtest_stats``), ``ci_low``/``ci_high`` (percentile CI),
+    and ``p_value`` (one-sided vs the zero-mean-PnL null; NaN for drawdown
+    metrics). ``block_length`` is the resolved expected block length (1.0
+    for ``'iid'``). ``print(result.table)`` is the display.
+    """
+    table: pd.DataFrame
+    method: str
+    block_length: float
+    n_resamples: int
+    ci: float
+    seed: Optional[int]
+    n_bars: int
+
+
+def _metrics_on_paths(pnl_matrix: np.ndarray, *, initial_capital: float,
+                      bpy: float) -> Dict[str, np.ndarray]:
+    """Vectorized metric set over (B, T) PnL paths; conventions match
+    ``analytics.backtest_stats`` (peak seeded at ``initial_capital``)."""
+    b, t = pnl_matrix.shape
+    net = pnl_matrix.sum(axis=1)
+    mean = pnl_matrix.mean(axis=1)
+    std = pnl_matrix.std(axis=1, ddof=1) if t >= 2 else np.full(b, _NAN)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        sharpe = np.where(std > 0, mean / std * math.sqrt(bpy), _NAN)
+    balance = initial_capital + np.cumsum(pnl_matrix, axis=1)
+    peak = np.maximum(np.maximum.accumulate(balance, axis=1), initial_capital)
+    dd_usd = (peak - balance).max(axis=1)
+    dd_pct = (100.0 * (peak - balance) / peak).max(axis=1)
+    years = t / bpy
+    final = balance[:, -1]
+    with np.errstate(invalid='ignore'):
+        cagr = np.where(
+            (years > 0) & (final > 0),
+            100.0 * ((final / initial_capital) ** (1.0 / years) - 1.0), _NAN)
+    return {'Sharpe Ratio': sharpe, 'Net PnL [$]': net, 'CAGR [%]': cagr,
+            'Max Drawdown [$]': dd_usd, 'Max Drawdown [%]': dd_pct}
+
+
+def bootstrap_stats(
+    equity_curve: pd.DataFrame,
+    *,
+    initial_capital: float,
+    timeframe: str,
+    days_convention: str,
+    start=None,
+    n_resamples: int = 5000,
+    method: str = 'stationary',
+    block_length: Optional[float] = None,
+    ci: float = 0.95,
+    seed: Optional[int] = None,
+) -> BootstrapResult:
+    """
+    Bootstrap CIs and p-values on backtest metrics from an equity curve.
+
+    Derives per-bar dollar PnL per the ``analytics.backtest_stats``
+    conventions (optional ``start`` trims the warmup head), resamples it
+    ``n_resamples`` times with ``method`` (``'stationary'`` default /
+    ``'circular'`` / ``'iid'``), and reports, per metric: the real-series
+    estimate, the ``ci`` percentile interval, and — for Sharpe / Net PnL /
+    CAGR — a one-sided p-value under H0: zero-mean PnL (the observed PnL is
+    mean-centered and re-resampled; ``p = (1+#{stat* >= estimate})/(B+1)``).
+    ``block_length=None`` resolves via ``politis_white_block_length``.
+    Bad params raise; degenerate data (empty, T<3, zero variance) yields
+    NaN cells, never a raise.
+    """
+    bpy = _bars_per_year(timeframe, days_convention)   # raises on bad inputs
+    if method not in _METHODS:
+        raise ValueError(f"Unexpected method: {method!r}")
+    if not isinstance(n_resamples, int) or n_resamples < 1:
+        raise ValueError(f"n_resamples must be a positive int, got {n_resamples}")
+    if not 0.0 < ci < 1.0:
+        raise ValueError(f"ci must be in (0, 1), got {ci}")
+    if block_length is not None and block_length <= 0:
+        raise ValueError(f"block_length must be > 0, got {block_length}")
+    pnl = pnl_from_equity(equity_curve, initial_capital=initial_capital,
+                          start=start)
+    vals = pnl.to_numpy(dtype=float)
+    t = len(vals)
+
+    table = pd.DataFrame(_NAN, index=list(_METRIC_LABELS),
+                         columns=['estimate', 'ci_low', 'ci_high', 'p_value'])
+    if t > 0:
+        est = _metrics_on_paths(vals[None, :], initial_capital=initial_capital,
+                                bpy=bpy)
+        for label in _METRIC_LABELS:
+            table.loc[label, 'estimate'] = float(est[label][0])
+
+    if t < _MIN_PNL_OBS:
+        degenerate = True
+    else:
+        degenerate = float(np.std(vals, ddof=1)) == 0.0
+    if degenerate:
+        logger.debug("bootstrap_stats: degenerate PnL (T=%d) — NaN CIs", t)
+        return BootstrapResult(table=table, method=method,
+                               block_length=_NAN, n_resamples=n_resamples,
+                               ci=ci, seed=seed, n_bars=t)
+
+    if method == 'iid':
+        resolved = 1.0
+    elif block_length is not None:
+        resolved = float(block_length)
+    else:
+        resolved = politis_white_block_length(vals)
+
+    rng = np.random.default_rng(seed)
+    idx = _resample_indices(rng, t, n_resamples, method, resolved)
+    dist = _metrics_on_paths(vals[idx], initial_capital=initial_capital,
+                             bpy=bpy)
+    centered = vals - vals.mean()
+    idx_null = _resample_indices(rng, t, n_resamples, method, resolved)
+    null = _metrics_on_paths(centered[idx_null],
+                             initial_capital=initial_capital, bpy=bpy)
+
+    lo_q, hi_q = (1.0 - ci) / 2.0, (1.0 + ci) / 2.0
+    for label in _METRIC_LABELS:
+        d = dist[label]
+        table.loc[label, 'ci_low'] = float(np.nanquantile(d, lo_q))
+        table.loc[label, 'ci_high'] = float(np.nanquantile(d, hi_q))
+        estimate = table.loc[label, 'estimate']
+        if label in _P_VALUE_METRICS and not pd.isna(estimate):
+            nd = null[label]
+            nd = nd[~np.isnan(nd)]
+            if len(nd):
+                table.loc[label, 'p_value'] = float(
+                    (1 + np.sum(nd >= estimate)) / (len(nd) + 1))
+    return BootstrapResult(table=table, method=method, block_length=resolved,
+                           n_resamples=n_resamples, ci=ci, seed=seed,
+                           n_bars=t)

@@ -148,3 +148,100 @@ def test_block_length_matches_naive_reference():
         x = _ar1(t, phi=phi, seed=seed)
         assert politis_white_block_length(x) == pytest.approx(
             _naive_politis_white(list(x)), rel=1e-9), (phi, seed, t)
+
+
+from analytics import backtest_stats
+from validation import BootstrapResult, bootstrap_stats
+
+
+def _drift_equity(t=400, drift=200.0, noise=1_000.0, seed=11, ic=1_000_000):
+    rng = np.random.default_rng(seed)
+    pnl = rng.normal(drift, noise, size=t)
+    idx = pd.date_range('2023-01-01', periods=t, freq='D', tz='UTC')
+    return pd.DataFrame({'account_balance': ic + np.cumsum(pnl),
+                         'total_commission': 0.0}, index=idx)
+
+
+def test_estimates_equal_backtest_stats():
+    eq = _drift_equity()
+    res = bootstrap_stats(eq, initial_capital=1_000_000, timeframe='1d',
+                          days_convention='calendar', n_resamples=50, seed=0)
+    bs = backtest_stats(eq, pd.DataFrame(), initial_capital=1_000_000,
+                        timeframe='1d', days_convention='calendar')
+    for label in ('Sharpe Ratio', 'Net PnL [$]', 'CAGR [%]',
+                  'Max Drawdown [$]', 'Max Drawdown [%]'):
+        assert res.table.loc[label, 'estimate'] == pytest.approx(
+            float(bs[label]), rel=1e-12), label
+
+
+def test_result_shape_and_determinism():
+    eq = _drift_equity()
+    kw = dict(initial_capital=1_000_000, timeframe='1d',
+              days_convention='calendar', n_resamples=200, seed=42)
+    a = bootstrap_stats(eq, **kw)
+    b = bootstrap_stats(eq, **kw)
+    assert isinstance(a, BootstrapResult)
+    assert list(a.table.columns) == ['estimate', 'ci_low', 'ci_high', 'p_value']
+    assert list(a.table.index) == ['Sharpe Ratio', 'Net PnL [$]', 'CAGR [%]',
+                                   'Max Drawdown [$]', 'Max Drawdown [%]']
+    pd.testing.assert_frame_equal(a.table, b.table)
+    assert a.block_length == b.block_length and a.n_bars == 400
+
+
+def test_pvalue_small_for_strong_drift_large_for_noise():
+    strong = bootstrap_stats(_drift_equity(drift=500.0, noise=1_000.0),
+                             initial_capital=1_000_000, timeframe='1d',
+                             days_convention='calendar',
+                             n_resamples=500, seed=1)
+    # negative drift => the null must NOT be rejected, robustly (p > 0.5-ish)
+    noise = bootstrap_stats(_drift_equity(drift=-100.0, noise=1_000.0, seed=13),
+                            initial_capital=1_000_000, timeframe='1d',
+                            days_convention='calendar',
+                            n_resamples=500, seed=1)
+    assert strong.table.loc['Sharpe Ratio', 'p_value'] < 0.01
+    assert noise.table.loc['Sharpe Ratio', 'p_value'] > 0.3
+    assert pd.isna(strong.table.loc['Max Drawdown [$]', 'p_value'])
+
+
+def test_ci_brackets_estimate_and_respects_level():
+    res = bootstrap_stats(_drift_equity(), initial_capital=1_000_000,
+                          timeframe='1d', days_convention='calendar',
+                          n_resamples=500, ci=0.90, seed=2)
+    row = res.table.loc['Sharpe Ratio']
+    assert row['ci_low'] < row['estimate'] < row['ci_high']
+
+
+def test_param_validation_raises():
+    eq = _drift_equity(t=10)
+    kw = dict(initial_capital=1_000_000, timeframe='1d',
+              days_convention='calendar')
+    with pytest.raises(ValueError):
+        bootstrap_stats(eq, **kw, method='parametric')
+    with pytest.raises(ValueError):
+        bootstrap_stats(eq, **kw, n_resamples=0)
+    with pytest.raises(ValueError):
+        bootstrap_stats(eq, **kw, ci=1.0)
+    with pytest.raises(ValueError):
+        bootstrap_stats(eq, **kw, block_length=0.0)
+    with pytest.raises(ValueError):
+        bootstrap_stats(eq, initial_capital=-1.0, timeframe='1d',
+                        days_convention='calendar')
+
+
+def test_degenerate_data_gives_nan_never_raises():
+    res = bootstrap_stats(pd.DataFrame(), initial_capital=1_000_000,
+                          timeframe='1d', days_convention='calendar')
+    assert res.table['ci_low'].isna().all() and res.n_bars == 0
+    idx = pd.date_range('2024-01-01', periods=5, freq='D', tz='UTC')
+    flat = pd.DataFrame({'account_balance': 1_000_000.0,
+                         'total_commission': 0.0}, index=idx)
+    res = bootstrap_stats(flat, initial_capital=1_000_000, timeframe='1d',
+                          days_convention='calendar', n_resamples=50, seed=0)
+    assert pd.isna(res.table.loc['Sharpe Ratio', 'ci_low'])   # zero variance
+
+
+def test_explicit_block_length_is_used():
+    res = bootstrap_stats(_drift_equity(), initial_capital=1_000_000,
+                          timeframe='1d', days_convention='calendar',
+                          n_resamples=50, block_length=7.5, seed=0)
+    assert res.block_length == 7.5

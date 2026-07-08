@@ -8,4 +8,7 @@ run factories — never imports the engine. Callers do
 ``from validation import ...``.
 """
 
-__all__ = []
+from ._bootstrap import (BootstrapResult, bootstrap_stats,
+                         politis_white_block_length)
+
+__all__ = ['BootstrapResult', 'bootstrap_stats', 'politis_white_block_length']
