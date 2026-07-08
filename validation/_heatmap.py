@@ -140,6 +140,9 @@ def build_param_heatmap(sweep, *, metric: str, x: Optional[str],
                 else np.nanargmax(values))
         r, c = np.unravel_index(int(flat), values.shape)
         best_cell = (frame.index[r], frame.columns[c])
+    else:
+        logger.debug("build_param_heatmap: every cell is NaN for %r — "
+                     "no best cell", metric)
     return ParamHeatmap(heatmap=frame, metric=metric, x=x, y=y, fixed=fixed,
                         best_cell=best_cell,
                         stats_start=sweep.stats_start_resolved)

@@ -116,3 +116,11 @@ def test_drawdown_best_cell_minimizes():
     table = sweep.table.set_index(['fast', 'slow'])['Max Drawdown [$]']
     fast, slow = table.idxmin()
     assert hm.best_cell == (slow, fast)   # (y_val, x_val)
+
+
+def test_all_nan_metric_has_no_best_cell():
+    # the fakes' fills are all winners -> zero gross loss -> Profit Factor is
+    # NaN for every cell (backtest_stats convention), so no best cell exists
+    hm = _sweep().heatmap('Profit Factor')
+    assert hm.best_cell is None
+    assert hm.heatmap.isna().all().all()
