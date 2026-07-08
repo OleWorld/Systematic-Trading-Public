@@ -50,6 +50,16 @@ def test_pnl_empty_curve_gives_empty_series():
     assert pnl_from_equity(pd.DataFrame(), initial_capital=1000.0).empty
 
 
+def test_pnl_start_accepts_tz_aware_first_fill_output():
+    """first_fill() -> pnl_from_equity(start=...) is the documented warmup
+    trim composition; its tz-aware timestamp must not raise."""
+    eq = _equity([1010.0, 1005.0, 1030.0])
+    log = pd.DataFrame({'timestamp': pd.to_datetime(['2024-01-02'], utc=True),
+                        'realized_pnl': [1.0]})
+    pnl = pnl_from_equity(eq, initial_capital=1000.0, start=first_fill(log))
+    assert list(pnl) == [5.0, 25.0]
+
+
 def test_window_stats_matches_backtest_stats_conventions():
     rng = np.random.default_rng(7)
     balances = 1_000_000 + np.cumsum(rng.normal(50, 1_000, size=300))

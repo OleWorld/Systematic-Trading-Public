@@ -54,6 +54,8 @@ def pnl_from_equity(
     collapse -> optional ``start`` trim -> ``balance.diff()`` with the first
     kept bar measured against ``initial_capital`` (pre-``start`` PnL folds
     into the first kept bar — the documented ``backtest_stats`` semantics).
+    A naive ``start`` is interpreted as UTC; a tz-aware ``start`` (e.g. the
+    output of ``first_fill``) passes through unchanged.
     Empty input yields an empty float Series; a non-empty curve without
     ``account_balance`` raises ``ValueError``; ``initial_capital <= 0`` raises.
     """
@@ -61,7 +63,9 @@ def pnl_from_equity(
         raise ValueError(f"initial_capital must be > 0, got {initial_capital}")
     eq = collapse_equity(equity_curve)
     if start is not None and not eq.empty:
-        start_ts = pd.Timestamp(start, tz='UTC')
+        start_ts = pd.Timestamp(start)
+        if start_ts.tzinfo is None:
+            start_ts = start_ts.tz_localize('UTC')
         eq = eq.loc[eq.index >= start_ts]
     if eq.empty:
         return pd.Series(dtype=float)
