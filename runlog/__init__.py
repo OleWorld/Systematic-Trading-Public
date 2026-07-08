@@ -11,10 +11,11 @@ and environment metadata. ``load_run(path)`` returns a ``RunRecord``
 handle for offline analysis; ``list_runs(root)`` browses the run history
 from manifests alone.
 
-Callers do ``from runlog import save_run, load_run, list_runs``.
+Callers do ``from runlog import save_run, load_run, list_runs, sanitize_frame``.
 """
 
 from ._load import RunRecord, list_runs, load_run
 from ._save import save_run
+from ._serialize import sanitize_frame
 
-__all__ = ['RunRecord', 'list_runs', 'load_run', 'save_run']
+__all__ = ['RunRecord', 'list_runs', 'load_run', 'sanitize_frame', 'save_run']

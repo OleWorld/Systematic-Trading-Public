@@ -643,3 +643,12 @@ def test_integration_real_mini_backtest(tmp_path):
         float(stats['Net PnL [$]']))
     assert float(recomputed['Sharpe Ratio']) == pytest.approx(
         float(stats['Sharpe Ratio']), nan_ok=True)
+
+
+def test_sanitize_frame_is_re_exported():
+    """sanitize_frame is public API (consumed by validation's sweep cache)."""
+    import runlog
+    from runlog._serialize import sanitize_frame as private
+
+    assert runlog.sanitize_frame is private
+    assert 'sanitize_frame' in runlog.__all__
