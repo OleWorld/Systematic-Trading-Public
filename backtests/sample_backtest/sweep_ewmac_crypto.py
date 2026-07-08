@@ -40,7 +40,11 @@ _raw['timestamp'] = pd.to_datetime(_raw['timestamp'], utc=True)
 _grouped = {sym: g for sym, g in _raw.groupby('symbol')
             if sym not in ('USDC_USDT:USDT', 'USTC_USDT:USDT')}
 _counts = pd.Series({sym: len(g) for sym, g in _grouped.items()})
-SYMBOLS = sorted(_counts.sort_values(ascending=False).index[:10])
+# deterministic selection: row count desc, ties broken alphabetically (58
+# symbols share the max history in the bundled CSV — an unstable sort would
+# pick an implementation-dependent 10)
+_by_history = sorted(_counts.index, key=lambda s: (-_counts[s], s))
+SYMBOLS = sorted(_by_history[:10])
 DATA = {
     sym: _grouped[sym].set_index('timestamp')[
         ['Open', 'High', 'Low', 'Close', 'Volume']]
