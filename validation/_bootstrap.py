@@ -64,6 +64,8 @@ def politis_white_block_length(values: np.ndarray) -> float:
         return 1.0
     x_c = x - x.mean()
     denom = float(np.dot(x_c, x_c))          # T * biased variance
+    # sqrt(log10 T) vs some references' log10 T: both floor at 5 for any
+    # realistic T, so the choice is deliberate and functionally inert.
     k_n = max(5, int(math.sqrt(math.log10(t))))
     n_lags = min(int(math.ceil(math.sqrt(t))) + k_n, t - 1)
     rho = np.array([float(np.dot(x_c[k:], x_c[:-k])) / denom

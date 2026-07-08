@@ -1,5 +1,7 @@
 """Tests for validation._bootstrap — resampling machinery + bootstrap_stats."""
 
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -86,3 +88,63 @@ def test_stationary_blocks_are_contiguous_runs():
     steps = (idx[:, 1:] - idx[:, :-1]) % 200
     frac_contiguous = float((steps == 1).mean())
     assert 0.8 < frac_contiguous < 0.95   # ~1 - 1/block_length
+
+
+def _naive_politis_white(x):
+    """Scalar-loop transcription of the documented Politis-White algorithm,
+    independent of the vectorized production code — guards against
+    indexing/coefficient slips between the two."""
+    t = len(x)
+    if t < 3:
+        return 1.0
+    mean = sum(x) / t
+    xc = [v - mean for v in x]
+    denom = sum(v * v for v in xc)
+    if denom == 0.0:
+        return 1.0
+
+    def autocov(k):
+        return sum(xc[i + k] * xc[i] for i in range(t - k)) / t
+
+    gamma0 = denom / t
+    k_n = max(5, int(math.sqrt(math.log10(t))))
+    n_lags = min(int(math.ceil(math.sqrt(t))) + k_n, t - 1)
+    threshold = 2.0 * math.sqrt(math.log10(t) / t)
+    rho = [autocov(k) / gamma0 for k in range(1, n_lags + 1)]
+    m_hat = None
+    for m in range(0, n_lags - k_n + 1):
+        if all(abs(r) < threshold for r in rho[m:m + k_n]):
+            m_hat = m
+            break
+    if m_hat is None:
+        m_hat = max(1, n_lags - k_n)
+    big_m = min(2 * m_hat, t - 1)
+    if big_m < 1:
+        return 1.0
+
+    def lam(u):
+        au = abs(u)
+        if au <= 0.5:
+            return 1.0
+        if au <= 1.0:
+            return 2.0 * (1.0 - au)
+        return 0.0
+
+    g = 2.0 * sum(lam(k / big_m) * k * autocov(k)
+                  for k in range(1, big_m + 1))
+    d = 2.0 * (gamma0 + 2.0 * sum(lam(k / big_m) * autocov(k)
+                                  for k in range(1, big_m + 1))) ** 2
+    if d <= 0.0:
+        return 1.0
+    b = ((2.0 * g * g) / d) ** (1.0 / 3.0) * t ** (1.0 / 3.0)
+    return float(min(max(b, 1.0), min(3.0 * math.sqrt(t), t / 3.0)))
+
+
+def test_block_length_matches_naive_reference():
+    """Vectorized production estimator == independent loop transcription
+    (golden cross-check, same pattern as the strategies' vectorized
+    recomputation tests)."""
+    for phi, seed, t in ((0.0, 1, 200), (0.5, 3, 500), (0.9, 2, 800)):
+        x = _ar1(t, phi=phi, seed=seed)
+        assert politis_white_block_length(x) == pytest.approx(
+            _naive_politis_white(list(x)), rel=1e-9), (phi, seed, t)
