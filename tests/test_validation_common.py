@@ -6,7 +6,7 @@ import pytest
 
 from analytics import backtest_stats
 from validation._common import (collapse_equity, first_fill, is_lower_better,
-                                pnl_from_equity, window_stats)
+                                pnl_from_equity, window_pnl, window_stats)
 
 
 def _equity(balances, start='2024-01-01', commission=0.0):
@@ -93,6 +93,17 @@ def test_is_lower_better():
     assert is_lower_better('Max Drawdown [$]')
     assert is_lower_better('Avg Drawdown [%]')
     assert not is_lower_better('Sharpe Ratio')
+
+
+def test_window_pnl_slices_and_reseeds():
+    from validation._common import window_pnl
+    eq = _equity([1010.0, 1005.0, 1030.0])
+    pnl, baseline = window_pnl(eq, initial_capital=1000.0,
+                               start='2024-01-02')
+    assert list(pnl) == [-5.0, 25.0]          # true bar diffs, no fold-in
+    assert baseline == 1010.0                 # entering balance
+    full, base0 = window_pnl(eq, initial_capital=1000.0)
+    assert list(full) == [10.0, -5.0, 25.0] and base0 == 1000.0
 
 
 def test_first_fill():

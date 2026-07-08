@@ -20,7 +20,7 @@ import pandas as pd
 
 from volatility import bars_per_year as _bars_per_year
 
-from ._common import pnl_from_equity
+from ._common import window_pnl
 
 logger = logging.getLogger(__name__)
 
@@ -200,9 +200,12 @@ def bootstrap_stats(
     """
     Bootstrap CIs and p-values on backtest metrics from an equity curve.
 
-    Derives per-bar dollar PnL per the ``analytics.backtest_stats``
-    conventions (optional ``start`` trims the warmup head), resamples it
-    ``n_resamples`` times with ``method`` (``'stationary'`` default /
+    Derives per-bar dollar PnL from the full history, then windows it:
+    ``start`` slices to ``index >= start`` and reseeds the baseline to the
+    true balance entering the window (no fold-in — see ``window_pnl``);
+    with ``start=None`` the estimates are identical to
+    ``analytics.backtest_stats`` on the same curve. Resamples the windowed
+    PnL ``n_resamples`` times with ``method`` (``'stationary'`` default /
     ``'circular'`` / ``'iid'``), and reports, per metric: the real-series
     estimate, the ``ci`` percentile interval, and — for Sharpe / Net PnL /
     CAGR — a one-sided p-value under H0: zero-mean PnL (the observed PnL is
@@ -220,15 +223,15 @@ def bootstrap_stats(
         raise ValueError(f"ci must be in (0, 1), got {ci}")
     if block_length is not None and block_length <= 0:
         raise ValueError(f"block_length must be > 0, got {block_length}")
-    pnl = pnl_from_equity(equity_curve, initial_capital=initial_capital,
-                          start=start)
+    pnl, baseline = window_pnl(equity_curve,
+                               initial_capital=initial_capital, start=start)
     vals = pnl.to_numpy(dtype=float)
     t = len(vals)
 
     table = pd.DataFrame(_NAN, index=list(_METRIC_LABELS),
                          columns=['estimate', 'ci_low', 'ci_high', 'p_value'])
     if t > 0:
-        est = _metrics_on_paths(vals[None, :], initial_capital=initial_capital,
+        est = _metrics_on_paths(vals[None, :], initial_capital=baseline,
                                 bpy=bpy)
         for label in _METRIC_LABELS:
             table.loc[label, 'estimate'] = float(est[label][0])
@@ -252,12 +255,12 @@ def bootstrap_stats(
 
     rng = np.random.default_rng(seed)
     idx = _resample_indices(rng, t, n_resamples, method, resolved)
-    dist = _metrics_on_paths(vals[idx], initial_capital=initial_capital,
+    dist = _metrics_on_paths(vals[idx], initial_capital=baseline,
                              bpy=bpy)
     centered = vals - vals.mean()
     idx_null = _resample_indices(rng, t, n_resamples, method, resolved)
     null = _metrics_on_paths(centered[idx_null],
-                             initial_capital=initial_capital, bpy=bpy)
+                             initial_capital=baseline, bpy=bpy)
 
     lo_q, hi_q = (1.0 - ci) / 2.0, (1.0 + ci) / 2.0
     for label in _METRIC_LABELS:

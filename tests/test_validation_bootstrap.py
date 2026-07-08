@@ -245,3 +245,23 @@ def test_explicit_block_length_is_used():
                           timeframe='1d', days_convention='calendar',
                           n_resamples=50, block_length=7.5, seed=0)
     assert res.block_length == 7.5
+
+
+def test_trimmed_estimates_equal_standalone_window():
+    """A non-flat head must not fold a spike bar into the window: trimming
+    with start= is equivalent to bootstrapping the window as its own curve
+    seeded with the true entering balance."""
+    rng = np.random.default_rng(3)
+    pnl_all = np.concatenate([np.full(69, 200.0),           # non-flat head
+                              rng.normal(50.0, 1_000.0, size=300)])
+    idx = pd.date_range('2023-01-01', periods=369, freq='D', tz='UTC')
+    eq = pd.DataFrame({'account_balance': 1_000_000 + np.cumsum(pnl_all),
+                       'total_commission': 0.0}, index=idx)
+    start = idx[69]
+    kw = dict(timeframe='1d', days_convention='calendar',
+              n_resamples=200, seed=0)
+    res = bootstrap_stats(eq, initial_capital=1_000_000, start=start, **kw)
+    ref = bootstrap_stats(eq.loc[start:],
+                          initial_capital=1_000_000 + 200.0 * 69, **kw)
+    pd.testing.assert_frame_equal(res.table, ref.table)
+    assert res.n_bars == 300

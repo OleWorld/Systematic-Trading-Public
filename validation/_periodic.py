@@ -16,7 +16,7 @@ import pandas as pd
 
 from volatility import bars_per_year as _bars_per_year
 
-from ._common import pnl_from_equity, window_stats
+from ._common import window_pnl, window_stats
 
 logger = logging.getLogger(__name__)
 
@@ -45,26 +45,22 @@ def periodic_stats(
     period (deliberately different from the ``backtest_stats`` trim, whose
     baseline stays ``initial_capital``): a periodic table measures each
     period from its actual starting equity. Bad params raise; empty
-    inputs yield an empty fixed-schema frame; periods with < 2 bars carry
-    NaN ratio stats (data law).
+    inputs yield an empty fixed-schema frame; degenerate periods carry NaN
+    Sharpe/volatility; Sortino may still compute on a single negative bar
+    (matches the ``backtest_stats`` downside convention).
     """
     if not isinstance(trade_log, pd.DataFrame):
         raise TypeError(
             f"trade_log must be a DataFrame, got {type(trade_log).__name__}")
     bpy = _bars_per_year(timeframe, days_convention)     # raises on bad input
     try:
-        pd.tseries.frequencies.to_offset(freq)
+        offset = pd.tseries.frequencies.to_offset(freq)
     except ValueError:
+        offset = None
+    if offset is None:
         raise ValueError(f"freq must be a pandas offset alias, got {freq!r}")
-    pnl = pnl_from_equity(equity_curve, initial_capital=initial_capital)
-    baseline = float(initial_capital)
-    if start is not None and not pnl.empty:
-        start_ts = pd.Timestamp(start)
-        if start_ts.tzinfo is None:        # naive start = UTC
-            start_ts = start_ts.tz_localize('UTC')
-        # reseed to the true balance entering the window (see docstring)
-        baseline += float(pnl[pnl.index < start_ts].sum())
-        pnl = pnl[pnl.index >= start_ts]
+    pnl, baseline = window_pnl(equity_curve,
+                               initial_capital=initial_capital, start=start)
     if pnl.empty:
         logger.debug("periodic_stats: no bars in window — empty table")
         return pd.DataFrame(columns=_COLUMNS)

@@ -81,6 +81,9 @@ def test_edge_and_param_law():
         periodic_stats(pd.DataFrame(), pd.DataFrame(), initial_capital=1.0,
                        timeframe='1d', days_convention='calendar',
                        freq='not-a-freq')
+    with pytest.raises(ValueError):
+        periodic_stats(pd.DataFrame(), pd.DataFrame(), initial_capital=1.0,
+                       timeframe='1d', days_convention='calendar', freq=None)
     with pytest.raises(TypeError):
         periodic_stats('nope', pd.DataFrame(), initial_capital=1.0,
                        timeframe='1d', days_convention='calendar')

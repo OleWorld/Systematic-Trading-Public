@@ -119,3 +119,18 @@ def test_dsr_validation():
     sweep = _sweep()
     with pytest.raises(ValueError):
         deflated_sharpe(sweep, n_trials=0)
+
+
+def test_psr_trim_is_window_slice_not_fold_in():
+    head = np.full(69, 200.0)
+    rng = np.random.default_rng(3)
+    pnl_all = np.concatenate([head, rng.normal(50.0, 1_000.0, size=300)])
+    eq = _equity_from_pnl(pnl_all)
+    start = eq.index[69]
+    kw = dict(timeframe='1d', days_convention='calendar')
+    trimmed = probabilistic_sharpe(eq, initial_capital=1_000_000.0,
+                                   start=start, **kw)
+    standalone = probabilistic_sharpe(eq.loc[start:],
+                                      initial_capital=1_000_000.0
+                                      + 200.0 * 69, **kw)
+    assert trimmed == pytest.approx(standalone, rel=1e-12)

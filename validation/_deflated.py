@@ -25,7 +25,7 @@ from scipy.stats import skew as _skew
 
 from volatility import bars_per_year as _bars_per_year
 
-from ._common import pnl_from_equity
+from ._common import window_pnl
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +76,13 @@ def probabilistic_sharpe(
     PSR of a backtest: probability its true Sharpe exceeds
     ``benchmark_sharpe`` (given in ANNUALIZED units; de-annualized
     internally), adjusting for track length, skew, and kurtosis of the
-    per-bar dollar PnL. Degenerate data (T<3, zero variance) yields NaN.
+    per-bar dollar PnL. ``start`` windows the series without folding
+    pre-start PnL into the first kept bar (see ``window_pnl``). Degenerate
+    data (T<3, zero variance) yields NaN.
     """
     bpy = _bars_per_year(timeframe, days_convention)
-    pnl = pnl_from_equity(equity_curve, initial_capital=initial_capital,
-                          start=start)
+    pnl, _ = window_pnl(equity_curve, initial_capital=initial_capital,
+                        start=start)
     return _psr(pnl.to_numpy(dtype=float),
                 float(benchmark_sharpe) / math.sqrt(bpy))
 
@@ -109,10 +111,11 @@ def deflated_sharpe(sweep, *, n_trials: Optional[int] = None
     against ``SR0 = sqrt(V[{SR_n}]) * ((1-gamma)*ppf(1-1/N) +
     gamma*ppf(1-1/(N*e)))`` — the expected maximum Sharpe of N zero-skill
     trials. Per-cell per-bar Sharpes use the sweep's ``stats_start`` trim.
-    ``n_trials`` defaults to the cell count (conservative — correlated
-    cells overstate the trial count); N<=1 or V=0 degrades SR0 to 0 (plain
-    PSR). Raises on an empty sweep or ``n_trials < 1``; an all-degenerate
-    sweep yields ``dsr=NaN`` (data law).
+    ``start`` windows the series without folding pre-start PnL into the
+    first kept bar (see ``window_pnl``). ``n_trials`` defaults to the cell
+    count (conservative — correlated cells overstate the trial count);
+    N<=1 or V=0 degrades SR0 to 0 (plain PSR). Raises on an empty sweep or
+    ``n_trials < 1``; an all-degenerate sweep yields ``dsr=NaN`` (data law).
     """
     keys = sweep.keys()
     if not keys:
@@ -128,9 +131,9 @@ def deflated_sharpe(sweep, *, n_trials: Optional[int] = None
     pnls: Dict[tuple, np.ndarray] = {}
     for key in keys:
         params = dict(zip(sweep.param_names, key))
-        pnl = pnl_from_equity(sweep.equity(**params),
-                              initial_capital=sweep.initial_capital(**params),
-                              start=start)
+        pnl, _ = window_pnl(sweep.equity(**params),
+                            initial_capital=sweep.initial_capital(**params),
+                            start=start)
         vals = pnl.to_numpy(dtype=float)
         pnls[key] = vals
         srs[key] = _per_bar_sharpe(vals)

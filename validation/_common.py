@@ -78,6 +78,34 @@ def pnl_from_equity(
     return pnl
 
 
+def window_pnl(
+    equity_curve: pd.DataFrame,
+    *,
+    initial_capital: float,
+    start=None,
+):
+    """Window view of the per-bar dollar PnL: the full-history series sliced
+    to ``index >= start``, plus the TRUE balance entering the window
+    (``initial_capital`` + pre-start PnL). Unlike the ``backtest_stats``
+    fold-in trim (``pnl_from_equity(start=...)``), no pre-start PnL folds
+    into the first kept bar — a non-flat head would otherwise inject a
+    synthetic spike bar that distorts the window's moments. This is the
+    derivation for inference-grade statistics (bootstrap, PSR/DSR) and the
+    periodic regime table. A naive ``start`` is interpreted as UTC.
+    Returns ``(pnl, entering_balance)``; ``start=None`` returns the full
+    series with ``initial_capital`` as the baseline.
+    """
+    pnl = pnl_from_equity(equity_curve, initial_capital=initial_capital)
+    baseline = float(initial_capital)
+    if start is not None and not pnl.empty:
+        start_ts = pd.Timestamp(start)
+        if start_ts.tzinfo is None:        # naive start = UTC
+            start_ts = start_ts.tz_localize('UTC')
+        baseline += float(pnl[pnl.index < start_ts].sum())
+        pnl = pnl[pnl.index >= start_ts]
+    return pnl, baseline
+
+
 def window_stats(
     pnl: pd.Series,
     *,
