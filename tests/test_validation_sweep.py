@@ -135,3 +135,83 @@ def test_factory_exception_propagates():
     with pytest.raises(RuntimeError, match='factory blew up'):
         param_sweep(boom, grid={'fast': [4]}, timeframe='1d',
                     days_convention='calendar')
+
+
+from validation import load_sweep
+
+
+def test_cache_roundtrip_and_resume(tmp_path):
+    cache = tmp_path / 'sweep'
+    calls = []
+    kw = dict(grid={'fast': [4, 8], 'slow': [16, 32]}, timeframe='1d',
+              days_convention='calendar', cache_dir=str(cache))
+    first = param_sweep(_factory(calls), **kw)
+    assert len(calls) == 4
+    # resume: identical call runs nothing new, table identical
+    second = param_sweep(_factory(calls), **kw)
+    assert len(calls) == 4
+    pd.testing.assert_frame_equal(first.table, second.table)
+    # offline load: same table again
+    loaded = load_sweep(str(cache))
+    pd.testing.assert_frame_equal(first.table, loaded.table)
+    assert loaded.param_names == ('fast', 'slow')
+    assert loaded.keys() == first.keys()
+
+
+def test_cache_preserves_param_types(tmp_path):
+    def run_fn(fast, label, frac):
+        return _FakePortfolio(_seeded_pnl(fast, 16), fills=['2023-02-01'])
+    kw = dict(grid={'fast': [4], 'label': ['a/b'], 'frac': [0.25]},
+              timeframe='1d', days_convention='calendar',
+              cache_dir=str(tmp_path / 's'))
+    param_sweep(run_fn, **kw)
+    loaded = load_sweep(str(tmp_path / 's'))
+    assert loaded.keys() == [(4, 'a/b', 0.25)]   # int/str/float round-trip
+
+
+def test_manifest_mismatch_raises(tmp_path):
+    cache = tmp_path / 'sweep'
+    param_sweep(_factory(), grid={'fast': [4], 'slow': [16]},
+                timeframe='1d', days_convention='calendar',
+                cache_dir=str(cache))
+    with pytest.raises(ValueError, match='manifest'):
+        param_sweep(_factory(), grid={'fast': [4, 8], 'slow': [16]},
+                    timeframe='1d', days_convention='calendar',
+                    cache_dir=str(cache))
+    with pytest.raises(ValueError, match='manifest'):
+        param_sweep(_factory(), grid={'fast': [4], 'slow': [16]},
+                    timeframe='1d', days_convention='business',
+                    cache_dir=str(cache))
+
+
+def test_partial_cache_resumes_after_crash(tmp_path):
+    cache = tmp_path / 'sweep'
+
+    class _Boom(Exception):
+        pass
+
+    calls = []
+
+    def flaky(fast, slow):
+        calls.append((fast, slow))
+        if (fast, slow) == (8, 16):
+            raise _Boom()
+        return _FakePortfolio(_seeded_pnl(fast, slow), fills=['2023-02-01'])
+
+    kw = dict(grid={'fast': [4, 8], 'slow': [16, 32]}, timeframe='1d',
+              days_convention='calendar', cache_dir=str(cache))
+    with pytest.raises(_Boom):
+        param_sweep(flaky, **kw)
+    assert calls == [(4, 16), (4, 32), (8, 16)]
+    # partial cache loads with the cells it has
+    assert load_sweep(str(cache)).keys() == [(4, 16), (4, 32)]
+    # fixed factory resumes: only the 2 missing cells run
+    calls.clear()
+    full = param_sweep(_factory(calls), **kw)
+    assert calls == [(8, 16), (8, 32)]
+    assert len(full.keys()) == 4
+
+
+def test_load_sweep_missing_manifest_raises(tmp_path):
+    with pytest.raises(ValueError, match='manifest'):
+        load_sweep(str(tmp_path / 'nope'))

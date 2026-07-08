@@ -10,7 +10,7 @@ run factories — never imports the engine. Callers do
 
 from ._bootstrap import (BootstrapResult, bootstrap_stats,
                          politis_white_block_length)
-from ._sweep import SweepResult, param_sweep
+from ._sweep import SweepResult, load_sweep, param_sweep
 
-__all__ = ['BootstrapResult', 'SweepResult', 'bootstrap_stats', 'param_sweep',
-          'politis_white_block_length']
+__all__ = ['BootstrapResult', 'SweepResult', 'bootstrap_stats', 'load_sweep',
+          'param_sweep', 'politis_white_block_length']

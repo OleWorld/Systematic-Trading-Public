@@ -12,13 +12,20 @@ per-cell disk cache with resume lands via ``cache_dir``.
 """
 
 import itertools
+import json
 import logging
+import os
+import re
+import shutil
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from analytics import backtest_stats
+from runlog import sanitize_frame
 
 from ._common import collapse_equity, first_fill, is_lower_better, \
     pnl_from_equity
@@ -283,9 +290,145 @@ def param_sweep(
                        stats_start=stats_start, cache_dir=cache_dir)
 
 
-class _CellCache:
-    """Placeholder — implemented in the cache task; constructing with a
-    non-None cache_dir before then is an explicit error."""
+_SCHEMA_VERSION = 1
+_SLUG_PATTERN = re.compile(r'[^A-Za-z0-9._=-]+')
 
-    def __init__(self, root, **kwargs):
-        raise NotImplementedError("cache_dir support lands in the cache task")
+
+def _slug_params(params: Dict[str, Any]) -> str:
+    """Filename-safe cell slug: sorted ``name=value`` pairs. Never parsed
+    back — ``cell.json`` is the source of truth (collision guard on load)."""
+    parts = [f"{k}={params[k]!r}" if isinstance(params[k], str)
+             else f"{k}={params[k]}" for k in sorted(params)]
+    return _SLUG_PATTERN.sub('-', '_'.join(parts))
+
+
+def _json_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    """JSON-normalized params (what a manifest/cell.json round-trip yields)."""
+    return json.loads(json.dumps(params))
+
+
+class _CellCache:
+    """
+    Per-cell disk cache under ``root``: ``manifest.json`` (sweep identity;
+    written on first use, compared strictly on reuse) + ``cells/<slug>/``
+    with ``equity.parquet`` / ``trades.parquet`` / ``cell.json`` (params,
+    initial_capital, runtime_s, created_utc — written last inside a staged
+    ``<slug>.tmp`` dir that is atomically renamed, so a crash never leaves a
+    half-visible cell).
+    """
+
+    def __init__(self, root, *, grid: Dict[str, list], timeframe: str,
+                 days_convention: str, stats_start):
+        self.root = Path(root)
+        self.cells_dir = self.root / 'cells'
+        identity = {'grid': {k: list(v) for k, v in grid.items()},
+                    'timeframe': timeframe,
+                    'days_convention': days_convention}
+        manifest_path = self.root / 'manifest.json'
+        if manifest_path.is_file():
+            with open(manifest_path, encoding='utf-8') as fh:
+                stored = json.load(fh)
+            expected = {'grid': _json_params(identity['grid']),
+                        'timeframe': identity['timeframe'],
+                        'days_convention': identity['days_convention']}
+            for field, want in expected.items():
+                if stored.get(field) != want:
+                    raise ValueError(
+                        f"cache manifest mismatch on {field!r}: cache holds "
+                        f"{stored.get(field)!r}, call uses {want!r} — use a "
+                        f"new cache_dir")
+            self.manifest = stored
+        else:
+            self.cells_dir.mkdir(parents=True, exist_ok=True)
+            self.manifest = {
+                'schema_version': _SCHEMA_VERSION, **identity,
+                'stats_start': (str(stats_start)
+                                if stats_start is not None else None),
+                'created_utc': datetime.now(timezone.utc).isoformat(),
+            }
+            tmp = manifest_path.with_suffix('.json.tmp')
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(self.manifest, fh, indent=2)
+            os.replace(tmp, manifest_path)
+
+    def _cell_dir(self, params: Dict[str, Any]) -> Path:
+        return self.cells_dir / _slug_params(params)
+
+    def has(self, params: Dict[str, Any]) -> bool:
+        """Completed cell = non-tmp dir with the cell.json marker present."""
+        return (self._cell_dir(params) / 'cell.json').is_file()
+
+    def load(self, params: Dict[str, Any]) -> _Cell:
+        """Load one completed cell; the stored params must equal the
+        expected cell's (slug-collision guard)."""
+        cell_dir = self._cell_dir(params)
+        with open(cell_dir / 'cell.json', encoding='utf-8') as fh:
+            meta = json.load(fh)
+        if meta['params'] != _json_params(params):
+            raise ValueError(
+                f"cache cell at {cell_dir} holds params {meta['params']!r}, "
+                f"expected {params!r} (slug collision) — delete the cache dir")
+        equity = pd.read_parquet(cell_dir / 'equity.parquet')
+        if 'timestamp' in equity.columns:
+            equity = equity.set_index('timestamp')
+        trades = pd.read_parquet(cell_dir / 'trades.parquet')
+        return _Cell(params=dict(params), equity=equity, trades=trades,
+                     initial_capital=float(meta['initial_capital']),
+                     runtime_s=float(meta['runtime_s']))
+
+    def store(self, cell: _Cell) -> None:
+        """Stage the cell in ``<slug>.tmp`` and atomically rename; cell.json
+        is written last (completeness marker)."""
+        final = self._cell_dir(cell.params)
+        tmp = final.with_name(final.name + '.tmp')
+        if tmp.exists():
+            shutil.rmtree(tmp)
+        tmp.mkdir(parents=True)
+        equity = cell.equity.copy()
+        equity.index.name = 'timestamp'
+        equity.reset_index().to_parquet(tmp / 'equity.parquet', index=False)
+        sanitize_frame(cell.trades).to_parquet(tmp / 'trades.parquet',
+                                               index=False)
+        with open(tmp / 'cell.json', 'w', encoding='utf-8') as fh:
+            json.dump({'params': _json_params(cell.params),
+                       'initial_capital': cell.initial_capital,
+                       'runtime_s': cell.runtime_s,
+                       'n_trades': int(len(cell.trades)),
+                       'created_utc':
+                           datetime.now(timezone.utc).isoformat()}, fh,
+                      indent=2)
+        if final.exists():
+            shutil.rmtree(final)
+        os.replace(tmp, final)
+
+
+def load_sweep(cache_dir) -> SweepResult:
+    """
+    Rebuild a ``SweepResult`` from a sweep cache directory alone (offline
+    analysis). The manifest's grid/timeframe/days_convention/stats_start are
+    authoritative; grid cells without a completed cache entry (never run,
+    ``where``-dropped, or in-flight ``.tmp``) are simply absent. Raises
+    ``ValueError`` when ``cache_dir`` holds no manifest.
+    """
+    root = Path(cache_dir)
+    manifest_path = root / 'manifest.json'
+    if not manifest_path.is_file():
+        raise ValueError(f"{root} is not a sweep cache (no manifest.json)")
+    with open(manifest_path, encoding='utf-8') as fh:
+        manifest = json.load(fh)
+    grid = {k: list(v) for k, v in manifest['grid'].items()}
+    cache = _CellCache(root, grid=grid, timeframe=manifest['timeframe'],
+                       days_convention=manifest['days_convention'],
+                       stats_start=manifest.get('stats_start'))
+    names = tuple(grid)
+    cells: Dict[Tuple, _Cell] = {}
+    for combo in itertools.product(*grid.values()):
+        params = dict(zip(names, combo))
+        if cache.has(params):
+            cells[tuple(combo)] = cache.load(params)
+    stats_start = manifest.get('stats_start')
+    if stats_start not in (None, 'common_first_fill'):
+        stats_start = pd.Timestamp(stats_start)
+    return SweepResult(cells, grid=grid, timeframe=manifest['timeframe'],
+                       days_convention=manifest['days_convention'],
+                       stats_start=stats_start, cache_dir=str(root))
