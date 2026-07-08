@@ -14,9 +14,8 @@ core consumes a plain ``cell-key -> PnL Series`` mapping, so a future
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
 from volatility import bars_per_year as _bars_per_year
@@ -48,7 +47,8 @@ class WalkForwardResult:
     folds: pd.DataFrame
     stitched_pnl: pd.Series
     stitched_stats: pd.Series
-    _oos_stats: Dict[str, pd.DataFrame] = field(repr=False, default=None)
+    _oos_stats: Optional[Dict[str, pd.DataFrame]] = field(repr=False,
+                                                          default=None)
 
     def oos_matrix(self, metric: str = 'Sharpe Ratio') -> pd.DataFrame:
         """Folds x cells frame of ``metric`` over each OOS window."""
@@ -166,6 +166,16 @@ def _walk_forward_core(
         {label: ws.get(label, _NAN) for label in _STITCHED_LABELS},
         dtype=float)
     folds_df = pd.DataFrame(fold_rows)
+    if folds_df.empty:
+        # zero schedulable/scorable folds: keep the documented schema so
+        # downstream column access fails soft (empty), not with a KeyError
+        folds_df = pd.DataFrame(columns=(
+            ['fold', 'is_start', 'oos_start', 'oos_end']
+            + list(param_names) + [f'is_{selection_metric}']
+            + [f'oos {m}' for m in _OOS_METRICS]))
+        logger.warning("walk_forward: no fold could be scheduled/scored — "
+                       "is the history long enough for the requested "
+                       "oos/is_window?")
     return WalkForwardResult(folds=folds_df, stitched_pnl=stitched,
                              stitched_stats=stitched_stats,
                              _oos_stats=oos_stats)

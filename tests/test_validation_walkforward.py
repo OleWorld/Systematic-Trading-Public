@@ -118,12 +118,27 @@ def test_timedelta_oos_and_explicit_start():
     assert (spans <= pd.Timedelta('180D')).all()
 
 
+@pytest.mark.filterwarnings("ignore::FutureWarning")  # pandas warns pre-raise
 def test_validation_raises():
     sweep = _regime_sweep()
     with pytest.raises(ValueError):
         walk_forward(sweep, selection_metric='Win Rate [%]')   # unsupported
     with pytest.raises(ValueError):
         walk_forward(sweep, oos=12345)                          # bad oos type
+    with pytest.raises(ValueError):
+        walk_forward(sweep, oos='bogus')                        # bad alias
+
+
+def test_no_schedulable_folds_yields_empty_wellformed_result():
+    def run_fn(a):
+        return _FakePortfolio(np.full(40, 10.0), fills=['2023-01-01'])
+    sweep = param_sweep(run_fn, grid={'a': [1]}, timeframe='1d',
+                        days_convention='calendar')
+    wf = walk_forward(sweep, oos=pd.Timedelta('365D'))   # 40 bars < 1 fold
+    assert wf.folds.empty
+    assert 'oos_start' in wf.folds.columns               # schema intact
+    assert wf.stitched_pnl.empty
+    assert pd.isna(wf.stitched_stats['Sharpe Ratio'])
 
 
 def test_mismatched_indexes_raise():
