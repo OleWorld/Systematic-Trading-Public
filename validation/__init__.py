@@ -12,6 +12,8 @@ from ._bootstrap import (BootstrapResult, bootstrap_stats,
                          politis_white_block_length)
 from ._heatmap import ParamHeatmap
 from ._sweep import SweepResult, load_sweep, param_sweep
+from ._walkforward import WalkForwardResult, walk_forward
 
-__all__ = ['BootstrapResult', 'ParamHeatmap', 'SweepResult', 'bootstrap_stats',
-          'load_sweep', 'param_sweep', 'politis_white_block_length']
+__all__ = ['BootstrapResult', 'ParamHeatmap', 'SweepResult', 'WalkForwardResult',
+          'bootstrap_stats', 'load_sweep', 'param_sweep',
+          'politis_white_block_length', 'walk_forward']
