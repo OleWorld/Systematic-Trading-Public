@@ -11,13 +11,12 @@ per-closing-fill convention.
 """
 
 import logging
-from typing import Optional
 
 import pandas as pd
 
 from volatility import bars_per_year as _bars_per_year
 
-from ._common import collapse_equity, pnl_from_equity, window_stats
+from ._common import pnl_from_equity, window_stats
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +39,12 @@ def periodic_stats(
     """
     Per-period stats table (index = the pandas resample bin label, e.g. the
     period-end timestamp for ``'YE'``). ``freq`` is any pandas offset alias
-    (``'YE'`` default, ``'QE'``, ``'ME'``, ...). Bad params raise; empty
+    (``'YE'`` default, ``'QE'``, ``'ME'``, ...). ``start`` (naive = UTC)
+    trims to bars at/after it AND reseeds the baseline to the true balance
+    entering the window — pre-start PnL never folds into the first kept
+    period (deliberately different from the ``backtest_stats`` trim, whose
+    baseline stays ``initial_capital``): a periodic table measures each
+    period from its actual starting equity. Bad params raise; empty
     inputs yield an empty fixed-schema frame; periods with < 2 bars carry
     NaN ratio stats (data law).
     """
@@ -52,9 +56,17 @@ def periodic_stats(
         pd.tseries.frequencies.to_offset(freq)
     except ValueError:
         raise ValueError(f"freq must be a pandas offset alias, got {freq!r}")
-    pnl = pnl_from_equity(equity_curve, initial_capital=initial_capital,
-                          start=start)                   # raises on bad types
+    pnl = pnl_from_equity(equity_curve, initial_capital=initial_capital)
+    baseline = float(initial_capital)
+    if start is not None and not pnl.empty:
+        start_ts = pd.Timestamp(start)
+        if start_ts.tzinfo is None:        # naive start = UTC
+            start_ts = start_ts.tz_localize('UTC')
+        # reseed to the true balance entering the window (see docstring)
+        baseline += float(pnl[pnl.index < start_ts].sum())
+        pnl = pnl[pnl.index >= start_ts]
     if pnl.empty:
+        logger.debug("periodic_stats: no bars in window — empty table")
         return pd.DataFrame(columns=_COLUMNS)
 
     closing = pd.DataFrame(columns=['timestamp', 'realized_pnl'])
@@ -66,14 +78,13 @@ def periodic_stats(
                 start_ts = start_ts.tz_localize('UTC')
             closing = closing[closing['timestamp'] >= start_ts]
     trades_by_period = {}
-    if not closing.empty:
+    if not closing.empty and 'timestamp' in closing.columns:
         for label, grp in closing.groupby(
                 pd.Grouper(key='timestamp', freq=freq)):
             if len(grp):
                 trades_by_period[label] = grp['realized_pnl'].astype(float)
 
     rows = {}
-    baseline = float(initial_capital)
     for label, grp in pnl.resample(freq):
         if len(grp) == 0:
             continue
@@ -82,12 +93,12 @@ def periodic_stats(
         rows[label] = {
             'Start': grp.index[0], 'End': grp.index[-1],
             'Net PnL [$]': ws['Net PnL [$]'],
-            'Return [%]': ws.get('Return [%]', _NAN),
+            'Return [%]': ws['Return [%]'],     # baseline always given
             'Sharpe Ratio': ws['Sharpe Ratio'],
             'Sortino Ratio': ws['Sortino Ratio'],
             'Volatility (Ann.) [$]': ws['Volatility (Ann.) [$]'],
             'Max Drawdown [$]': ws['Max Drawdown [$]'],
-            'Max Drawdown [%]': ws.get('Max Drawdown [%]', _NAN),
+            'Max Drawdown [%]': ws['Max Drawdown [%]'],
             '# Closing Trades': int(len(tr)),
             'Win Rate [%]': (100.0 * float((tr > 0).sum()) / len(tr)
                              if len(tr) else _NAN),

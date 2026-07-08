@@ -69,6 +69,11 @@ def test_quarterly_freq_and_start_trim():
                              timeframe='1d', days_convention='calendar',
                              start='2024-01-01')
     assert len(trimmed) == 1
+    # start= reseeds the baseline to the true balance entering the window —
+    # pre-start PnL must NOT fold into the first kept period
+    assert trimmed.iloc[0]['Net PnL [$]'] == pytest.approx(-50.0 * 366)
+    assert trimmed.iloc[0]['Return [%]'] == pytest.approx(
+        100.0 * (-50.0 * 366) / (1_000_000.0 + 100.0 * 365))
 
 
 def test_edge_and_param_law():
