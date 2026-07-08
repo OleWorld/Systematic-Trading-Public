@@ -1,0 +1,137 @@
+"""Tests for validation._sweep — grid execution, SweepResult, cell cache."""
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from validation import param_sweep
+
+
+class _FakePortfolio:
+    """Duck-typed portfolio-like: the factory contract's full surface."""
+
+    def __init__(self, pnl, initial_capital=1_000_000.0, fills=()):
+        idx = pd.date_range('2023-01-01', periods=len(pnl), freq='D', tz='UTC')
+        self._eq = pd.DataFrame(
+            {'account_balance': initial_capital + np.cumsum(pnl),
+             'total_commission': 0.0}, index=idx)
+        self._trades = pd.DataFrame(
+            {'timestamp': pd.to_datetime(list(fills), utc=True),
+             'realized_pnl': [1.0] * len(fills)})
+        self.initial_capital = initial_capital
+
+    def get_equity_curve(self):
+        return self._eq
+
+    def get_trade_log(self):
+        return self._trades
+
+
+def _seeded_pnl(fast, slow, t=300, warmup=31):
+    """Deterministic per-cell PnL: flat (zero) for the first ``warmup`` bars
+    — honoring the flat-before-first-fill premise the fills fixture claims
+    (2023-01-01 start + 31 flat days = first fill 2023-02-01) — then drift
+    scaling with fast/slow so cells rank predictably. Noise sits an order of
+    magnitude below the drift gaps so rankings are robust, not seed-lottery;
+    the flat head keeps the common-first-fill trim from folding synthetic
+    pre-start PnL into the first kept bar (backtest_stats folds pre-start
+    PnL there by design)."""
+    rng = np.random.default_rng(fast * 1000 + slow)
+    pnl = rng.normal(50.0 * fast / slow, 50.0, size=t)
+    pnl[:warmup] = 0.0
+    return pnl
+
+
+def _factory(calls=None):
+    def run_fn(fast, slow):
+        if calls is not None:
+            calls.append((fast, slow))
+        return _FakePortfolio(_seeded_pnl(fast, slow),
+                              fills=['2023-02-01', '2023-06-01'])
+    return run_fn
+
+
+def _make_sweep(**kw):
+    return param_sweep(_factory(), grid={'fast': [4, 8], 'slow': [16, 32]},
+                       timeframe='1d', days_convention='calendar', **kw)
+
+
+def test_grid_enumeration_order_and_where():
+    calls = []
+    param_sweep(_factory(calls), grid={'fast': [4, 8], 'slow': [16, 32]},
+                where=lambda fast, slow: not (fast == 8 and slow == 16),
+                timeframe='1d', days_convention='calendar')
+    assert calls == [(4, 16), (4, 32), (8, 32)]   # product order, cell dropped
+
+
+def test_table_has_param_columns_then_stats():
+    sweep = _make_sweep()
+    assert list(sweep.table.columns[:2]) == ['fast', 'slow']
+    assert 'Sharpe Ratio' in sweep.table.columns
+    assert len(sweep.table) == 4
+    assert sweep.keys() == [(4, 16), (4, 32), (8, 16), (8, 32)]
+
+
+def test_stats_start_common_first_fill_and_none():
+    sweep = _make_sweep()   # every fake fills first at 2023-02-01
+    assert sweep.stats_start_resolved == pd.Timestamp('2023-02-01', tz='UTC')
+    full = _make_sweep(stats_start=None)
+    assert full.stats_start_resolved is None
+    # the trim actually reaches backtest_stats: trimmed table starts at the
+    # first fill, full table at the first bar. (Net PnL is trim-invariant by
+    # design — final minus initial_capital — so it is NOT the probe.)
+    assert sweep.table['Start'].iloc[0] == pd.Timestamp('2023-02-01', tz='UTC')
+    assert full.table['Start'].iloc[0] == pd.Timestamp('2023-01-01', tz='UTC')
+
+
+def test_stats_start_no_fills_resolves_none():
+    def run_fn(x):
+        return _FakePortfolio(_seeded_pnl(4, 16), fills=[])
+    sweep = param_sweep(run_fn, grid={'x': [1]}, timeframe='1d',
+                        days_convention='calendar')
+    assert sweep.stats_start_resolved is None
+
+
+def test_cell_accessors_and_unknown_params_raise():
+    sweep = _make_sweep()
+    pnl = sweep.pnl(fast=4, slow=16)
+    assert len(pnl) == 300
+    assert sweep.initial_capital(fast=4, slow=16) == 1_000_000.0
+    with pytest.raises(KeyError):
+        sweep.pnl(fast=5, slow=16)
+    with pytest.raises(ValueError):
+        sweep.pnl(fast=4)          # missing param name
+
+
+def test_best_is_direction_aware():
+    sweep = _make_sweep()
+    # highest drift/vol is fast=8, slow=16 (ratio 0.5)
+    assert sweep.best('Sharpe Ratio') == {'fast': 8, 'slow': 16}
+    best_dd = sweep.best('Max Drawdown [$]')
+    col = sweep.table.set_index(['fast', 'slow'])['Max Drawdown [$]']
+    assert tuple(best_dd.values()) == col.idxmin()
+
+
+def test_grid_validation_raises():
+    kw = dict(timeframe='1d', days_convention='calendar')
+    with pytest.raises(ValueError):
+        param_sweep(_factory(), grid={}, **kw)
+    with pytest.raises(ValueError):
+        param_sweep(_factory(), grid={'fast': []}, **kw)
+    with pytest.raises(ValueError):
+        param_sweep(_factory(), grid={'fast': [4, 4]}, **kw)
+    with pytest.raises(TypeError):
+        param_sweep(_factory(), grid={'fast': [[4]]}, **kw)
+    with pytest.raises(TypeError):
+        param_sweep('not callable', grid={'fast': [4]}, **kw)
+    with pytest.raises(ValueError):
+        param_sweep(_factory(), grid={'fast': [4]}, stats_start='bogus policy',
+                    **kw)
+
+
+def test_factory_exception_propagates():
+    def boom(fast):
+        raise RuntimeError('factory blew up')
+    with pytest.raises(RuntimeError, match='factory blew up'):
+        param_sweep(boom, grid={'fast': [4]}, timeframe='1d',
+                    days_convention='calendar')
