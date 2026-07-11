@@ -37,6 +37,7 @@ from ._serialize import (
     SCHEMA_VERSION,
     encode_stats,
     json_safe,
+    replace_with_retry,
     sanitize_frame,
     serialize_config,
     serialize_instruments,
@@ -146,7 +147,7 @@ def save_run(*, portfolio: Any, strategy: Any, risk_manager: Any,
     with open(tmp_dir / 'manifest.json', 'w', encoding='utf-8') as fh:
         json.dump(manifest, fh, indent=2, allow_nan=False)
     final_dir = root / run_id
-    tmp_dir.rename(final_dir)
+    replace_with_retry(tmp_dir, final_dir)
     logger.info("Run archived: %s", final_dir)
     return load_run(final_dir)
 

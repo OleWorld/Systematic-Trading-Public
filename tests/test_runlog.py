@@ -13,6 +13,8 @@ Run from repo root:  pytest tests/test_runlog.py -v
 
 import dataclasses
 import json
+import logging
+import os
 from datetime import datetime, timezone
 from typing import Dict, List
 
@@ -20,7 +22,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from runlog import RunRecord, list_runs, load_run, save_run
+from runlog import (RunRecord, list_runs, load_run,
+                    replace_with_retry, save_run)
 from runlog._save import _resolve_run_id
 from runlog._serialize import (
     decode_stats,
@@ -679,3 +682,40 @@ def test_run_record_reads_parquet_once_per_table(tmp_path, monkeypatch):
     rec.trade_log()
     rec.trade_log()
     assert calls['n'] == 1                   # cached after the first read
+
+
+# ──────────────────────────────────────────────
+# replace_with_retry (F3): transient Windows rename locks
+# ──────────────────────────────────────────────
+
+def test_replace_with_retry_recovers_from_transient_lock(tmp_path,
+                                                         monkeypatch, caplog):
+    calls = {'n': 0}
+    real_replace = os.replace
+    def flaky(src, dst):
+        calls['n'] += 1
+        if calls['n'] <= 2:
+            raise PermissionError(5, 'Access is denied')
+        return real_replace(src, dst)
+    monkeypatch.setattr('runlog._serialize.os.replace', flaky)
+    monkeypatch.setattr('runlog._serialize.time.sleep', lambda s: None)
+    src = tmp_path / 'a'
+    src.mkdir()
+    dst = tmp_path / 'b'
+    with caplog.at_level(logging.WARNING, logger='runlog._serialize'):
+        replace_with_retry(src, dst)
+    assert calls['n'] == 3
+    assert dst.is_dir() and not src.exists()
+    assert any('retrying' in rec.message for rec in caplog.records)
+
+
+def test_replace_with_retry_reraises_after_exhausted_attempts(tmp_path,
+                                                              monkeypatch):
+    def always_locked(src, dst):
+        raise PermissionError(5, 'Access is denied')
+    monkeypatch.setattr('runlog._serialize.os.replace', always_locked)
+    monkeypatch.setattr('runlog._serialize.time.sleep', lambda s: None)
+    src = tmp_path / 'a'
+    src.mkdir()
+    with pytest.raises(PermissionError):
+        replace_with_retry(src, tmp_path / 'b', attempts=3)

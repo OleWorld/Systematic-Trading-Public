@@ -14,7 +14,9 @@ import datetime
 import enum
 import logging
 import math
+import os
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -26,6 +28,37 @@ logger = logging.getLogger(__name__)
 #: table schema changes incompatibly; ``load_run`` records it in the manifest
 #: so future readers can dispatch.
 SCHEMA_VERSION = 1
+
+
+def replace_with_retry(src: Any, dst: Any, *, attempts: int = 6,
+                       base_delay: float = 0.05) -> None:
+    """``os.replace(src, dst)`` with bounded retry on ``PermissionError``.
+
+    On Windows a just-written file or directory can be transiently locked
+    by an antivirus/indexer scan, so an immediate rename fails with
+    ``PermissionError`` (WinError 5) even though a retry moments later
+    succeeds. Retries with exponential backoff (``base_delay * 2**k``,
+    ~1.55 s total at the defaults) and re-raises the final
+    ``PermissionError`` once ``attempts`` renames have failed — fail-loud
+    is preserved; only the transient lock is absorbed. Any other
+    exception propagates immediately.
+    """
+    delay = base_delay
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts:
+                raise
+            logger.warning(
+                "replace_with_retry: rename %s -> %s hit a transient lock "
+                "(attempt %d/%d); retrying in %.2fs",
+                src, dst, attempt, attempts, delay,
+            )
+            time.sleep(delay)
+            delay *= 2
+
 
 _SLUG_PATTERN = re.compile(r'[^A-Za-z0-9._-]+')
 

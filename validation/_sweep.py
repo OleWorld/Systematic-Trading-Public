@@ -14,7 +14,6 @@ per-cell disk cache with resume lands via ``cache_dir``.
 import itertools
 import json
 import logging
-import os
 import re
 import shutil
 import time
@@ -25,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pandas as pd
 
 from analytics import backtest_stats
-from runlog import sanitize_frame
+from runlog import replace_with_retry, sanitize_frame
 
 from ._common import collapse_equity, first_fill, is_lower_better, \
     pnl_from_equity
@@ -349,7 +348,7 @@ class _CellCache:
             tmp = manifest_path.with_suffix('.json.tmp')
             with open(tmp, 'w', encoding='utf-8') as fh:
                 json.dump(self.manifest, fh, indent=2)
-            os.replace(tmp, manifest_path)
+            replace_with_retry(tmp, manifest_path)
 
     def _cell_dir(self, params: Dict[str, Any]) -> Path:
         """The cell's on-disk directory (slugged params, not necessarily
@@ -401,7 +400,7 @@ class _CellCache:
                       indent=2)
         if final.exists():
             shutil.rmtree(final)
-        os.replace(tmp, final)
+        replace_with_retry(tmp, final)
 
 
 def load_sweep(cache_dir) -> SweepResult:

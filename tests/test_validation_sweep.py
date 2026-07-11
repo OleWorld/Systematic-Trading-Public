@@ -1,10 +1,12 @@
 """Tests for validation._sweep — grid execution, SweepResult, cell cache."""
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
 
-from validation import param_sweep
+from validation import load_sweep, param_sweep
 
 
 class _FakePortfolio:
@@ -215,3 +217,19 @@ def test_partial_cache_resumes_after_crash(tmp_path):
 def test_load_sweep_missing_manifest_raises(tmp_path):
     with pytest.raises(ValueError, match='manifest'):
         load_sweep(str(tmp_path / 'nope'))
+
+
+def test_cell_store_survives_transient_rename_lock(tmp_path, monkeypatch):
+    calls = {'n': 0}
+    real_replace = os.replace
+    def flaky(src, dst):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise PermissionError(5, 'Access is denied')
+        return real_replace(src, dst)
+    monkeypatch.setattr('runlog._serialize.os.replace', flaky)
+    monkeypatch.setattr('runlog._serialize.time.sleep', lambda s: None)
+    sweep = _make_sweep(cache_dir=tmp_path / 'cache')
+    assert len(sweep.keys()) == 4          # all cells stored despite the lock
+    reloaded = load_sweep(tmp_path / 'cache')
+    assert len(reloaded.keys()) == 4
