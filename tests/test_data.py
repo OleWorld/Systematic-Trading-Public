@@ -938,3 +938,59 @@ def test_append_bar_non_adjacent_duplicate_now_raises():
     h._append_bar('BTC', t1, 2, 2, 2, 2.0, 10)
     with pytest.raises(ValueError, match="Out-of-order bar"):
         h._append_bar('BTC', t0, 9, 9, 9, 9.0, 99)
+
+
+# ──────────────────────────────────────────────
+# resample buckets via get_period_start (F6)
+# ──────────────────────────────────────────────
+
+def _daily_frame(start, periods):
+    idx = pd.date_range(start, periods=periods, freq='D', tz='UTC')
+    vals = [float(i + 1) for i in range(periods)]
+    return pd.DataFrame({'Open': vals, 'High': vals, 'Low': vals,
+                         'Close': vals, 'Volume': [1.0] * periods}, index=idx)
+
+
+def test_resample_3m_buckets_are_calendar_quarters_not_data_anchored():
+    """Data starting mid-February must bucket to the Jan/Apr/Jul/Oct
+    calendar quarters get_period_start defines — the old pandas '3MS'
+    path anchored at the data start (Feb/May/Aug)."""
+    df = _daily_frame('2026-02-15', 200)          # runs into September
+    out = _resample_ohlcv(df, '3M')
+    expected_starts = {pd.Timestamp('2026-01-01', tz='UTC'),
+                       pd.Timestamp('2026-04-01', tz='UTC'),
+                       pd.Timestamp('2026-07-01', tz='UTC')}
+    assert set(out.index) == expected_starts
+
+
+def test_resample_2y_buckets_match_get_period_start_blocks():
+    df = _daily_frame('2025-06-01', 400)          # spans 2025 -> 2026
+    out = _resample_ohlcv(df, '2Y')
+    assert list(out.index) == [pd.Timestamp('2024-01-01', tz='UTC'),
+                               pd.Timestamp('2026-01-01', tz='UTC')]
+
+
+@pytest.mark.parametrize("bad_tf", ['2d', '3d', '2w'])
+def test_resample_unsupported_multi_unit_raises_like_live_path(bad_tf):
+    df = _daily_frame('2026-01-01', 10)
+    with pytest.raises(ValueError):
+        _resample_ohlcv(df, bad_tf)
+
+
+def test_resample_single_unit_calendar_aliases_unchanged():
+    """'1d'/'1w'/'1M'/'1Y' must produce byte-identical output to the old
+    pandas-offset path (golden equality, computed in-test)."""
+    df = _daily_frame('2026-01-07', 100)
+    agg = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+           'Volume': 'sum'}
+    for tf, offset in [('1d', '1D'), ('1M', '1MS'), ('1Y', '1YS')]:
+        new = _resample_ohlcv(df, tf)
+        old = df.resample(offset).agg(agg).dropna(subset=['Open'])
+        pd.testing.assert_frame_equal(new, old, check_freq=False)
+    # weekly: old path = Monday-of-week groupby (unchanged semantics)
+    monday_idx = (df.index - pd.to_timedelta(df.index.weekday,
+                                             unit='D')).normalize()
+    old_w = df.groupby(monday_idx).agg(agg)
+    old_w.index.name = df.index.name
+    new_w = _resample_ohlcv(df, '1w')
+    pd.testing.assert_frame_equal(new_w, old_w, check_freq=False)

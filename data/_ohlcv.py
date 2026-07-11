@@ -4,6 +4,7 @@ import pandas as pd
 
 from data._timeframe import (
     _ms_to_utc,
+    get_period_start,
     parse_timeframe_to_seconds,
     _timeframe_to_pandas_offset,
 )
@@ -22,10 +23,12 @@ def _candles_to_dataframe(candles: List[List[Any]]) -> pd.DataFrame:
 def resample(df: pd.DataFrame, timeframe: str, agg: _AggSpec) -> pd.DataFrame:
     """Resample a time-indexed DataFrame to ``timeframe`` using ``agg``.
 
-    Bucket alignment: sub-daily bars are aligned to midnight UTC each day,
-    weekly to Monday 00:00 UTC of the ISO week (open-time convention),
-    matching ``get_period_start`` so historic resampling and live HTF
-    accumulation produce identical bucket boundaries.
+    Bucket alignment: all buckets are defined by ``get_period_start`` —
+    sub-daily aligned to midnight UTC each day, weekly to Monday 00:00 UTC,
+    monthly/yearly to calendar blocks — so historic resampling and live HTF
+    accumulation produce identical bucket boundaries for every supported
+    timeframe. Timeframes ``get_period_start`` rejects (e.g. '2d', '2w')
+    raise ``ValueError`` here too. Only non-empty buckets are returned.
 
     ``agg`` maps column name to a pandas aggregation (string op or callable).
     The caller decides the agg dict and is responsible for dropping empty
@@ -36,16 +39,19 @@ def resample(df: pd.DataFrame, timeframe: str, agg: _AggSpec) -> pd.DataFrame:
 
     tf_seconds = parse_timeframe_to_seconds(timeframe)
 
-    if tf_seconds == 604800:
-        # Weekly: bucket each row by Monday-of-week, label at Monday 00:00.
-        monday_idx = (df.index - pd.to_timedelta(df.index.weekday, unit='D')).normalize()
-        resampled = df.groupby(monday_idx).agg(agg)
+    if tf_seconds >= 86400:
+        # Daily and above (daily, weekly, monthly, yearly): bucket every
+        # row by ``get_period_start`` — the same calendar-block authority
+        # the live HTF accumulation uses — so historic resampling and live
+        # aggregation produce identical bucket boundaries by construction.
+        # Unsupported multi-unit aliases ('2d', '2w', ...) raise inside
+        # get_period_start, exactly like the live path.
+        bucket_idx = pd.Index(
+            [get_period_start(ts, timeframe) for ts in df.index]
+        )
+        resampled = df.groupby(bucket_idx).agg(agg)
         resampled.index.name = df.index.name
         return resampled
-    if tf_seconds >= 86400:
-        # Daily and above (monthly, yearly).
-        offset = _timeframe_to_pandas_offset(timeframe)
-        return df.resample(offset).agg(agg)
     if 86400 % tf_seconds == 0:
         # Sub-daily that divides evenly into 24h (e.g., 4h, 15m).
         offset = _timeframe_to_pandas_offset(timeframe)
