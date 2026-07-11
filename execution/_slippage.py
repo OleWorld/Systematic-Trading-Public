@@ -7,6 +7,8 @@ when the slipped price difference is converted to dollar PnL by the portfolio.
 
 from dataclasses import dataclass
 
+import math
+
 from event import Direction
 
 
@@ -25,6 +27,13 @@ class SlippageModel:
     def __post_init__(self):
         if self.mode not in ('pct', 'absolute'):
             raise ValueError(f"Unknown SlippageModel mode: '{self.mode}'. Must be 'pct' or 'absolute'.")
+        # A negative value would produce FAVORABLE slippage (a seller filled
+        # above market), silently flattering every backtest; NaN/inf would
+        # flow into fill prices. Zero stays valid (frictionless default).
+        if not (math.isfinite(self.value) and self.value >= 0):
+            raise ValueError(
+                f"SlippageModel value must be finite and >= 0, got {self.value}"
+            )
 
     def apply(self, price: float, direction: Direction) -> float:
         # ``abs(price)`` for the pct branch so slippage is always a positive
