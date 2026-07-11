@@ -24,7 +24,8 @@ def configure_logging(
 
     Replaces ``logging.basicConfig`` for callers of this project. Safe
     to call multiple times: the factory is only installed once. Re-runs
-    update the level on the root logger and on any handlers it owns.
+    update the level AND formatter on the root logger and on ALL root
+    handlers, including handlers other code attached.
     """
     fmt = fmt or _DEFAULT_FMT
     datefmt = datefmt or _DEFAULT_DATEFMT

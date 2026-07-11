@@ -120,7 +120,9 @@ class VolEstimator(ABC):
         feed in price changes).
 
         ``None`` while warming up (insufficient observations to produce a
-        finalized estimate). ``0.0`` if the underlying estimate is genuinely
-        zero (constant inputs). Never returns ``NaN``.
+        finalized estimate). ``0.0`` on constant-from-start inputs
+        (mid-stream transitions to constancy may leave dust-level sigma;
+        the risk manager's relative zero-vol floor is the operative
+        guard). Never returns ``NaN``.
         """
         raise NotImplementedError

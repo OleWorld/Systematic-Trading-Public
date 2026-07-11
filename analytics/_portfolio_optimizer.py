@@ -406,7 +406,8 @@ def _newton_polish_erc(sigma: np.ndarray, w: np.ndarray) -> np.ndarray:
     two or three steps reach the ``1e-12`` residual exit. Step-halving
     keeps iterates strictly positive; the iteration cap (10) only binds
     on inputs where Newton cannot improve further, in which case the
-    best iterate so far is returned (never worse than the solver's).
+    final iterate is returned and ``_validate_erc_solution`` re-validates
+    it downstream.
     """
     # Solver output is strictly positive (log domain); the floor only
     # guards against representation-level dust on the way in.

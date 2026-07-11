@@ -5,7 +5,9 @@ Folds are analysis-time slices of each cell's full-history per-bar PnL —
 valid because the engine is causal/truncation-invariant, so any window of a
 full run is that config's honest out-of-sample record (no re-runs). Two
 caveats are contracts, not runtime checks: stitching OOS slices across cells
-is exact under dollar-vol targeting and approximate under percent-vol
+is exact under dollar-vol targeting WHILE margin never binds and no margin
+call fires (target sizes are path-independent; order scaling and
+liquidations are not), and approximate under percent-vol
 targeting; strategies with offline-trained components (future ML) void the
 causality precondition and need per-fold retraining instead. The private
 core consumes a plain ``cell-key -> PnL Series`` mapping, so a future

@@ -2,7 +2,8 @@
 Unit tests for the stateful ``Indicator`` classes and their vectorized
 ``from_series`` companions.
 
-For each of the 9 indicator classes we cover:
+For the 10 indicator classes we cover (upsert coverage varies by class —
+see the per-class sections):
 
 1. ``from_series`` — pinned hand-computed expectations or pandas references
    (preserves the coverage of the previous pure-function ``test_indicator.py``).

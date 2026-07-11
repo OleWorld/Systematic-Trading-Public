@@ -9,8 +9,8 @@ research notebooks or strategy-setup code, not on every bar — see
 
 Public surface:
 
-* ``correlation_matrix(values, *, lookback=None, method='pearson')`` —
-  N×N correlation matrix of a wide DataFrame's columns.
+* ``correlation_matrix(values, *, lookback=None, method='pearson',
+  shrinkage=None)`` — N×N correlation matrix of a wide DataFrame's columns.
 * ``diversification_multiplier(weights, corr_matrix)`` — Carver's
   ``1 / sqrt(wᵀ ρ w)``. Quantifies the vol-cancellation credit of a
   weighted bundle.

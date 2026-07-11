@@ -24,11 +24,15 @@ drift, which at large means can both fabricate a tiny negative ``M2`` (which
 would ``sqrt`` to NaN) and mask genuine low-dispersion variance. When ``M2``
 falls into that dust band the slide **recomputes ``M2`` directly from the
 window** (the same exact ``O(length)`` mean-centered sum used on the first
-full window): a genuinely constant window yields exactly 0.0 — matching the
-old mean-centered ``np.std`` and keeping strict ``sigma == 0`` guards
-downstream valid — while a real variance is recovered faithfully, so the
-output stays translation-invariant and matches ``from_series`` for every
-input scale (never snapping genuine variance to zero, never ``sqrt``ing a
+full window): a genuinely constant window yields exactly 0.0 when the
+window has been constant from the start — matching the old mean-centered
+``np.std``; the risk manager's zero-vol guard is RELATIVE (``sigma == 0 or
+sigma < 1e-6·|close|``), so dust-level leakage is absorbed there. A window
+that becomes constant MID-STREAM can retain float dust from the incremental
+slide when the window mean is ~0 (the dust band is mean-relative) — a known
+open limitation. A real variance is recovered faithfully, so the output
+stays translation-invariant and matches ``from_series`` for every input
+scale (never snapping genuine variance to zero, never ``sqrt``ing a
 negative).
 """
 

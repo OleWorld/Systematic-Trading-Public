@@ -456,10 +456,10 @@ class VolTargetingRiskManager(RiskManager):
             symbols at the same timestamp and sub-period base bars (e.g.
             base='1h' with corr_timeframe='1d') both contribute exactly
             one period crossing. Default ``30``. Set to ``0`` to disable
-            auto-recalc (one-shot at ``__init__`` only). Only active
-            under a corr-based ``instrument_weight_mode``
-            (``'min_variance'`` / ``'risk_parity'``); no effect under
-            ``'equal_weight'``.
+            auto-recalc (one-shot at ``__init__`` only). Active in EVERY
+            weight mode — under ``'equal_weight'`` the recalc is the
+            periodic liveness re-assessment that admits newly-live
+            symbols (weights stay 1/N; the IDM still updates).
         corr_timeframe
             Timeframe the data handler reads when assembling the closes
             window. Default ``'1d'``. Must be a key of
