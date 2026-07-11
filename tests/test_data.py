@@ -889,3 +889,52 @@ def test_historic_handler_stops_after_exhausting_stream():
     assert h.continue_backtest is True
     h.update_bar()  # drains the StopIteration
     assert h.continue_backtest is False
+
+
+# ──────────────────────────────────────────────
+# Out-of-order bars fail loudly (F2)
+# ──────────────────────────────────────────────
+
+def test_historic_handler_rejects_unsorted_frame_at_construction():
+    idx = pd.to_datetime(['2024-01-01', '2024-01-03', '2024-01-02'], utc=True)
+    df = pd.DataFrame({'Open': [1., 3., 2.], 'High': [1., 3., 2.],
+                       'Low': [1., 3., 2.], 'Close': [1., 3., 2.],
+                       'Volume': [10., 10., 10.]}, index=idx)
+    events = thread_queue.Queue()
+    with pytest.raises(ValueError, match="not sorted ascending"):
+        HistoricDataHandler(events, ['BTC'], '1d', {'1d': 500},
+                            data={'BTC': df})
+
+
+def test_append_bar_out_of_order_completed_bar_raises():
+    h = _new_stub()
+    t1 = datetime.datetime(2026, 1, 1, tzinfo=UTC)
+    t3 = datetime.datetime(2026, 1, 3, tzinfo=UTC)
+    t2 = datetime.datetime(2026, 1, 2, tzinfo=UTC)
+    assert h._append_bar('BTC', t1, 1, 1, 1, 1.0, 10) is True
+    assert h._append_bar('BTC', t3, 3, 3, 3, 3.0, 10) is True
+    with pytest.raises(ValueError, match="Out-of-order bar"):
+        h._append_bar('BTC', t2, 2, 2, 2, 2.0, 10)
+    # deque and HTF state untouched by the rejected bar
+    assert [b.timestamp for b in h._base_bar_data['BTC']] == [t1, t3]
+
+
+def test_append_bar_out_of_order_forming_bar_raises():
+    h = _new_stub()
+    t1 = datetime.datetime(2026, 1, 2, tzinfo=UTC)
+    t0 = datetime.datetime(2026, 1, 1, tzinfo=UTC)
+    assert h._append_bar('BTC', t1, 1, 1, 1, 1.0, 10) is True
+    with pytest.raises(ValueError, match="Out-of-order bar"):
+        h._append_bar('BTC', t0, 1, 1, 1, 1.0, 10, is_forming=True)
+
+
+def test_append_bar_non_adjacent_duplicate_now_raises():
+    """Jan 1 -> Jan 2 -> Jan 1 again: backward, so the monotonicity gate
+    fires (the old equality-only gate silently accepted it)."""
+    h = _new_stub()
+    t0 = datetime.datetime(2026, 1, 1, tzinfo=UTC)
+    t1 = datetime.datetime(2026, 1, 2, tzinfo=UTC)
+    h._append_bar('BTC', t0, 1, 1, 1, 1.0, 10)
+    h._append_bar('BTC', t1, 2, 2, 2, 2.0, 10)
+    with pytest.raises(ValueError, match="Out-of-order bar"):
+        h._append_bar('BTC', t0, 9, 9, 9, 9.0, 99)

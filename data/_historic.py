@@ -19,7 +19,10 @@ class HistoricDataHandler(DataHandler):
 
     Each DataFrame must be indexed by a timezone-aware ``DatetimeIndex`` and
     expose ``Open``/``High``/``Low``/``Close``/``Volume`` columns. Sourcing,
-    cleaning, and windowing the data is the caller's responsibility.
+    cleaning, and windowing the data is the caller's responsibility. Each
+    frame's index must be sorted ascending — unsorted input raises
+    ``ValueError`` at construction (same-timestamp adjacent duplicates are
+    tolerated here and handled by the stream gate: first bar wins).
     """
 
     def __init__(self, events_queue: thread_queue.Queue[Any], symbol_list: List[str],
@@ -38,6 +41,18 @@ class HistoricDataHandler(DataHandler):
                 "data is required: pass data={symbol: DataFrame} with a "
                 "tz-aware DatetimeIndex and Open/High/Low/Close/Volume columns."
             )
+
+        for sym, df in data.items():
+            if df is None or df.empty:
+                continue
+            if not df.index.is_monotonic_increasing:
+                raise ValueError(
+                    f"data[{sym!r}] index is not sorted ascending: bars "
+                    f"must be supplied in time order. An out-of-order bar "
+                    f"would silently corrupt HTF aggregates, indicator "
+                    f"recursion, and the latest-price cache, so the run "
+                    f"is refused up front."
+                )
 
         self._bar_generators = self._build_stream(data)
 
