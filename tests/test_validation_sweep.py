@@ -1,5 +1,6 @@
 """Tests for validation._sweep — grid execution, SweepResult, cell cache."""
 
+import logging
 import os
 
 import numpy as np
@@ -233,3 +234,77 @@ def test_cell_store_survives_transient_rename_lock(tmp_path, monkeypatch):
     assert len(sweep.keys()) == 4          # all cells stored despite the lock
     reloaded = load_sweep(tmp_path / 'cache')
     assert len(reloaded.keys()) == 4
+
+
+# ──────────────────────────────────────────────
+# Table reseeds the entering balance (F4)
+# ──────────────────────────────────────────────
+
+def test_table_reseeds_entering_balance_no_fold_in_spike():
+    """Cell A earns +100/bar for 30 bars BEFORE the common first fill;
+    cell B is flat there. Under the old fold-in trim, A's first kept bar
+    carried a synthetic +3000 spike. Reseeded stats must equal a manual
+    backtest_stats call with initial_capital = capital + 3000."""
+    def run_fn(cell):
+        pnl = np.zeros(100)
+        if cell == 1:
+            pnl[:30] = 100.0                  # head PnL before common start
+        pnl[30:] = 10.0
+        pnl[31::2] = 20.0                     # in-window variance: a constant
+        #                                       window would make Sharpe NaN
+        #                                       on BOTH sides (NaN != NaN)
+        # cell 1's first fill is early; cell 2's is at bar 30 -> common
+        fills = ['2023-01-05', '2023-01-31'] if cell == 1 else ['2023-01-31']
+        return _FakePortfolio(pnl, fills=fills)
+
+    sweep = param_sweep(run_fn, grid={'cell': [1, 2]}, timeframe='1d',
+                        days_convention='calendar',
+                        stats_start='common_first_fill')
+    start = sweep.stats_start_resolved
+    assert start == pd.Timestamp('2023-01-31', tz='UTC')
+
+    from analytics import backtest_stats
+    eq1, tr1 = sweep.equity(cell=1), sweep.trades(cell=1)
+    cap1 = sweep.initial_capital(cell=1)
+    expected = backtest_stats(
+        eq1, tr1,
+        initial_capital=cap1 + 3000.0,                    # entering balance
+        timeframe='1d', days_convention='calendar', start=start)
+    row = sweep.table[sweep.table['cell'] == 1].iloc[0]
+    assert row['Sharpe Ratio'] == expected['Sharpe Ratio']
+    assert row['Net PnL [$]'] == expected['Net PnL [$]']
+    # and it must DIFFER from the old fold-in numbers
+    folded = backtest_stats(
+        eq1, tr1, initial_capital=cap1,
+        timeframe='1d', days_convention='calendar', start=start)
+    assert row['Sharpe Ratio'] != folded['Sharpe Ratio']
+
+
+def test_table_stats_start_none_unchanged():
+    sweep = _make_sweep(stats_start=None)
+    from analytics import backtest_stats
+    params = dict(zip(sweep.param_names, sweep.keys()[0]))
+    expected = backtest_stats(sweep.equity(**params), sweep.trades(**params),
+                              initial_capital=sweep.initial_capital(**params),
+                              timeframe='1d', days_convention='calendar')
+    row = sweep.table.iloc[0]
+    assert row['Sharpe Ratio'] == expected['Sharpe Ratio']
+    assert row['Net PnL [$]'] == expected['Net PnL [$]']
+
+
+def test_table_nonpositive_entering_balance_falls_back_full_history(caplog):
+    def run_fn(cell):
+        pnl = np.zeros(100)
+        pnl[:30] = -60_000.0                  # wipes out 1M capital pre-start
+        return _FakePortfolio(pnl, fills=['2023-01-31'])
+    sweep = param_sweep(run_fn, grid={'cell': [1]}, timeframe='1d',
+                        days_convention='calendar',
+                        stats_start='common_first_fill')
+    with caplog.at_level(logging.WARNING, logger='validation._sweep'):
+        table = sweep.table
+    assert any('non-positive' in rec.message for rec in caplog.records)
+    from analytics import backtest_stats
+    expected = backtest_stats(sweep.equity(cell=1), sweep.trades(cell=1),
+                              initial_capital=sweep.initial_capital(cell=1),
+                              timeframe='1d', days_convention='calendar')
+    assert table.iloc[0]['Net PnL [$]'] == expected['Net PnL [$]']

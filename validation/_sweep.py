@@ -14,6 +14,7 @@ per-cell disk cache with resume lands via ``cache_dir``.
 import itertools
 import json
 import logging
+import math
 import re
 import shutil
 import time
@@ -27,7 +28,7 @@ from analytics import backtest_stats
 from runlog import replace_with_retry, sanitize_frame
 
 from ._common import collapse_equity, first_fill, is_lower_better, \
-    pnl_from_equity
+    pnl_from_equity, window_pnl
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,8 @@ class SweepResult:
     Result of a parameter sweep: one ``_Cell`` per completed grid cell, in
     deterministic grid order. ``table`` (lazy, cached) carries the param
     columns first, then every ``analytics.backtest_stats`` label, computed
-    with ``start=stats_start_resolved``. Cell accessors take the params as
+    with ``start=stats_start_resolved`` and the capital reseeded to each
+    cell's entering balance (no fold-in). Cell accessors take the params as
     keyword arguments (``sweep.pnl(fast=16, slow=64)``).
     """
 
@@ -194,16 +196,39 @@ class SweepResult:
     @property
     def table(self) -> pd.DataFrame:
         """One row per cell: param columns, then all ``backtest_stats``
-        labels (lazy; recomputed never — cached on first access)."""
+        labels (lazy; cached on first access). With a resolved
+        ``stats_start``, each cell's stats are computed over the window
+        with the capital RESEEDED to the cell's true entering balance
+        (``window_pnl``) — the same convention as the inference modules
+        and ``periodic_stats`` — so no pre-window PnL folds into the
+        first kept bar and cells with different warmup speeds stay
+        comparable. A cell entering the window with a non-positive
+        balance (wiped out pre-start) falls back to full-history stats
+        with a WARNING."""
         if self._table is None:
             start = self.stats_start_resolved
             rows = []
             for key, cell in self._cells.items():
+                capital = cell.initial_capital
+                cell_start = start
+                if start is not None:
+                    _, baseline = window_pnl(
+                        cell.equity, initial_capital=cell.initial_capital,
+                        start=start)
+                    if math.isfinite(baseline) and baseline > 0:
+                        capital = baseline
+                    else:
+                        logger.warning(
+                            "table: cell %s enters the stats window with a "
+                            "non-positive balance (%s) — falling back to "
+                            "full-history stats for this cell",
+                            cell.params, baseline)
+                        cell_start = None
                 stats = backtest_stats(
                     cell.equity, cell.trades,
-                    initial_capital=cell.initial_capital,
+                    initial_capital=capital,
                     timeframe=self.timeframe,
-                    days_convention=self.days_convention, start=start)
+                    days_convention=self.days_convention, start=cell_start)
                 rows.append({**cell.params, **stats.to_dict()})
             self._table = pd.DataFrame(rows)
         return self._table
@@ -245,7 +270,9 @@ def param_sweep(
     A factory exception propagates immediately (fail-loud; with a cache the
     restart resumes at the failed cell). ``timeframe``/``days_convention``
     set stats annualization; ``stats_start`` is the warmup-trim policy
-    (``'common_first_fill'`` default / ``None`` / explicit timestamp).
+    (``'common_first_fill'`` default / ``None`` / explicit timestamp); table
+    stats reseed each cell's entering balance at the trim point (the
+    ``window_pnl`` convention — no synthetic spike bar).
     """
     if not callable(run_fn):
         raise TypeError(f"run_fn must be callable, got "
