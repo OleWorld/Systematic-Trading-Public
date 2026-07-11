@@ -1437,9 +1437,19 @@ def test_explicit_corr_matrix_pre_warmup_run_has_no_type_error():
     assert pf.submitted == []
 
 
-def test_constructor_rejects_corr_lookback_below_31():
+def test_constructor_rejects_corr_lookback_below_32():
     with pytest.raises(ValueError, match="corr_lookback"):
         _build_rm(['BTC'], corr_lookback=30)
+
+
+def test_corr_lookback_31_rejected_with_alignment_explanation():
+    with pytest.raises(ValueError, match="corr_lookback must be >= 32"):
+        _build_rm(['BTC'], corr_lookback=31)
+
+
+def test_corr_lookback_32_accepted():
+    rm = _build_rm(['BTC'], corr_lookback=32)
+    assert rm.corr_lookback == 32
 
 
 def test_constructor_rejects_corr_lookback_above_deque_maxlen():

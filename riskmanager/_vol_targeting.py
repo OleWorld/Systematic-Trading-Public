@@ -439,8 +439,11 @@ class VolTargetingRiskManager(RiskManager):
             universe liveness threshold: a symbol must carry this many
             bars at ``corr_timeframe`` before it can enter the tradable
             universe (see ``get_live_symbols``). Default ``60``. Must
-            be ``>= 31`` (so the window yields at least 30 price-change
-            observations) and ``<=`` the ``corr_timeframe`` deque maxlen
+            be ``>= 32``: the window yields corr_lookback - 1
+            price-change observations and the cross-symbol alignment
+            trim costs one more, so corr_lookback - 2 must cover the
+            30-observation minimum. Must also be ``<=`` the
+            ``corr_timeframe`` deque maxlen
             (``data_handler.timeframes[corr_timeframe]``) — otherwise no
             symbol could ever go live.
         corr_step_size
@@ -553,13 +556,17 @@ class VolTargetingRiskManager(RiskManager):
             raise ValueError(
                 f"position_buffer must be in [0, 1), got {position_buffer}"
             )
-        if corr_lookback < _MIN_CORR_OBS + 1:
+        if corr_lookback < _MIN_CORR_OBS + 2:
             raise ValueError(
-                f"corr_lookback must be >= {_MIN_CORR_OBS + 1}, got "
+                f"corr_lookback must be >= {_MIN_CORR_OBS + 2}, got "
                 f"{corr_lookback}. corr_lookback is the universe liveness "
-                f"threshold and yields corr_lookback - 1 price-change "
-                f"observations, which must cover the {_MIN_CORR_OBS}-obs "
-                f"minimum for a stable correlation estimate."
+                f"threshold; the window yields corr_lookback - 1 price-"
+                f"change observations, and the cross-symbol alignment trim "
+                f"(the event symbol's window ends one bar after the "
+                f"laggards', so dropna removes one row at each end of the "
+                f"union frame) costs one more — corr_lookback - 2 must "
+                f"cover the {_MIN_CORR_OBS}-obs minimum for a stable "
+                f"correlation estimate."
             )
         if corr_step_size < 0:
             raise ValueError(
