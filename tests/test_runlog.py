@@ -652,3 +652,30 @@ def test_sanitize_frame_is_re_exported():
 
     assert runlog.sanitize_frame is private
     assert 'sanitize_frame' in runlog.__all__
+
+
+# ──────────────────────────────────────────────
+# Accessor copy semantics (F8)
+# ──────────────────────────────────────────────
+
+def test_run_record_accessor_mutation_does_not_poison_cache(tmp_path):
+    rec = _save_fake_run(tmp_path)
+    first = rec.trade_log()
+    first['injected'] = 999.0                # new column
+    if len(first):
+        first.iloc[0, first.columns.get_loc('injected')] = -1.0
+    second = rec.trade_log()
+    assert 'injected' not in second.columns
+
+
+def test_run_record_reads_parquet_once_per_table(tmp_path, monkeypatch):
+    rec = _save_fake_run(tmp_path)
+    calls = {'n': 0}
+    real = pd.read_parquet
+    def counting(path, *a, **kw):
+        calls['n'] += 1
+        return real(path, *a, **kw)
+    monkeypatch.setattr('runlog._load.pd.read_parquet', counting)
+    rec.trade_log()
+    rec.trade_log()
+    assert calls['n'] == 1                   # cached after the first read
