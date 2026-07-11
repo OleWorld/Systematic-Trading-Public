@@ -85,8 +85,10 @@ def backtest_stats(
         days/year); also fixes the days-per-year used to rescale
         per-bar volatility to the daily lines.
     start
-        Optional trim point (anything ``pd.Timestamp`` accepts; must be
-        tz-compatible with the curve's UTC index). When given, the
+        Optional trim point (anything ``pd.Timestamp`` accepts; a naive
+        value is interpreted as UTC when the curve's index is tz-aware
+        (matching the validation package's convention); naive-on-naive
+        comparisons pass through unchanged). When given, the
         collapsed equity curve and the trade log are restricted to
         ``timestamp >= start`` before any statistic is computed —
         intended to drop the **flat warmup head** (see the warmup-
@@ -115,10 +117,11 @@ def backtest_stats(
     TypeError
         If ``equity_curve`` or ``trade_log`` is not a DataFrame.
     ValueError
-        If ``initial_capital <= 0``, ``days_convention``/``timeframe`` is
-        invalid, a non-empty ``equity_curve`` lacks required columns, or
-        ``start`` is given while a non-empty ``trade_log`` lacks a
-        ``timestamp`` column.
+        If ``initial_capital`` is not a finite number > 0,
+        ``days_convention``/``timeframe`` is invalid, a non-empty
+        ``equity_curve`` lacks required columns, a non-empty ``trade_log``
+        lacks ``realized_pnl``, or ``start`` is given while a non-empty
+        ``trade_log`` lacks a ``timestamp`` column.
 
     Notes
     -----
@@ -150,9 +153,9 @@ def backtest_stats(
         raise TypeError(
             f"trade_log must be a DataFrame, got {type(trade_log).__name__}"
         )
-    if initial_capital <= 0:
+    if not (math.isfinite(initial_capital) and initial_capital > 0):
         raise ValueError(
-            f"initial_capital must be > 0, got {initial_capital}"
+            f"initial_capital must be a finite number > 0, got {initial_capital}"
         )
     bpy = bars_per_year(timeframe, days_convention)  # raises on bad inputs
     dpy = bars_per_year('1d', days_convention)
@@ -163,10 +166,22 @@ def backtest_stats(
             raise ValueError(
                 f"equity_curve is missing required columns: {missing}"
             )
+    if not trade_log.empty and 'realized_pnl' not in trade_log.columns:
+        raise ValueError(
+            "trade_log is missing required column 'realized_pnl' (a "
+            "non-empty trade log must carry per-fill realized PnL)"
+        )
 
     eq = _collapse_equity(equity_curve)
     if start is not None:
         start = pd.Timestamp(start)
+        if (start.tzinfo is None
+                and isinstance(eq.index, pd.DatetimeIndex)
+                and eq.index.tz is not None):
+            # Naive start = UTC (the validation-package convention); only
+            # localized when the curve is tz-aware so naive synthetic
+            # curves keep comparing naive-to-naive.
+            start = start.tz_localize('UTC')
         if not eq.empty:
             eq = eq.loc[eq.index >= start]
         if not trade_log.empty:
