@@ -92,3 +92,25 @@ def test_uniform_registry_empty_symbols_raises():
 def test_uniform_registry_duplicate_symbols_raises():
     with pytest.raises(ValueError):
         uniform_registry(['BTC', 'BTC'])
+
+
+# ──────────────────────────────────────────────
+# Frozen dataclass (F21)
+# ──────────────────────────────────────────────
+
+import dataclasses
+
+
+def test_instrument_config_is_frozen():
+    cfg = InstrumentConfig(point_value=1000.0, fractional=False)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.point_value = 2000.0
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.fractional = True
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.slippage = None
+
+
+def test_uniform_registry_still_shares_one_instance():
+    reg = uniform_registry(['A', 'B', 'C'])
+    assert reg['A'] is reg['B'] is reg['C']   # dedupe-by-identity preserved
