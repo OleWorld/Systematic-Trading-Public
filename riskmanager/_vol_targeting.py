@@ -961,13 +961,18 @@ class VolTargetingRiskManager(RiskManager):
             # absent from the weights, or the DM's label check would raise.
             corr_matrix = self._derive_corr_matrix(mode, live)
             if corr_matrix is None:
-                # Data-gap / degenerate shortfall — equal weights over the
-                # full live subset; leave self.idm untouched (rho=1
-                # degenerate case), mirroring the corr-based fallback.
-                self.instrument_weight = equal_weight(live)
+                # Data-gap / degenerate shortfall — grouped equal weights
+                # over the full live subset (budgets still honored); leave
+                # self.idm untouched (rho=1 degenerate case), mirroring the
+                # corr-based fallback.
+                self.instrument_weight = self._grouped_weights(
+                    mode, live, None,
+                )
                 return
             self._mark_constant_price_exclusions(live, corr_matrix.index)
-            self.instrument_weight = equal_weight(list(corr_matrix.index))
+            self.instrument_weight = self._grouped_weights(
+                mode, list(corr_matrix.index), corr_matrix,
+            )
             self._update_idm_from_corr(corr_matrix)
         elif mode in ('min_variance', 'risk_parity'):
             if corr_matrix is None:
@@ -1094,6 +1099,96 @@ class VolTargetingRiskManager(RiskManager):
                 for label, (_, symbols) in groups.items()
             }
         return groups
+
+    def _grouped_weights(
+        self, mode: str, kept: List[str],
+        corr_matrix: Optional[pd.DataFrame],
+        dead_log_level: int = logging.INFO,
+    ) -> Dict[str, float]:
+        """Sum-of-books instrument weights over the ``kept`` labels.
+
+        Per budget group (``_budget_groups``): intersect the group's
+        declared universe with ``kept`` (order taken from ``kept``), run
+        the within-group weight scheme over the members — ``mode``'s
+        optimizer on the principal submatrix of ``corr_matrix``, or equal
+        weight when ``mode='equal_weight'`` or ``corr_matrix is None``
+        (the ρ=1 degenerate fallback) — scale by the group's budget
+        renormalized over the groups that have members, and sum:
+        ``w(s) = Σᵢ W'ᵢ·vᵢ(s)``. The result sums to 1 by construction and
+        a symbol covered by several groups draws budget from each owner
+        (sum-of-books; Carver's sub-system aggregation). Groups with no
+        ``kept`` members drop out with their budget redistributed, logged
+        at ``dead_log_level`` — INFO for the inline path (expected warmup
+        staging), WARNING when an explicit ``corr_matrix`` excluded them.
+        If every surviving group carries budget 0, equal budgets over the
+        survivors apply (WARNING). A group covering all of ``kept``
+        consumes ``corr_matrix`` as-is — single-group runs (bare
+        ``Strategy`` / full overlap) stay byte-identical to the ungrouped
+        path, including optimizer-validator behavior on caller-supplied
+        matrices. With >= 2 surviving groups, one INFO line records each
+        group's configured vs. renormalized budget share per recalc.
+        """
+        groups = self._budget_groups()
+        members = {
+            label: [s for s in kept if s in set(universe)]
+            for label, (_, universe) in groups.items()
+        }
+        alive = {label: syms for label, syms in members.items() if syms}
+        if not alive:
+            # Defensive: only reachable if get_budget_groups universes fail
+            # to cover strategy.symbol_list (a malformed custom source).
+            logger.warning(
+                "no budget group covers any of the %d weightable symbols; "
+                "falling back to ungrouped equal weight",
+                len(kept),
+            )
+            return equal_weight(kept)
+        dead = sorted(set(groups) - set(alive))
+        if dead:
+            logger.log(
+                dead_log_level,
+                "budget group(s) %s have no weightable symbols this recalc; "
+                "their budget is redistributed over the %d remaining "
+                "group(s)",
+                dead, len(alive),
+            )
+        total = sum(groups[label][0] for label in alive)
+        if total <= 0:
+            logger.warning(
+                "all %d weightable budget group(s) carry zero budget; "
+                "falling back to equal budgets across them",
+                len(alive),
+            )
+            budgets = {label: 1.0 / len(alive) for label in alive}
+        else:
+            budgets = {label: groups[label][0] / total for label in alive}
+        if len(alive) >= 2:
+            logger.info(
+                "budget groups (configured -> renormalized live share): %s",
+                {label: (groups[label][0], round(budgets[label], 6))
+                 for label in alive},
+            )
+        combined: Dict[str, float] = {s: 0.0 for s in kept}
+        for label, group_syms in alive.items():
+            if len(group_syms) == 1:
+                within = {group_syms[0]: 1.0}
+            elif mode == 'equal_weight' or corr_matrix is None:
+                within = equal_weight(group_syms)
+            else:
+                # Full-cover group: pass the matrix through untouched so
+                # the ungrouped contract (incl. validator behavior on
+                # explicit matrices) is preserved byte-identically.
+                sub = (corr_matrix if group_syms == kept
+                       else corr_matrix.loc[group_syms, group_syms])
+                if mode == 'min_variance':
+                    within = min_variance(sub)
+                elif mode == 'risk_parity':
+                    within = risk_parity(sub)
+                else:
+                    raise ValueError(f"Unexpected mode: {mode!r}")
+            for symbol, v in within.items():
+                combined[symbol] += budgets[label] * v
+        return combined
 
     def _reassess_universe_for_recalc(self) -> None:
         """Start-of-recalc universe pass.

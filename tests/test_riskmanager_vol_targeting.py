@@ -2586,3 +2586,71 @@ def test_budget_groups_bad_budget_falls_back_to_equal_with_warning(caplog):
     assert groups == {'a': (0.5, ['X']), 'b': (0.5, ['Z'])}
     assert any('non-finite/negative budget' in r.getMessage()
                for r in caplog.records)
+
+
+def test_grouped_equal_weight_disjoint_universes_honor_budgets():
+    """The spec's disjoint example: A(0.7)={X,Y,Z}, B(0.3)={W,M,N} →
+    X,Y,Z get 0.7/3 each and W,M,N get 0.1 each (books split 70/30)."""
+    symbols = ['X', 'Y', 'Z', 'W', 'M', 'N']
+    rm = _build_grouped_rm(
+        {'a': (0.7, ['X', 'Y', 'Z']), 'b': (0.3, ['W', 'M', 'N'])},
+        data_handler=_live_dh(symbols),
+    )
+    rm.calculate_instrument_weight(mode='equal_weight')
+    for s in ['X', 'Y', 'Z']:
+        assert math.isclose(rm.instrument_weight[s], 0.7 / 3, abs_tol=1e-12)
+    for s in ['W', 'M', 'N']:
+        assert math.isclose(rm.instrument_weight[s], 0.1, abs_tol=1e-12)
+    assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-12)
+
+
+def test_grouped_equal_weight_overlap_sums_books():
+    """The spec's overlap example: A(0.7)={X,Y}, B(0.3)={Y,Z} → X=.35,
+    Y=.35+.15=.50 (sum of both books), Z=.15."""
+    rm = _build_grouped_rm(
+        {'a': (0.7, ['X', 'Y']), 'b': (0.3, ['Y', 'Z'])},
+        data_handler=_live_dh(['X', 'Y', 'Z']),
+    )
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 0.35, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Y'], 0.50, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Z'], 0.15, abs_tol=1e-12)
+
+
+def test_grouped_equal_weight_full_overlap_matches_ungrouped():
+    """Full-overlap invariance: identical universes reproduce the ungrouped
+    weights and IDM exactly, regardless of the budget split — the smoke-run
+    safety property."""
+    symbols = ['BTC', 'ETH', 'SOL']
+    grouped = _build_grouped_rm(
+        {'a': (0.7, symbols), 'b': (0.3, symbols)},
+        data_handler=_live_dh(symbols),
+    )
+    bare = _build_rm(symbols, data_handler=_live_dh(symbols))
+    grouped.calculate_instrument_weight(mode='equal_weight')
+    bare.calculate_instrument_weight(mode='equal_weight')
+    for s in symbols:
+        assert math.isclose(grouped.instrument_weight[s],
+                            bare.instrument_weight[s], abs_tol=1e-12)
+    assert math.isclose(grouped.idm, bare.idm, rel_tol=1e-12)
+
+
+def test_grouped_fallback_honors_budgets_on_data_gap():
+    """Full-lookback rows but <30 valid observations → ρ None → the
+    grouped equal-weight fallback keeps the 0.7/0.3 budget split and
+    leaves idm untouched (mirrors the ungrouped fallback contract)."""
+    idx = pd.date_range('2024-01-01', periods=60, freq='D')
+
+    def _gappy(seed):
+        vals = np.full(60, np.nan)
+        vals[-20:] = _price_series(20, seed=seed).to_numpy()
+        return pd.Series(vals, index=idx)
+
+    dh = FakeDataHandler(closes={'X': _gappy(0), 'Z': _gappy(1)})
+    rm = _build_grouped_rm({'a': (0.7, ['X']), 'b': (0.3, ['Z'])},
+                           data_handler=dh)
+    rm.idm = 1.7                                     # sentinel
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 0.7, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Z'], 0.3, abs_tol=1e-12)
+    assert rm.idm == 1.7                             # untouched
