@@ -2654,3 +2654,54 @@ def test_grouped_fallback_honors_budgets_on_data_gap():
     assert math.isclose(rm.instrument_weight['X'], 0.7, abs_tol=1e-12)
     assert math.isclose(rm.instrument_weight['Z'], 0.3, abs_tol=1e-12)
     assert rm.idm == 1.7                             # untouched
+
+
+def test_grouped_risk_parity_book_sums_equal_budgets():
+    """Disjoint groups under risk_parity: within-group ERC weights sum to 1,
+    so each book's total instrument weight equals its budget exactly."""
+    symbols = ['A', 'B', 'C', 'D']
+    rm = _build_grouped_rm(
+        {'g1': (0.7, ['A', 'B']), 'g2': (0.3, ['C', 'D'])},
+        data_handler=_live_dh(symbols),
+    )
+    rm.calculate_instrument_weight(mode='risk_parity')
+    book1 = rm.instrument_weight['A'] + rm.instrument_weight['B']
+    book2 = rm.instrument_weight['C'] + rm.instrument_weight['D']
+    assert math.isclose(book1, 0.7, abs_tol=1e-6)
+    assert math.isclose(book2, 0.3, abs_tol=1e-6)
+    assert all(w > 0 for w in rm.instrument_weight.values())
+    assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
+
+
+def test_grouped_min_variance_full_overlap_matches_ungrouped():
+    """Full-overlap invariance holds for the corr-based modes too: both
+    groups solve the identical optimization over the identical matrix, so
+    the sum reproduces the bare-strategy result."""
+    symbols = ['A', 'B', 'C']
+    grouped = _build_grouped_rm(
+        {'g1': (0.6, symbols), 'g2': (0.4, symbols)},
+        data_handler=_live_dh(symbols),
+    )
+    bare = _build_rm(symbols, data_handler=_live_dh(symbols))
+    grouped.calculate_instrument_weight(mode='min_variance')
+    bare.calculate_instrument_weight(mode='min_variance')
+    for s in symbols:
+        assert math.isclose(grouped.instrument_weight[s],
+                            bare.instrument_weight[s], abs_tol=1e-9)
+    assert math.isclose(grouped.idm, bare.idm, rel_tol=1e-9)
+
+
+def test_grouped_inline_min_variance_uses_group_submatrix():
+    """Groups {A,B}(0.5) and {C}(0.5): the pair's min-var solve runs on its
+    2x2 principal submatrix — a two-asset equal-vol min-var is always
+    50/50 regardless of their correlation — so A and B each get 0.25 and
+    the solo group's C takes its full 0.5 budget."""
+    symbols = ['A', 'B', 'C']
+    rm = _build_grouped_rm(
+        {'pair': (0.5, ['A', 'B']), 'solo': (0.5, ['C'])},
+        data_handler=_live_dh(symbols),
+    )
+    rm.calculate_instrument_weight(mode='min_variance')
+    assert math.isclose(rm.instrument_weight['A'], 0.25, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['B'], 0.25, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['C'], 0.5, abs_tol=1e-9)

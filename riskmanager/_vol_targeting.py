@@ -989,12 +989,15 @@ class VolTargetingRiskManager(RiskManager):
                     return
                 corr_matrix = self._derive_corr_matrix(mode, live)
                 if corr_matrix is None:
-                    # Data-gap shortfall — equal-weight fallback over the
-                    # live subset (ρ=1 degenerate case); IDM intentionally
-                    # left untouched.
-                    self.instrument_weight = equal_weight(live)
+                    # Data-gap shortfall — grouped equal-weight fallback over
+                    # the live subset (ρ=1 degenerate case, budgets still
+                    # honored); IDM intentionally left untouched.
+                    self.instrument_weight = self._grouped_weights(
+                        mode, live, None,
+                    )
                     return
                 self._mark_constant_price_exclusions(live, corr_matrix.index)
+                dead_level = logging.INFO
             else:
                 # Explicit-matrix hook (manual/research). The caller owns
                 # the MATRIX (no shrink/floor/PSD hygiene), but the RM owns
@@ -1042,12 +1045,14 @@ class VolTargetingRiskManager(RiskManager):
                     # columns) still reaches the optimizer's validators
                     # untouched.
                     corr_matrix = corr_matrix.loc[kept, kept]
-            if mode == 'min_variance':
-                self.instrument_weight = min_variance(corr_matrix)
-            elif mode == 'risk_parity':
-                self.instrument_weight = risk_parity(corr_matrix)
-            else:
-                raise ValueError(f"Unexpected mode: {mode!r}")
+                dead_level = logging.WARNING
+            # Sum-of-books weights: within-group optimization on principal
+            # submatrices of the ONE matrix, scaled by renormalized budgets
+            # and summed (the mode dispatch lives in _grouped_weights).
+            self.instrument_weight = self._grouped_weights(
+                mode, list(corr_matrix.index), corr_matrix,
+                dead_log_level=dead_level,
+            )
             # Auto-update IDM from the same matrix used for weights so the
             # two stay coherent across walk-forward recomputes.
             self._update_idm_from_corr(corr_matrix)
