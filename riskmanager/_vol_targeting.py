@@ -879,6 +879,12 @@ class VolTargetingRiskManager(RiskManager):
             behaves like the empty inline universe (empty weight dict +
             INFO log, ``idm`` untouched); a single survivor yields
             ``{symbol: 1.0}`` with ``idm = 1.0``.
+            Under budget groups (an orchestrator in the strategy slot)
+            the survivors are then weighted **per group** — each group's
+            scheme runs on its principal submatrix, scaled by its budget
+            renormalized over the groups with survivors and summed
+            (sum-of-books); a group whose members were all dropped loses
+            its budget to the survivors with a WARNING.
             When ``None``, ρ is derived inline from the data
             handler over the live subset (see ``_derive_corr_matrix``):
             an empty live set — always the case at construction time in
@@ -907,7 +913,16 @@ class VolTargetingRiskManager(RiskManager):
         ``idm_cap`` when the cap is enabled, so weights and IDM stay
         coherent. The data-gap equal-weight fallback and the
         empty-universe path leave ``self.idm`` untouched; a singleton
-        universe sets ``idm = 1.0``. Safe to re-call any time
+        universe sets ``idm = 1.0``.
+        When the forecast source exposes ``get_budget_groups()`` (an
+        ``Orchestrator``), every path builds **strategy-budgeted**
+        weights: the configured scheme runs within each strategy's book
+        and each book's total weight equals its renormalized budget share
+        (``w(s) = Σᵢ W'ᵢ·vᵢ(s)`` — see ``_grouped_weights``). A bare
+        ``Strategy`` is a single implicit group, reproducing the
+        ungrouped math exactly; identical group universes (full overlap)
+        also reproduce it, so behavior changes only where universes
+        diverge. Safe to re-call any time
         (e.g. monthly rebalances, regime-driven scheme switches);
         ``update_bar`` re-calls this method every ``corr_step_size``
         completed ``corr_timeframe`` periods in every mode (the recalc

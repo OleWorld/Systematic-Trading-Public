@@ -2705,3 +2705,41 @@ def test_grouped_inline_min_variance_uses_group_submatrix():
     assert math.isclose(rm.instrument_weight['A'], 0.25, abs_tol=1e-9)
     assert math.isclose(rm.instrument_weight['B'], 0.25, abs_tol=1e-9)
     assert math.isclose(rm.instrument_weight['C'], 0.5, abs_tol=1e-9)
+
+
+def test_explicit_corr_matrix_grouped_weights_per_group():
+    """Explicit ρ over a grouped universe: within-group solves on principal
+    submatrices, books scaled by budgets (ρ=0 → 2-asset min-var = 50/50
+    inside the pair)."""
+    symbols = ['A', 'B', 'C']
+    rm = _build_grouped_rm(
+        {'pair': (0.8, ['A', 'B']), 'solo': (0.2, ['C'])},
+        data_handler=_live_dh(symbols),
+    )
+    corr = _corr_df(symbols, off_diag=0.0)
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert math.isclose(rm.instrument_weight['A'], 0.4, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['B'], 0.4, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['C'], 0.2, abs_tol=1e-9)
+
+
+def test_explicit_corr_matrix_omitting_group_warns_and_renormalizes(caplog):
+    """An explicit matrix that omits group 'solo' entirely: the surviving
+    pair book takes the full budget (0.8 → 1.0) and the dead group draws a
+    WARNING (the explicit hook's surprise is louder than inline warmup
+    staging, which logs INFO)."""
+    rm = _build_grouped_rm(
+        {'pair': (0.8, ['A', 'B']), 'solo': (0.2, ['C'])},
+        data_handler=_live_dh(['A', 'B', 'C']),
+    )
+    corr = _corr_df(['A', 'B'], off_diag=0.0)
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert math.isclose(rm.instrument_weight['A'], 0.5, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['B'], 0.5, abs_tol=1e-9)
+    assert 'C' not in rm.instrument_weight
+    assert any(
+        'budget group' in r.getMessage() and 'solo' in r.getMessage()
+        and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
