@@ -183,6 +183,25 @@ class Orchestrator:
         """
         self.strategy_weights = equal_weight(list(self.strategies.keys()))
 
+    def get_budget_groups(self) -> Dict[str, Tuple[float, List[str]]]:
+        """Return the budget-group structure for the risk manager's budget layer.
+
+        ``{label: (budget_weight, universe)}`` — one entry per managed
+        strategy: its current ``strategy_weights`` value (the share of the
+        portfolio risk budget that strategy's book consumes) and a copy of
+        its declared ``symbol_list``. A stateless view over existing state
+        (no new attributes): the weights are read fresh on every call, so a
+        direct ``strategy_weights`` overwrite propagates at the risk
+        manager's next weight recalc. Consumed — via ``hasattr`` — by
+        ``VolTargetingRiskManager.calculate_instrument_weight`` to build
+        strategy-budgeted instrument weights (sum-of-books); a bare
+        ``Strategy`` lacks this method and gets a single implicit group.
+        """
+        return {
+            label: (self.strategy_weights[label], list(strat.symbol_list))
+            for label, strat in self.strategies.items()
+        }
+
     def update_bar(self, event: BarEvent) -> None:
         """Drive every child, then recompute the combined forecast.
 

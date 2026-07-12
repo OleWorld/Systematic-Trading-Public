@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Protocol, Union
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 import pandas as pd
 
@@ -96,14 +96,18 @@ class _StrategyLike(Protocol):
 class _OrchestratorLike(Protocol):
     """Read surface of an ``orchestrator.Orchestrator`` the RiskManager reads.
 
-    Structurally identical to ``_StrategyLike`` — an orchestrator combines
-    several strategies' forecasts into one combined forecast per symbol, but
-    presents the *same* three members the risk manager consumes. The risk
-    manager therefore treats a single strategy and a multi-strategy
-    orchestrator interchangeably as forecast sources (its ``strategy``
-    parameter is typed ``Union[_StrategyLike, _OrchestratorLike]``); the two
-    protocols are kept distinct only to document that both source kinds are
-    first-class.
+    A superset of ``_StrategyLike``: an orchestrator combines several
+    strategies' forecasts into one combined forecast per symbol and presents
+    the same three forecast-source members the risk manager consumes, plus
+    ``get_budget_groups`` — the budget-group structure
+    ``{label: (budget_weight, universe)}`` that
+    ``VolTargetingRiskManager.calculate_instrument_weight`` uses to build
+    strategy-budgeted instrument weights (sum-of-books). The risk manager
+    detects the extra method via ``hasattr`` at recalc time, so a single
+    strategy and a multi-strategy orchestrator remain interchangeable as
+    forecast sources (its ``strategy`` parameter is typed
+    ``Union[_StrategyLike, _OrchestratorLike]``); a bare ``Strategy``
+    simply gets one implicit group.
     """
 
     symbol_list: List[str]
@@ -111,6 +115,8 @@ class _OrchestratorLike(Protocol):
     def get_forecast(self, symbol: str) -> Optional[float]: ...
 
     def is_warmed_up(self, symbol: str) -> bool: ...
+
+    def get_budget_groups(self) -> Dict[str, Tuple[float, List[str]]]: ...
 
 
 # A forecast source is either a single strategy or a multi-strategy
