@@ -104,6 +104,23 @@ class FakeStrategy:
         return self._warmed_up.get(symbol, False)
 
 
+class FakeOrchestrator(FakeStrategy):
+    """FakeStrategy + the orchestrator's ``get_budget_groups`` surface.
+
+    ``groups`` maps ``label -> (budget_weight, [symbols])``; ``symbol_list``
+    is derived as the sorted union of the group universes (mirroring the
+    real ``Orchestrator``).
+    """
+
+    def __init__(self, groups, **kwargs):
+        union = sorted({s for _, syms in groups.values() for s in syms})
+        super().__init__(symbol_list=union, **kwargs)
+        self._groups = {k: (w, list(syms)) for k, (w, syms) in groups.items()}
+
+    def get_budget_groups(self):
+        return {k: (w, list(syms)) for k, (w, syms) in self._groups.items()}
+
+
 class FakeVolEstimator:
     """Returns a configurable per-symbol annualized $-vol (or None for warmup)."""
 
@@ -1019,6 +1036,17 @@ def _build_rm(symbols, *, data_handler: Optional[FakeDataHandler] = None,
         pf, strat, FakeVolEstimator(), data_handler=dh, **kwargs,
     )
     return rm
+
+
+def _build_grouped_rm(groups, *, data_handler=None, **kwargs):
+    """``_build_rm`` variant whose forecast source exposes get_budget_groups."""
+    pf = FakePortfolio()
+    strat = FakeOrchestrator(groups)
+    dh = data_handler if data_handler is not None else FakeDataHandler()
+    kwargs.setdefault('annual_target_vol', 0.25)
+    return VolTargetingRiskManager(
+        pf, strat, FakeVolEstimator(), data_handler=dh, **kwargs,
+    )
 
 
 def _corr_df(labels, off_diag):
@@ -2530,3 +2558,31 @@ def test_small_but_material_sigma_still_sizes():
     pf, _, _, rm = _make(sigma=0.01)            # >> 1e-6 * 100
     rm.update_bar(_bar())
     assert len(pf.submitted) == 1
+
+
+# ──────────────────────────────────────────────
+# Strategy-budgeted instrument weights (budget groups)
+# ──────────────────────────────────────────────
+
+def test_budget_groups_bare_strategy_is_single_implicit_group():
+    """A forecast source without get_budget_groups resolves to one implicit
+    full-universe group at weight 1.0 — the grouped math then collapses to
+    the ungrouped form exactly."""
+    rm = _build_rm(['BTC', 'ETH'])
+    assert rm._budget_groups() == {'__all__': (1.0, ['BTC', 'ETH'])}
+
+
+def test_budget_groups_passthrough_from_orchestrator_like_source():
+    rm = _build_grouped_rm({'a': (0.7, ['X', 'Y']), 'b': (0.3, ['Z'])})
+    assert rm._budget_groups() == {'a': (0.7, ['X', 'Y']), 'b': (0.3, ['Z'])}
+
+
+def test_budget_groups_bad_budget_falls_back_to_equal_with_warning(caplog):
+    """Non-finite/negative budgets (a bad strategy_weights overwrite) draw a
+    WARNING and fall back to equal budgets over all groups."""
+    rm = _build_grouped_rm({'a': (-0.5, ['X']), 'b': (1.5, ['Z'])})
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        groups = rm._budget_groups()
+    assert groups == {'a': (0.5, ['X']), 'b': (0.5, ['Z'])}
+    assert any('non-finite/negative budget' in r.getMessage()
+               for r in caplog.records)

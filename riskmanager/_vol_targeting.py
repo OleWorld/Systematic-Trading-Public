@@ -168,7 +168,7 @@ position matches the target.
 import datetime
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -1060,6 +1060,40 @@ class VolTargetingRiskManager(RiskManager):
             "until the next recalc",
             mode, self.corr_lookback, self.corr_timeframe,
         )
+
+    def _budget_groups(self) -> Dict[str, Tuple[float, List[str]]]:
+        """Resolve the budget-group structure from the forecast source.
+
+        ``strategy.get_budget_groups()`` when the source exposes it (an
+        ``Orchestrator``); otherwise one implicit group over the whole
+        universe — the bare-``Strategy`` case, under which the grouped
+        weight math collapses to the ungrouped form exactly. Budget values
+        are guarded (finite, >= 0): a bad value draws a WARNING and the
+        budgets fall back to equal over all groups. Overall scale is NOT
+        validated — the live-group renormalization in ``_grouped_weights``
+        divides by the live-group budget sum, so a not-quite-sum-to-1
+        overwrite degrades gracefully.
+        """
+        get_groups = getattr(self.strategy, 'get_budget_groups', None)
+        if not callable(get_groups):
+            return {'__all__': (1.0, list(self.strategy.symbol_list))}
+        groups = get_groups()
+        bad = sorted(
+            label for label, (weight, _) in groups.items()
+            if not np.isfinite(weight) or weight < 0
+        )
+        if bad:
+            logger.warning(
+                "get_budget_groups returned non-finite/negative budget(s) "
+                "for %s; falling back to equal budgets over all %d groups",
+                bad, len(groups),
+            )
+            m = len(groups)
+            return {
+                label: (1.0 / m, symbols)
+                for label, (_, symbols) in groups.items()
+            }
+        return groups
 
     def _reassess_universe_for_recalc(self) -> None:
         """Start-of-recalc universe pass.
