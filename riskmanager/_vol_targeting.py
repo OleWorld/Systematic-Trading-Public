@@ -924,7 +924,12 @@ class VolTargetingRiskManager(RiskManager):
         ``Strategy`` is a single implicit group, reproducing the
         ungrouped math exactly; identical group universes (full overlap)
         also reproduce it, so behavior changes only where universes
-        diverge. Safe to re-call any time
+        diverge. One deliberate precedence rule: the singleton-live
+        short-circuit runs BEFORE budget grouping, so the sole live
+        symbol takes weight 1.0 (``idm = 1.0``) even when its group's
+        budget is 0 — the live-subset renormalization convention; the
+        configured budgets re-assert at the first recalc with two or
+        more live symbols. Safe to re-call any time
         (e.g. monthly rebalances, regime-driven scheme switches);
         ``update_bar`` re-calls this method every ``corr_step_size``
         completed ``corr_timeframe`` periods in every mode (the recalc
@@ -1149,6 +1154,10 @@ class VolTargetingRiskManager(RiskManager):
         path, including optimizer-validator behavior on caller-supplied
         matrices. With >= 2 surviving groups, one INFO line records each
         group's configured vs. renormalized budget share per recalc.
+        Kept symbols covered by no group at all keep their seeded 0.0
+        weight and draw a WARNING (only reachable from a malformed custom
+        source — the real ``Orchestrator``'s union universe always
+        covers ``kept``).
         """
         groups = self._budget_groups()
         members = {
@@ -1165,6 +1174,15 @@ class VolTargetingRiskManager(RiskManager):
                 len(kept),
             )
             return equal_weight(kept)
+        covered = {s for syms in members.values() for s in syms}
+        uncovered = [s for s in kept if s not in covered]
+        if uncovered:
+            logger.warning(
+                "%d weightable symbol(s) %s are covered by no budget group "
+                "(malformed get_budget_groups universe?); they keep weight "
+                "0.0 this recalc",
+                len(uncovered), uncovered,
+            )
         dead = sorted(set(groups) - set(alive))
         if dead:
             logger.log(

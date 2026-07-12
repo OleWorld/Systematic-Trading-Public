@@ -2851,3 +2851,41 @@ def test_multi_group_recalc_logs_budget_shares(caplog):
         rm.calculate_instrument_weight(mode='equal_weight')
     assert any('budget groups (configured' in r.getMessage()
                for r in caplog.records)
+
+
+def test_grouped_disjoint_idm_from_summed_weights(caplog):
+    """Diverging universes are the only regime where the summed weights (and
+    hence wᵀρw) actually change — pin the IDM number. Explicit identity ρ
+    over books a=(0.7,{A,B}) / b=(0.3,{C,D}) with 2-asset min-var 50/50
+    within each book gives w = (.35,.35,.15,.15) and
+    IDM = 1/sqrt(Σwᵢ²) = 1/sqrt(0.29), below the 2.5 cap."""
+    symbols = ['A', 'B', 'C', 'D']
+    rm = _build_grouped_rm(
+        {'a': (0.7, ['A', 'B']), 'b': (0.3, ['C', 'D'])},
+        data_handler=_live_dh(symbols),
+    )
+    corr = _corr_df(symbols, off_diag=0.0)
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert math.isclose(rm.instrument_weight['A'], 0.35, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['C'], 0.15, abs_tol=1e-9)
+    assert math.isclose(rm.idm, 1.0 / math.sqrt(0.29), rel_tol=1e-9)
+
+
+def test_uncovered_kept_symbol_warns_and_keeps_zero_weight(caplog):
+    """A malformed custom source whose groups miss a live symbol: the symbol
+    keeps its seeded 0.0 weight and the gap is WARNING-logged instead of
+    silent (the real Orchestrator's union universe cannot produce this)."""
+    class _PartialSource(FakeStrategy):
+        def get_budget_groups(self):
+            return {'a': (1.0, ['X'])}           # omits Y from every group
+    strat = _PartialSource(symbol_list=['X', 'Y'])
+    rm = VolTargetingRiskManager(
+        FakePortfolio(), strat, FakeVolEstimator(),
+        data_handler=_live_dh(['X', 'Y']), annual_target_vol=0.25,
+    )
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 1.0, abs_tol=1e-12)
+    assert rm.instrument_weight['Y'] == 0.0
+    assert any('covered by no budget group' in r.getMessage()
+               for r in caplog.records)
