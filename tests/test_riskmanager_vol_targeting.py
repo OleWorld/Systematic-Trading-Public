@@ -2743,3 +2743,111 @@ def test_explicit_corr_matrix_omitting_group_warns_and_renormalizes(caplog):
         and r.levelno == logging.WARNING
         for r in caplog.records
     )
+
+
+def test_zero_budget_group_symbols_carry_zero_weight():
+    """A live group at budget 0: its exclusive symbols are PRESENT in the
+    dict at weight 0.0 (the existing zero-weight flatten path's trigger),
+    and it does not distort the other groups' renormalization."""
+    rm = _build_grouped_rm(
+        {'a': (1.0, ['X']), 'b': (0.0, ['Z'])},
+        data_handler=_live_dh(['X', 'Z']),
+    )
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 1.0, abs_tol=1e-12)
+    assert rm.instrument_weight['Z'] == 0.0
+
+
+def test_zero_budget_group_flattens_held_position():
+    """End-to-end: a held position on a zero-budget group's symbol flattens
+    through the existing 'zero_weight' path (target 0 → SELL the lot)."""
+    pf = FakePortfolio(positions={'Z': 5.0})
+    strat = FakeOrchestrator({'a': (1.0, ['X']), 'b': (0.0, ['Z'])},
+                             forecasts={'X': 50.0, 'Z': 50.0})
+    rm = VolTargetingRiskManager(
+        pf, strat, FakeVolEstimator({'X': 8000.0, 'Z': 8000.0}),
+        data_handler=_live_dh(['X', 'Z']),
+        annual_target_vol=0.25, vol_target_mode='percent_volatility',
+        position_buffer=0.0, corr_step_size=0,
+    )
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert rm.instrument_weight['Z'] == 0.0
+    rm.update_bar(_bar('Z'))
+    assert len(pf.submitted) == 1
+    assert pf.submitted[0]['symbol'] == 'Z'
+    assert pf.submitted[0]['direction'] == Direction.SELL
+    assert math.isclose(pf.submitted[0]['quantity'], 5.0)
+
+
+def test_dead_group_budget_redistributes_then_reenters():
+    """Group b has no live symbols at the first recalc (no data yet) →
+    group a takes the full budget. Once b's symbol has history, a later
+    recalc restores the configured 0.7/0.3 split — the walk-forward
+    self-heal."""
+    dh = FakeDataHandler(closes={'X': _price_series(60, seed=0)})
+    strat = FakeOrchestrator({'a': (0.7, ['X']), 'b': (0.3, ['Z'])})
+    rm = VolTargetingRiskManager(
+        FakePortfolio(), strat, FakeVolEstimator(), data_handler=dh,
+        annual_target_vol=0.25,
+    )
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 1.0, abs_tol=1e-12)
+    assert 'Z' not in rm.instrument_weight
+    dh._closes['Z'] = _price_series(60, seed=1)      # Z lists later
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 0.7, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Z'], 0.3, abs_tol=1e-12)
+
+
+def test_dead_group_logs_info_and_redistributes(caplog):
+    """>=2 live symbols with one whole group dead: the dead group is
+    INFO-logged (expected warmup staging, not a WARNING) and its budget
+    redistributes to the survivors."""
+    dh = FakeDataHandler(closes={'X': _price_series(60, seed=0),
+                                 'Y': _price_series(60, seed=1)})
+    strat = FakeOrchestrator({'a': (0.7, ['X', 'Y']), 'b': (0.3, ['Z'])})
+    rm = VolTargetingRiskManager(
+        FakePortfolio(), strat, FakeVolEstimator(), data_handler=dh,
+        annual_target_vol=0.25,
+    )
+    with caplog.at_level(logging.INFO, logger='riskmanager._vol_targeting'):
+        rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 0.5, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Y'], 0.5, abs_tol=1e-12)
+    assert 'Z' not in rm.instrument_weight
+    assert any(
+        'budget group' in r.getMessage() and r.levelno == logging.INFO
+        for r in caplog.records
+    )
+
+
+def test_all_zero_live_budgets_fall_back_to_equal(caplog):
+    """All non-zero budget sits on a dead group → the renormalization
+    denominator is 0 → WARNING + equal budgets over the live groups (the
+    spec's degenerate case)."""
+    dh = FakeDataHandler(closes={'X': _price_series(60, seed=0),
+                                 'Z': _price_series(60, seed=1)})
+    strat = FakeOrchestrator({'a': (0.0, ['X']), 'b': (0.0, ['Z']),
+                              'c': (1.0, ['DEAD'])})
+    rm = VolTargetingRiskManager(
+        FakePortfolio(), strat, FakeVolEstimator(), data_handler=dh,
+        annual_target_vol=0.25,
+    )
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 0.5, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Z'], 0.5, abs_tol=1e-12)
+    assert any('zero budget' in r.getMessage() for r in caplog.records)
+
+
+def test_multi_group_recalc_logs_budget_shares(caplog):
+    """Every multi-group recalc INFO-logs configured vs renormalized budget
+    shares (the spec's observability requirement)."""
+    rm = _build_grouped_rm(
+        {'a': (0.7, ['X']), 'b': (0.3, ['Z'])},
+        data_handler=_live_dh(['X', 'Z']),
+    )
+    with caplog.at_level(logging.INFO, logger='riskmanager._vol_targeting'):
+        rm.calculate_instrument_weight(mode='equal_weight')
+    assert any('budget groups (configured' in r.getMessage()
+               for r in caplog.records)
