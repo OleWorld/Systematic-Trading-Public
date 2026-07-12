@@ -25,6 +25,8 @@ where:
     capital                = portfolio.calculate_balance()              (account equity)
     IDM                    = instrument diversification multiplier      (constructor)
     instrument_weight      = per-symbol capital weight                  (self.instrument_weight)
+                             (strategy-budgeted sum-of-books when an
+                             orchestrator supplies budget groups)
     annual_target_vol  = annualized vol target                      (constructor; REQUIRED —
                              $ amount in dollar mode, e.g. 250_000;
                              fraction of equity in percent mode, e.g. 0.25 = 25 %)

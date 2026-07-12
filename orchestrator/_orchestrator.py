@@ -39,11 +39,17 @@ forecast for the symbol (the first time a combined forecast is cached);
 convention strategies use, so the risk manager's liveness gate treats the
 orchestrator exactly as it treats a single strategy.
 
-Strategy weighting lives **here** (the orchestrator is the sole owner):
-the weights are baked into the combined forecast, so the risk manager no
-longer applies a strategy weight of its own. Because vol-target sizing is
-linear in the forecast, forecast-level weighting is equivalent to
-position-level weighting.
+Strategy weighting lives **here** (the orchestrator is the sole owner),
+with one meaning at two layers. Conviction: the weights are baked into
+the combined forecast, so the risk manager no longer applies a strategy
+weight of its own (vol-target sizing is linear in the forecast, so
+forecast-level weighting is equivalent to position-level weighting when
+universes overlap). Budget: ``get_budget_groups()`` exposes
+``{label: (weight, universe)}`` so ``VolTargetingRiskManager`` can build
+strategy-budgeted instrument weights (sum-of-books) — each strategy's
+book carries its weight's share of the portfolio risk budget even when
+the universes are disjoint and the per-symbol renormalization would
+otherwise void the weight.
 """
 
 import logging
@@ -89,6 +95,9 @@ class Orchestrator:
         must match ``strategies`` exactly; values must be finite and
         non-negative and sum to ``1.0`` within ``1e-9``. Default
         ``None`` → equal weight ``1/M`` via ``analytics.equal_weight``.
+        Besides weighting the forecast blend, these are the per-strategy
+        **risk-budget shares** consumed by the risk manager via
+        ``get_budget_groups()``.
         These are the *global* weights; per symbol they are renormalized
         over the contributing subset (see the module docstring).
     fdm
