@@ -676,3 +676,28 @@ def test_live_execution_execute_order_is_noop():
 def test_live_execution_update_bar_is_noop():
     le = LiveExecution()
     assert le.update_bar(_bar()) is None
+
+
+# ──────────────────────────────────────────────
+# Value-domain validation (F5): negative/NaN/inf value must raise
+# ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("mode", ['pct', 'absolute'])
+@pytest.mark.parametrize("bad", [-0.01, float('nan'), float('inf'),
+                                 float('-inf')])
+def test_slippage_model_rejects_non_finite_or_negative_value(mode, bad):
+    with pytest.raises(ValueError, match="SlippageModel value"):
+        SlippageModel(mode=mode, value=bad)
+
+
+@pytest.mark.parametrize("mode", ['rate', 'per_contract'])
+@pytest.mark.parametrize("bad", [-1.0, float('nan'), float('inf'),
+                                 float('-inf')])
+def test_commission_model_rejects_non_finite_or_negative_value(mode, bad):
+    with pytest.raises(ValueError, match="CommissionModel value"):
+        CommissionModel(mode=mode, value=bad)
+
+
+def test_slippage_and_commission_accept_zero_value():
+    assert SlippageModel(mode='absolute', value=0.0).value == 0.0
+    assert CommissionModel(mode='per_contract', value=0.0).value == 0.0

@@ -107,7 +107,12 @@ class DataHandler(abc.ABC):
         deque is left untouched (first bar wins), a WARNING is logged,
         and the method returns ``False`` — so the duplicate never
         re-enters the HTF volume accumulator and never emits a second
-        ``BarEvent``.
+        ``BarEvent``. A bar whose timestamp is EARLIER than the last
+        accepted completed bar raises ``ValueError`` (forming or
+        completed): out-of-order input violates the sorted-stream
+        contract and everything computed since the true position of that
+        bar is suspect — the run dies loudly instead of continuing on
+        corrupt state.
 
         HTF accumulation is gated on ``is_forming`` because live forming
         emissions carry cumulative OHLCV for the in-progress base bar —
@@ -118,7 +123,9 @@ class DataHandler(abc.ABC):
         -------
         bool
             ``True`` if the bar was accepted and stored; ``False`` if it was
-            rejected for NaN OHLC or as a duplicate completed bar.
+            rejected for NaN OHLC or as a duplicate completed bar. A bar
+            earlier than the last accepted completed bar raises
+            ``ValueError`` instead of returning.
         """
         if pd.isna(o) or pd.isna(h) or pd.isna(l) or pd.isna(c):
             logger.warning(
@@ -126,7 +133,17 @@ class DataHandler(abc.ABC):
                 symbol, ts, o, h, l, c,
             )
             return False
-        if not is_forming and ts == self._last_completed_ts[symbol]:
+        last_completed = self._last_completed_ts[symbol]
+        if last_completed is not None and ts < last_completed:
+            raise ValueError(
+                f"Out-of-order bar for {symbol!r}: ts={ts} is earlier than "
+                f"the last accepted completed bar at {last_completed}. "
+                f"Bars must arrive in ascending time order — a backward "
+                f"bar would corrupt HTF aggregates, indicator recursion, "
+                f"and the latest-price cache, so the run is aborted "
+                f"rather than continued on corrupt state."
+            )
+        if not is_forming and ts == last_completed:
             logger.warning(
                 "Dropping duplicate completed bar: symbol=%s ts=%s "
                 "(a completed bar at this timestamp was already accepted; "

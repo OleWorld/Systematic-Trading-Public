@@ -499,3 +499,32 @@ def test_risk_manager_accepts_orchestrator_and_sizes_off_combined_forecast():
     assert pf.submitted[0]['direction'] == Direction.BUY
     assert math.isclose(pf.submitted[0]['quantity'], 25_000.0 / 8_000.0,
                         rel_tol=1e-12)
+
+
+# ──────────────────────────────────────────────
+# get_budget_groups — the risk manager's budget-layer view
+# ──────────────────────────────────────────────
+
+def test_get_budget_groups_returns_weights_and_universes():
+    """{label: (strategy_weight, universe copy)} per child; universes are
+    copies, so caller mutation cannot corrupt the child's symbol_list."""
+    a = _StubStrategy({'X': 10.0}, ['X', 'Y'])
+    b = _StubStrategy({'Y': -20.0}, ['Y', 'Z'])
+    orch = Orchestrator({'a': a, 'b': b}, weights={'a': 0.7, 'b': 0.3})
+    groups = orch.get_budget_groups()
+    assert groups == {'a': (0.7, ['X', 'Y']), 'b': (0.3, ['Y', 'Z'])}
+    groups['a'][1].append('MUTATED')
+    assert a.symbol_list == ['X', 'Y']
+
+
+def test_get_budget_groups_reads_overwritten_weights_fresh():
+    """A direct strategy_weights overwrite (the documented convention) is
+    visible on the next call — the view holds no copied state."""
+    a = _StubStrategy({}, ['X'])
+    b = _StubStrategy({}, ['Z'])
+    orch = Orchestrator({'a': a, 'b': b})            # equal 1/2 default
+    assert orch.get_budget_groups()['a'][0] == 0.5
+    orch.strategy_weights = {'a': 0.9, 'b': 0.1}
+    groups = orch.get_budget_groups()
+    assert groups['a'][0] == 0.9
+    assert groups['b'][0] == 0.1

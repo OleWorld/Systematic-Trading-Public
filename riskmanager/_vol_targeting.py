@@ -25,6 +25,8 @@ where:
     capital                = portfolio.calculate_balance()              (account equity)
     IDM                    = instrument diversification multiplier      (constructor)
     instrument_weight      = per-symbol capital weight                  (self.instrument_weight)
+                             (strategy-budgeted sum-of-books when an
+                             orchestrator supplies budget groups)
     annual_target_vol  = annualized vol target                      (constructor; REQUIRED —
                              $ amount in dollar mode, e.g. 250_000;
                              fraction of equity in percent mode, e.g. 0.25 = 25 %)
@@ -168,7 +170,7 @@ position matches the target.
 import datetime
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -439,8 +441,11 @@ class VolTargetingRiskManager(RiskManager):
             universe liveness threshold: a symbol must carry this many
             bars at ``corr_timeframe`` before it can enter the tradable
             universe (see ``get_live_symbols``). Default ``60``. Must
-            be ``>= 31`` (so the window yields at least 30 price-change
-            observations) and ``<=`` the ``corr_timeframe`` deque maxlen
+            be ``>= 32``: the window yields corr_lookback - 1
+            price-change observations and the cross-symbol alignment
+            trim costs one more, so corr_lookback - 2 must cover the
+            30-observation minimum. Must also be ``<=`` the
+            ``corr_timeframe`` deque maxlen
             (``data_handler.timeframes[corr_timeframe]``) — otherwise no
             symbol could ever go live.
         corr_step_size
@@ -453,10 +458,10 @@ class VolTargetingRiskManager(RiskManager):
             symbols at the same timestamp and sub-period base bars (e.g.
             base='1h' with corr_timeframe='1d') both contribute exactly
             one period crossing. Default ``30``. Set to ``0`` to disable
-            auto-recalc (one-shot at ``__init__`` only). Only active
-            under a corr-based ``instrument_weight_mode``
-            (``'min_variance'`` / ``'risk_parity'``); no effect under
-            ``'equal_weight'``.
+            auto-recalc (one-shot at ``__init__`` only). Active in EVERY
+            weight mode — under ``'equal_weight'`` the recalc is the
+            periodic liveness re-assessment that admits newly-live
+            symbols (weights stay 1/N; the IDM still updates).
         corr_timeframe
             Timeframe the data handler reads when assembling the closes
             window. Default ``'1d'``. Must be a key of
@@ -553,13 +558,17 @@ class VolTargetingRiskManager(RiskManager):
             raise ValueError(
                 f"position_buffer must be in [0, 1), got {position_buffer}"
             )
-        if corr_lookback < _MIN_CORR_OBS + 1:
+        if corr_lookback < _MIN_CORR_OBS + 2:
             raise ValueError(
-                f"corr_lookback must be >= {_MIN_CORR_OBS + 1}, got "
+                f"corr_lookback must be >= {_MIN_CORR_OBS + 2}, got "
                 f"{corr_lookback}. corr_lookback is the universe liveness "
-                f"threshold and yields corr_lookback - 1 price-change "
-                f"observations, which must cover the {_MIN_CORR_OBS}-obs "
-                f"minimum for a stable correlation estimate."
+                f"threshold; the window yields corr_lookback - 1 price-"
+                f"change observations, and the cross-symbol alignment trim "
+                f"(the event symbol's window ends one bar after the "
+                f"laggards', so dropna removes one row at each end of the "
+                f"union frame) costs one more — corr_lookback - 2 must "
+                f"cover the {_MIN_CORR_OBS}-obs minimum for a stable "
+                f"correlation estimate."
             )
         if corr_step_size < 0:
             raise ValueError(
@@ -872,6 +881,12 @@ class VolTargetingRiskManager(RiskManager):
             behaves like the empty inline universe (empty weight dict +
             INFO log, ``idm`` untouched); a single survivor yields
             ``{symbol: 1.0}`` with ``idm = 1.0``.
+            Under budget groups (an orchestrator in the strategy slot)
+            the survivors are then weighted **per group** — each group's
+            scheme runs on its principal submatrix, scaled by its budget
+            renormalized over the groups with survivors and summed
+            (sum-of-books); a group whose members were all dropped loses
+            its budget to the survivors with a WARNING.
             When ``None``, ρ is derived inline from the data
             handler over the live subset (see ``_derive_corr_matrix``):
             an empty live set — always the case at construction time in
@@ -900,7 +915,21 @@ class VolTargetingRiskManager(RiskManager):
         ``idm_cap`` when the cap is enabled, so weights and IDM stay
         coherent. The data-gap equal-weight fallback and the
         empty-universe path leave ``self.idm`` untouched; a singleton
-        universe sets ``idm = 1.0``. Safe to re-call any time
+        universe sets ``idm = 1.0``.
+        When the forecast source exposes ``get_budget_groups()`` (an
+        ``Orchestrator``), every path builds **strategy-budgeted**
+        weights: the configured scheme runs within each strategy's book
+        and each book's total weight equals its renormalized budget share
+        (``w(s) = Σᵢ W'ᵢ·vᵢ(s)`` — see ``_grouped_weights``). A bare
+        ``Strategy`` is a single implicit group, reproducing the
+        ungrouped math exactly; identical group universes (full overlap)
+        also reproduce it, so behavior changes only where universes
+        diverge. One deliberate precedence rule: the singleton-live
+        short-circuit runs BEFORE budget grouping, so the sole live
+        symbol takes weight 1.0 (``idm = 1.0``) even when its group's
+        budget is 0 — the live-subset renormalization convention; the
+        configured budgets re-assert at the first recalc with two or
+        more live symbols. Safe to re-call any time
         (e.g. monthly rebalances, regime-driven scheme switches);
         ``update_bar`` re-calls this method every ``corr_step_size``
         completed ``corr_timeframe`` periods in every mode (the recalc
@@ -954,13 +983,18 @@ class VolTargetingRiskManager(RiskManager):
             # absent from the weights, or the DM's label check would raise.
             corr_matrix = self._derive_corr_matrix(mode, live)
             if corr_matrix is None:
-                # Data-gap / degenerate shortfall — equal weights over the
-                # full live subset; leave self.idm untouched (rho=1
-                # degenerate case), mirroring the corr-based fallback.
-                self.instrument_weight = equal_weight(live)
+                # Data-gap / degenerate shortfall — grouped equal weights
+                # over the full live subset (budgets still honored); leave
+                # self.idm untouched (rho=1 degenerate case), mirroring the
+                # corr-based fallback.
+                self.instrument_weight = self._grouped_weights(
+                    mode, live, None,
+                )
                 return
             self._mark_constant_price_exclusions(live, corr_matrix.index)
-            self.instrument_weight = equal_weight(list(corr_matrix.index))
+            self.instrument_weight = self._grouped_weights(
+                mode, list(corr_matrix.index), corr_matrix,
+            )
             self._update_idm_from_corr(corr_matrix)
         elif mode in ('min_variance', 'risk_parity'):
             if corr_matrix is None:
@@ -977,12 +1011,15 @@ class VolTargetingRiskManager(RiskManager):
                     return
                 corr_matrix = self._derive_corr_matrix(mode, live)
                 if corr_matrix is None:
-                    # Data-gap shortfall — equal-weight fallback over the
-                    # live subset (ρ=1 degenerate case); IDM intentionally
-                    # left untouched.
-                    self.instrument_weight = equal_weight(live)
+                    # Data-gap shortfall — grouped equal-weight fallback over
+                    # the live subset (ρ=1 degenerate case, budgets still
+                    # honored); IDM intentionally left untouched.
+                    self.instrument_weight = self._grouped_weights(
+                        mode, live, None,
+                    )
                     return
                 self._mark_constant_price_exclusions(live, corr_matrix.index)
+                dead_level = logging.INFO
             else:
                 # Explicit-matrix hook (manual/research). The caller owns
                 # the MATRIX (no shrink/floor/PSD hygiene), but the RM owns
@@ -1030,12 +1067,14 @@ class VolTargetingRiskManager(RiskManager):
                     # columns) still reaches the optimizer's validators
                     # untouched.
                     corr_matrix = corr_matrix.loc[kept, kept]
-            if mode == 'min_variance':
-                self.instrument_weight = min_variance(corr_matrix)
-            elif mode == 'risk_parity':
-                self.instrument_weight = risk_parity(corr_matrix)
-            else:
-                raise ValueError(f"Unexpected mode: {mode!r}")
+                dead_level = logging.WARNING
+            # Sum-of-books weights: within-group optimization on principal
+            # submatrices of the ONE matrix, scaled by renormalized budgets
+            # and summed (the mode dispatch lives in _grouped_weights).
+            self.instrument_weight = self._grouped_weights(
+                mode, list(corr_matrix.index), corr_matrix,
+                dead_log_level=dead_level,
+            )
             # Auto-update IDM from the same matrix used for weights so the
             # two stay coherent across walk-forward recomputes.
             self._update_idm_from_corr(corr_matrix)
@@ -1053,6 +1092,143 @@ class VolTargetingRiskManager(RiskManager):
             "until the next recalc",
             mode, self.corr_lookback, self.corr_timeframe,
         )
+
+    def _budget_groups(self) -> Dict[str, Tuple[float, List[str]]]:
+        """Resolve the budget-group structure from the forecast source.
+
+        ``strategy.get_budget_groups()`` when the source exposes it (an
+        ``Orchestrator``); otherwise one implicit group over the whole
+        universe — the bare-``Strategy`` case, under which the grouped
+        weight math collapses to the ungrouped form exactly. Budget values
+        are guarded (finite, >= 0): a bad value draws a WARNING and the
+        budgets fall back to equal over all groups. Overall scale is NOT
+        validated — the live-group renormalization in ``_grouped_weights``
+        divides by the live-group budget sum, so a not-quite-sum-to-1
+        overwrite degrades gracefully.
+        """
+        get_groups = getattr(self.strategy, 'get_budget_groups', None)
+        if not callable(get_groups):
+            return {'__all__': (1.0, list(self.strategy.symbol_list))}
+        groups = get_groups()
+        bad = sorted(
+            label for label, (weight, _) in groups.items()
+            if not np.isfinite(weight) or weight < 0
+        )
+        if bad:
+            logger.warning(
+                "get_budget_groups returned non-finite/negative budget(s) "
+                "for %s; falling back to equal budgets over all %d groups",
+                bad, len(groups),
+            )
+            m = len(groups)
+            return {
+                label: (1.0 / m, symbols)
+                for label, (_, symbols) in groups.items()
+            }
+        return groups
+
+    def _grouped_weights(
+        self, mode: str, kept: List[str],
+        corr_matrix: Optional[pd.DataFrame],
+        dead_log_level: int = logging.INFO,
+    ) -> Dict[str, float]:
+        """Sum-of-books instrument weights over the ``kept`` labels.
+
+        Per budget group (``_budget_groups``): intersect the group's
+        declared universe with ``kept`` (order taken from ``kept``), run
+        the within-group weight scheme over the members — ``mode``'s
+        optimizer on the principal submatrix of ``corr_matrix``, or equal
+        weight when ``mode='equal_weight'`` or ``corr_matrix is None``
+        (the ρ=1 degenerate fallback) — scale by the group's budget
+        renormalized over the groups that have members, and sum:
+        ``w(s) = Σᵢ W'ᵢ·vᵢ(s)``. The result sums to 1 by construction and
+        a symbol covered by several groups draws budget from each owner
+        (sum-of-books; Carver's sub-system aggregation). Groups with no
+        ``kept`` members drop out with their budget redistributed, logged
+        at ``dead_log_level`` — INFO for the inline path (expected warmup
+        staging), WARNING when an explicit ``corr_matrix`` excluded them.
+        If every surviving group carries budget 0, equal budgets over the
+        survivors apply (WARNING). A group covering all of ``kept``
+        consumes ``corr_matrix`` as-is — single-group runs (bare
+        ``Strategy`` / full overlap) stay byte-identical to the ungrouped
+        path, including optimizer-validator behavior on caller-supplied
+        matrices. With >= 2 surviving groups, one INFO line records each
+        group's configured vs. renormalized budget share per recalc.
+        Kept symbols covered by no group at all keep their seeded 0.0
+        weight and draw a WARNING (only reachable from a malformed custom
+        source — the real ``Orchestrator``'s union universe always
+        covers ``kept``).
+        """
+        groups = self._budget_groups()
+        members = {
+            label: [s for s in kept if s in set(universe)]
+            for label, (_, universe) in groups.items()
+        }
+        alive = {label: syms for label, syms in members.items() if syms}
+        if not alive:
+            # Defensive: only reachable if get_budget_groups universes fail
+            # to cover strategy.symbol_list (a malformed custom source).
+            logger.warning(
+                "no budget group covers any of the %d weightable symbols; "
+                "falling back to ungrouped equal weight",
+                len(kept),
+            )
+            return equal_weight(kept)
+        covered = {s for syms in members.values() for s in syms}
+        uncovered = [s for s in kept if s not in covered]
+        if uncovered:
+            logger.warning(
+                "%d weightable symbol(s) %s are covered by no budget group "
+                "(malformed get_budget_groups universe?); they keep weight "
+                "0.0 this recalc",
+                len(uncovered), uncovered,
+            )
+        dead = sorted(set(groups) - set(alive))
+        if dead:
+            logger.log(
+                dead_log_level,
+                "budget group(s) %s have no weightable symbols this recalc; "
+                "their budget is redistributed over the %d remaining "
+                "group(s)",
+                dead, len(alive),
+            )
+        total = sum(groups[label][0] for label in alive)
+        if total <= 0:
+            logger.warning(
+                "all %d weightable budget group(s) carry zero budget; "
+                "falling back to equal budgets across them",
+                len(alive),
+            )
+            budgets = {label: 1.0 / len(alive) for label in alive}
+        else:
+            budgets = {label: groups[label][0] / total for label in alive}
+        if len(alive) >= 2:
+            logger.info(
+                "budget groups (configured -> renormalized live share): %s",
+                {label: (groups[label][0], round(budgets[label], 6))
+                 for label in alive},
+            )
+        combined: Dict[str, float] = {s: 0.0 for s in kept}
+        for label, group_syms in alive.items():
+            if len(group_syms) == 1:
+                within = {group_syms[0]: 1.0}
+            elif mode == 'equal_weight' or corr_matrix is None:
+                within = equal_weight(group_syms)
+            else:
+                # Full-cover group: pass the matrix through untouched so
+                # the ungrouped contract (incl. validator behavior on
+                # explicit matrices) is preserved byte-identically.
+                sub = (corr_matrix if group_syms == kept
+                       else corr_matrix.loc[group_syms, group_syms])
+                if mode == 'min_variance':
+                    within = min_variance(sub)
+                elif mode == 'risk_parity':
+                    within = risk_parity(sub)
+                else:
+                    raise ValueError(f"Unexpected mode: {mode!r}")
+            for symbol, v in within.items():
+                combined[symbol] += budgets[label] * v
+        return combined
 
     def _reassess_universe_for_recalc(self) -> None:
         """Start-of-recalc universe pass.

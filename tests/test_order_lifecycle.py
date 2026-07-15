@@ -99,7 +99,7 @@ def _run_engine(closes, *, capital: float, vol: StubVol,
         annual_target_vol=annual_target_vol,
         vol_target_mode='dollar_volatility',
         position_buffer=0.25, instrument_weight_mode='equal_weight',
-        corr_lookback=31, corr_step_size=5, corr_timeframe='1d',
+        corr_lookback=32, corr_step_size=5, corr_timeframe='1d',
     )
     execution = BacktestExecution(events, instruments)
     Backtester(events, dh, strategy, portfolio, rm, execution).run()

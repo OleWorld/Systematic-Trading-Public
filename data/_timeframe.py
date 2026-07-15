@@ -7,7 +7,9 @@ TIMEFRAME_FALLBACK_ORDER = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
 
 
 def _parse_date(date_input: Union[str, datetime.datetime]) -> datetime.datetime:
-    """Parse string or datetime to timezone-aware UTC datetime."""
+    """Parse string or datetime; date-only strings get UTC attached, but
+    tz-less ISO datetime strings and naive datetime inputs pass through
+    NAIVE (no tz is forced)."""
     if isinstance(date_input, datetime.datetime):
         return date_input
     if 'T' in date_input:

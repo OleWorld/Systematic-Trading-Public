@@ -42,10 +42,13 @@ def _default_margin() -> MarginModel:
     return PortfolioMarginModel.from_leverage(1.0)
 
 
-@dataclass
+@dataclass(frozen=True)
 class InstrumentConfig:
     """
     Per-symbol trading metadata.
+
+    Frozen: instances are immutable after construction (field assignment
+    raises ``FrozenInstanceError``).
 
     Attributes
     ----------
@@ -98,10 +101,13 @@ def uniform_registry(
     Build a registry that applies the same ``InstrumentConfig`` to every
     symbol — the one-liner for a homogeneous book (e.g. the crypto basket).
 
-    Every symbol maps to a single shared ``InstrumentConfig`` instance (treat
-    it as immutable). The cost/margin models are stateless, so sharing their
-    references is safe. Pass distinct ``InstrumentConfig`` objects directly in
-    a hand-built dict for a heterogeneous book.
+    Every symbol maps to a single shared ``InstrumentConfig`` instance.
+    The config is a frozen dataclass — field assignment raises
+    ``FrozenInstanceError`` — so the shared instance cannot be mutated
+    out from under the other symbols. The cost/margin model objects are
+    also shared references: build new model instances rather than
+    mutating one in place. Pass distinct ``InstrumentConfig`` objects
+    directly in a hand-built dict for a heterogeneous book.
 
     Parameters
     ----------

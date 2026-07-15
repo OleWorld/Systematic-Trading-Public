@@ -104,6 +104,23 @@ class FakeStrategy:
         return self._warmed_up.get(symbol, False)
 
 
+class FakeOrchestrator(FakeStrategy):
+    """FakeStrategy + the orchestrator's ``get_budget_groups`` surface.
+
+    ``groups`` maps ``label -> (budget_weight, [symbols])``; ``symbol_list``
+    is derived as the sorted union of the group universes (mirroring the
+    real ``Orchestrator``).
+    """
+
+    def __init__(self, groups, **kwargs):
+        union = sorted({s for _, syms in groups.values() for s in syms})
+        super().__init__(symbol_list=union, **kwargs)
+        self._groups = {k: (w, list(syms)) for k, (w, syms) in groups.items()}
+
+    def get_budget_groups(self):
+        return {k: (w, list(syms)) for k, (w, syms) in self._groups.items()}
+
+
 class FakeVolEstimator:
     """Returns a configurable per-symbol annualized $-vol (or None for warmup)."""
 
@@ -1021,6 +1038,17 @@ def _build_rm(symbols, *, data_handler: Optional[FakeDataHandler] = None,
     return rm
 
 
+def _build_grouped_rm(groups, *, data_handler=None, **kwargs):
+    """``_build_rm`` variant whose forecast source exposes get_budget_groups."""
+    pf = FakePortfolio()
+    strat = FakeOrchestrator(groups)
+    dh = data_handler if data_handler is not None else FakeDataHandler()
+    kwargs.setdefault('annual_target_vol', 0.25)
+    return VolTargetingRiskManager(
+        pf, strat, FakeVolEstimator(), data_handler=dh, **kwargs,
+    )
+
+
 def _corr_df(labels, off_diag):
     """N×N correlation matrix with a uniform off-diagonal value."""
     n = len(labels)
@@ -1437,9 +1465,19 @@ def test_explicit_corr_matrix_pre_warmup_run_has_no_type_error():
     assert pf.submitted == []
 
 
-def test_constructor_rejects_corr_lookback_below_31():
+def test_constructor_rejects_corr_lookback_below_32():
     with pytest.raises(ValueError, match="corr_lookback"):
         _build_rm(['BTC'], corr_lookback=30)
+
+
+def test_corr_lookback_31_rejected_with_alignment_explanation():
+    with pytest.raises(ValueError, match="corr_lookback must be >= 32"):
+        _build_rm(['BTC'], corr_lookback=31)
+
+
+def test_corr_lookback_32_accepted():
+    rm = _build_rm(['BTC'], corr_lookback=32)
+    assert rm.corr_lookback == 32
 
 
 def test_constructor_rejects_corr_lookback_above_deque_maxlen():
@@ -2520,3 +2558,334 @@ def test_small_but_material_sigma_still_sizes():
     pf, _, _, rm = _make(sigma=0.01)            # >> 1e-6 * 100
     rm.update_bar(_bar())
     assert len(pf.submitted) == 1
+
+
+# ──────────────────────────────────────────────
+# Strategy-budgeted instrument weights (budget groups)
+# ──────────────────────────────────────────────
+
+def test_budget_groups_bare_strategy_is_single_implicit_group():
+    """A forecast source without get_budget_groups resolves to one implicit
+    full-universe group at weight 1.0 — the grouped math then collapses to
+    the ungrouped form exactly."""
+    rm = _build_rm(['BTC', 'ETH'])
+    assert rm._budget_groups() == {'__all__': (1.0, ['BTC', 'ETH'])}
+
+
+def test_budget_groups_passthrough_from_orchestrator_like_source():
+    rm = _build_grouped_rm({'a': (0.7, ['X', 'Y']), 'b': (0.3, ['Z'])})
+    assert rm._budget_groups() == {'a': (0.7, ['X', 'Y']), 'b': (0.3, ['Z'])}
+
+
+def test_budget_groups_bad_budget_falls_back_to_equal_with_warning(caplog):
+    """Non-finite/negative budgets (a bad strategy_weights overwrite) draw a
+    WARNING and fall back to equal budgets over all groups."""
+    rm = _build_grouped_rm({'a': (-0.5, ['X']), 'b': (1.5, ['Z'])})
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        groups = rm._budget_groups()
+    assert groups == {'a': (0.5, ['X']), 'b': (0.5, ['Z'])}
+    assert any('non-finite/negative budget' in r.getMessage()
+               for r in caplog.records)
+
+
+def test_grouped_equal_weight_disjoint_universes_honor_budgets():
+    """The spec's disjoint example: A(0.7)={X,Y,Z}, B(0.3)={W,M,N} →
+    X,Y,Z get 0.7/3 each and W,M,N get 0.1 each (books split 70/30)."""
+    symbols = ['X', 'Y', 'Z', 'W', 'M', 'N']
+    rm = _build_grouped_rm(
+        {'a': (0.7, ['X', 'Y', 'Z']), 'b': (0.3, ['W', 'M', 'N'])},
+        data_handler=_live_dh(symbols),
+    )
+    rm.calculate_instrument_weight(mode='equal_weight')
+    for s in ['X', 'Y', 'Z']:
+        assert math.isclose(rm.instrument_weight[s], 0.7 / 3, abs_tol=1e-12)
+    for s in ['W', 'M', 'N']:
+        assert math.isclose(rm.instrument_weight[s], 0.1, abs_tol=1e-12)
+    assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-12)
+
+
+def test_grouped_equal_weight_overlap_sums_books():
+    """The spec's overlap example: A(0.7)={X,Y}, B(0.3)={Y,Z} → X=.35,
+    Y=.35+.15=.50 (sum of both books), Z=.15."""
+    rm = _build_grouped_rm(
+        {'a': (0.7, ['X', 'Y']), 'b': (0.3, ['Y', 'Z'])},
+        data_handler=_live_dh(['X', 'Y', 'Z']),
+    )
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 0.35, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Y'], 0.50, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Z'], 0.15, abs_tol=1e-12)
+
+
+def test_grouped_equal_weight_full_overlap_matches_ungrouped():
+    """Full-overlap invariance: identical universes reproduce the ungrouped
+    weights and IDM exactly, regardless of the budget split — the smoke-run
+    safety property."""
+    symbols = ['BTC', 'ETH', 'SOL']
+    grouped = _build_grouped_rm(
+        {'a': (0.7, symbols), 'b': (0.3, symbols)},
+        data_handler=_live_dh(symbols),
+    )
+    bare = _build_rm(symbols, data_handler=_live_dh(symbols))
+    grouped.calculate_instrument_weight(mode='equal_weight')
+    bare.calculate_instrument_weight(mode='equal_weight')
+    for s in symbols:
+        assert math.isclose(grouped.instrument_weight[s],
+                            bare.instrument_weight[s], abs_tol=1e-12)
+    assert math.isclose(grouped.idm, bare.idm, rel_tol=1e-12)
+
+
+def test_grouped_fallback_honors_budgets_on_data_gap():
+    """Full-lookback rows but <30 valid observations → ρ None → the
+    grouped equal-weight fallback keeps the 0.7/0.3 budget split and
+    leaves idm untouched (mirrors the ungrouped fallback contract)."""
+    idx = pd.date_range('2024-01-01', periods=60, freq='D')
+
+    def _gappy(seed):
+        vals = np.full(60, np.nan)
+        vals[-20:] = _price_series(20, seed=seed).to_numpy()
+        return pd.Series(vals, index=idx)
+
+    dh = FakeDataHandler(closes={'X': _gappy(0), 'Z': _gappy(1)})
+    rm = _build_grouped_rm({'a': (0.7, ['X']), 'b': (0.3, ['Z'])},
+                           data_handler=dh)
+    rm.idm = 1.7                                     # sentinel
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 0.7, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Z'], 0.3, abs_tol=1e-12)
+    assert rm.idm == 1.7                             # untouched
+
+
+def test_grouped_risk_parity_book_sums_equal_budgets():
+    """Disjoint groups under risk_parity: within-group ERC weights sum to 1,
+    so each book's total instrument weight equals its budget exactly."""
+    symbols = ['A', 'B', 'C', 'D']
+    rm = _build_grouped_rm(
+        {'g1': (0.7, ['A', 'B']), 'g2': (0.3, ['C', 'D'])},
+        data_handler=_live_dh(symbols),
+    )
+    rm.calculate_instrument_weight(mode='risk_parity')
+    book1 = rm.instrument_weight['A'] + rm.instrument_weight['B']
+    book2 = rm.instrument_weight['C'] + rm.instrument_weight['D']
+    assert math.isclose(book1, 0.7, abs_tol=1e-6)
+    assert math.isclose(book2, 0.3, abs_tol=1e-6)
+    assert all(w > 0 for w in rm.instrument_weight.values())
+    assert math.isclose(sum(rm.instrument_weight.values()), 1.0, abs_tol=1e-9)
+
+
+def test_grouped_min_variance_full_overlap_matches_ungrouped():
+    """Full-overlap invariance holds for the corr-based modes too: both
+    groups solve the identical optimization over the identical matrix, so
+    the sum reproduces the bare-strategy result."""
+    symbols = ['A', 'B', 'C']
+    grouped = _build_grouped_rm(
+        {'g1': (0.6, symbols), 'g2': (0.4, symbols)},
+        data_handler=_live_dh(symbols),
+    )
+    bare = _build_rm(symbols, data_handler=_live_dh(symbols))
+    grouped.calculate_instrument_weight(mode='min_variance')
+    bare.calculate_instrument_weight(mode='min_variance')
+    for s in symbols:
+        assert math.isclose(grouped.instrument_weight[s],
+                            bare.instrument_weight[s], abs_tol=1e-9)
+    assert math.isclose(grouped.idm, bare.idm, rel_tol=1e-9)
+
+
+def test_grouped_inline_min_variance_uses_group_submatrix():
+    """Groups {A,B}(0.5) and {C}(0.5): the pair's min-var solve runs on its
+    2x2 principal submatrix — a two-asset equal-vol min-var is always
+    50/50 regardless of their correlation — so A and B each get 0.25 and
+    the solo group's C takes its full 0.5 budget."""
+    symbols = ['A', 'B', 'C']
+    rm = _build_grouped_rm(
+        {'pair': (0.5, ['A', 'B']), 'solo': (0.5, ['C'])},
+        data_handler=_live_dh(symbols),
+    )
+    rm.calculate_instrument_weight(mode='min_variance')
+    assert math.isclose(rm.instrument_weight['A'], 0.25, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['B'], 0.25, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['C'], 0.5, abs_tol=1e-9)
+
+
+def test_explicit_corr_matrix_grouped_weights_per_group():
+    """Explicit ρ over a grouped universe: within-group solves on principal
+    submatrices, books scaled by budgets (ρ=0 → 2-asset min-var = 50/50
+    inside the pair)."""
+    symbols = ['A', 'B', 'C']
+    rm = _build_grouped_rm(
+        {'pair': (0.8, ['A', 'B']), 'solo': (0.2, ['C'])},
+        data_handler=_live_dh(symbols),
+    )
+    corr = _corr_df(symbols, off_diag=0.0)
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert math.isclose(rm.instrument_weight['A'], 0.4, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['B'], 0.4, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['C'], 0.2, abs_tol=1e-9)
+
+
+def test_explicit_corr_matrix_omitting_group_warns_and_renormalizes(caplog):
+    """An explicit matrix that omits group 'solo' entirely: the surviving
+    pair book takes the full budget (0.8 → 1.0) and the dead group draws a
+    WARNING (the explicit hook's surprise is louder than inline warmup
+    staging, which logs INFO)."""
+    rm = _build_grouped_rm(
+        {'pair': (0.8, ['A', 'B']), 'solo': (0.2, ['C'])},
+        data_handler=_live_dh(['A', 'B', 'C']),
+    )
+    corr = _corr_df(['A', 'B'], off_diag=0.0)
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert math.isclose(rm.instrument_weight['A'], 0.5, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['B'], 0.5, abs_tol=1e-9)
+    assert 'C' not in rm.instrument_weight
+    assert any(
+        'budget group' in r.getMessage() and 'solo' in r.getMessage()
+        and r.levelno == logging.WARNING
+        for r in caplog.records
+    )
+
+
+def test_zero_budget_group_symbols_carry_zero_weight():
+    """A live group at budget 0: its exclusive symbols are PRESENT in the
+    dict at weight 0.0 (the existing zero-weight flatten path's trigger),
+    and it does not distort the other groups' renormalization."""
+    rm = _build_grouped_rm(
+        {'a': (1.0, ['X']), 'b': (0.0, ['Z'])},
+        data_handler=_live_dh(['X', 'Z']),
+    )
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 1.0, abs_tol=1e-12)
+    assert rm.instrument_weight['Z'] == 0.0
+
+
+def test_zero_budget_group_flattens_held_position():
+    """End-to-end: a held position on a zero-budget group's symbol flattens
+    through the existing 'zero_weight' path (target 0 → SELL the lot)."""
+    pf = FakePortfolio(positions={'Z': 5.0})
+    strat = FakeOrchestrator({'a': (1.0, ['X']), 'b': (0.0, ['Z'])},
+                             forecasts={'X': 50.0, 'Z': 50.0})
+    rm = VolTargetingRiskManager(
+        pf, strat, FakeVolEstimator({'X': 8000.0, 'Z': 8000.0}),
+        data_handler=_live_dh(['X', 'Z']),
+        annual_target_vol=0.25, vol_target_mode='percent_volatility',
+        position_buffer=0.0, corr_step_size=0,
+    )
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert rm.instrument_weight['Z'] == 0.0
+    rm.update_bar(_bar('Z'))
+    assert len(pf.submitted) == 1
+    assert pf.submitted[0]['symbol'] == 'Z'
+    assert pf.submitted[0]['direction'] == Direction.SELL
+    assert math.isclose(pf.submitted[0]['quantity'], 5.0)
+
+
+def test_dead_group_budget_redistributes_then_reenters():
+    """Group b has no live symbols at the first recalc (no data yet) →
+    group a takes the full budget. Once b's symbol has history, a later
+    recalc restores the configured 0.7/0.3 split — the walk-forward
+    self-heal."""
+    dh = FakeDataHandler(closes={'X': _price_series(60, seed=0)})
+    strat = FakeOrchestrator({'a': (0.7, ['X']), 'b': (0.3, ['Z'])})
+    rm = VolTargetingRiskManager(
+        FakePortfolio(), strat, FakeVolEstimator(), data_handler=dh,
+        annual_target_vol=0.25,
+    )
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 1.0, abs_tol=1e-12)
+    assert 'Z' not in rm.instrument_weight
+    dh._closes['Z'] = _price_series(60, seed=1)      # Z lists later
+    rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 0.7, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Z'], 0.3, abs_tol=1e-12)
+
+
+def test_dead_group_logs_info_and_redistributes(caplog):
+    """>=2 live symbols with one whole group dead: the dead group is
+    INFO-logged (expected warmup staging, not a WARNING) and its budget
+    redistributes to the survivors."""
+    dh = FakeDataHandler(closes={'X': _price_series(60, seed=0),
+                                 'Y': _price_series(60, seed=1)})
+    strat = FakeOrchestrator({'a': (0.7, ['X', 'Y']), 'b': (0.3, ['Z'])})
+    rm = VolTargetingRiskManager(
+        FakePortfolio(), strat, FakeVolEstimator(), data_handler=dh,
+        annual_target_vol=0.25,
+    )
+    with caplog.at_level(logging.INFO, logger='riskmanager._vol_targeting'):
+        rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 0.5, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Y'], 0.5, abs_tol=1e-12)
+    assert 'Z' not in rm.instrument_weight
+    assert any(
+        'budget group' in r.getMessage() and r.levelno == logging.INFO
+        for r in caplog.records
+    )
+
+
+def test_all_zero_live_budgets_fall_back_to_equal(caplog):
+    """All non-zero budget sits on a dead group → the renormalization
+    denominator is 0 → WARNING + equal budgets over the live groups (the
+    spec's degenerate case)."""
+    dh = FakeDataHandler(closes={'X': _price_series(60, seed=0),
+                                 'Z': _price_series(60, seed=1)})
+    strat = FakeOrchestrator({'a': (0.0, ['X']), 'b': (0.0, ['Z']),
+                              'c': (1.0, ['DEAD'])})
+    rm = VolTargetingRiskManager(
+        FakePortfolio(), strat, FakeVolEstimator(), data_handler=dh,
+        annual_target_vol=0.25,
+    )
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 0.5, abs_tol=1e-12)
+    assert math.isclose(rm.instrument_weight['Z'], 0.5, abs_tol=1e-12)
+    assert any('zero budget' in r.getMessage() for r in caplog.records)
+
+
+def test_multi_group_recalc_logs_budget_shares(caplog):
+    """Every multi-group recalc INFO-logs configured vs renormalized budget
+    shares (the spec's observability requirement)."""
+    rm = _build_grouped_rm(
+        {'a': (0.7, ['X']), 'b': (0.3, ['Z'])},
+        data_handler=_live_dh(['X', 'Z']),
+    )
+    with caplog.at_level(logging.INFO, logger='riskmanager._vol_targeting'):
+        rm.calculate_instrument_weight(mode='equal_weight')
+    assert any('budget groups (configured' in r.getMessage()
+               for r in caplog.records)
+
+
+def test_grouped_disjoint_idm_from_summed_weights(caplog):
+    """Diverging universes are the only regime where the summed weights (and
+    hence wᵀρw) actually change — pin the IDM number. Explicit identity ρ
+    over books a=(0.7,{A,B}) / b=(0.3,{C,D}) with 2-asset min-var 50/50
+    within each book gives w = (.35,.35,.15,.15) and
+    IDM = 1/sqrt(Σwᵢ²) = 1/sqrt(0.29), below the 2.5 cap."""
+    symbols = ['A', 'B', 'C', 'D']
+    rm = _build_grouped_rm(
+        {'a': (0.7, ['A', 'B']), 'b': (0.3, ['C', 'D'])},
+        data_handler=_live_dh(symbols),
+    )
+    corr = _corr_df(symbols, off_diag=0.0)
+    rm.calculate_instrument_weight(mode='min_variance', corr_matrix=corr)
+    assert math.isclose(rm.instrument_weight['A'], 0.35, abs_tol=1e-9)
+    assert math.isclose(rm.instrument_weight['C'], 0.15, abs_tol=1e-9)
+    assert math.isclose(rm.idm, 1.0 / math.sqrt(0.29), rel_tol=1e-9)
+
+
+def test_uncovered_kept_symbol_warns_and_keeps_zero_weight(caplog):
+    """A malformed custom source whose groups miss a live symbol: the symbol
+    keeps its seeded 0.0 weight and the gap is WARNING-logged instead of
+    silent (the real Orchestrator's union universe cannot produce this)."""
+    class _PartialSource(FakeStrategy):
+        def get_budget_groups(self):
+            return {'a': (1.0, ['X'])}           # omits Y from every group
+    strat = _PartialSource(symbol_list=['X', 'Y'])
+    rm = VolTargetingRiskManager(
+        FakePortfolio(), strat, FakeVolEstimator(),
+        data_handler=_live_dh(['X', 'Y']), annual_target_vol=0.25,
+    )
+    with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+        rm.calculate_instrument_weight(mode='equal_weight')
+    assert math.isclose(rm.instrument_weight['X'], 1.0, abs_tol=1e-12)
+    assert rm.instrument_weight['Y'] == 0.0
+    assert any('covered by no budget group' in r.getMessage()
+               for r in caplog.records)

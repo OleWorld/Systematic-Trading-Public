@@ -8,6 +8,8 @@ definition, independent of both price and multiplier.
 
 from dataclasses import dataclass
 
+import math
+
 
 @dataclass
 class CommissionModel:
@@ -31,6 +33,12 @@ class CommissionModel:
             raise ValueError(
                 f"Unknown CommissionModel mode: '{self.mode}'. "
                 "Must be 'rate' or 'per_contract'."
+            )
+        # Enforces the "always non-negative" contract in calculate()'s
+        # docstring: a negative value would PAY the trader per fill.
+        if not (math.isfinite(self.value) and self.value >= 0):
+            raise ValueError(
+                f"CommissionModel value must be finite and >= 0, got {self.value}"
             )
 
     def calculate(self, quantity: float, fill_price: float,

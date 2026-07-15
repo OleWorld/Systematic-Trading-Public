@@ -2,8 +2,9 @@
 
 True Range = ``max(h - l, |h - prev_close|, |l - prev_close|)``. The
 smoothing is Wilder's exponential moving average with ``alpha = 1/length``,
-seeded from the first valid TR (the second observed bar — TR is undefined
-without a prior close). Emits NaN until ``length`` valid TRs have been
+seeded from the first observed bar's TR (``high − low`` — no prior close
+exists yet), matching ``from_series`` and the Wilder recursion in
+``_compute``. Emits NaN until ``length`` valid TRs have been
 observed (matches the original ``ema(tr, length)`` masking).
 """
 

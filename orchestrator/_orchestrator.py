@@ -39,11 +39,17 @@ forecast for the symbol (the first time a combined forecast is cached);
 convention strategies use, so the risk manager's liveness gate treats the
 orchestrator exactly as it treats a single strategy.
 
-Strategy weighting lives **here** (the orchestrator is the sole owner):
-the weights are baked into the combined forecast, so the risk manager no
-longer applies a strategy weight of its own. Because vol-target sizing is
-linear in the forecast, forecast-level weighting is equivalent to
-position-level weighting.
+Strategy weighting lives **here** (the orchestrator is the sole owner),
+with one meaning at two layers. Conviction: the weights are baked into
+the combined forecast, so the risk manager no longer applies a strategy
+weight of its own (vol-target sizing is linear in the forecast, so
+forecast-level weighting is equivalent to position-level weighting when
+universes overlap). Budget: ``get_budget_groups()`` exposes
+``{label: (weight, universe)}`` so ``VolTargetingRiskManager`` can build
+strategy-budgeted instrument weights (sum-of-books) — each strategy's
+book carries its weight's share of the portfolio risk budget even when
+the universes are disjoint and the per-symbol renormalization would
+otherwise void the weight.
 """
 
 import logging
@@ -89,6 +95,9 @@ class Orchestrator:
         must match ``strategies`` exactly; values must be finite and
         non-negative and sum to ``1.0`` within ``1e-9``. Default
         ``None`` → equal weight ``1/M`` via ``analytics.equal_weight``.
+        Besides weighting the forecast blend, these are the per-strategy
+        **risk-budget shares** consumed by the risk manager via
+        ``get_budget_groups()``.
         These are the *global* weights; per symbol they are renormalized
         over the contributing subset (see the module docstring).
     fdm
@@ -182,6 +191,25 @@ class Orchestrator:
         be overwritten directly. Mutates in place; safe to re-call any time.
         """
         self.strategy_weights = equal_weight(list(self.strategies.keys()))
+
+    def get_budget_groups(self) -> Dict[str, Tuple[float, List[str]]]:
+        """Return the budget-group structure for the risk manager's budget layer.
+
+        ``{label: (budget_weight, universe)}`` — one entry per managed
+        strategy: its current ``strategy_weights`` value (the share of the
+        portfolio risk budget that strategy's book consumes) and a copy of
+        its declared ``symbol_list``. A stateless view over existing state
+        (no new attributes): the weights are read fresh on every call, so a
+        direct ``strategy_weights`` overwrite propagates at the risk
+        manager's next weight recalc. Consumed — via ``hasattr`` — by
+        ``VolTargetingRiskManager.calculate_instrument_weight`` to build
+        strategy-budgeted instrument weights (sum-of-books); a bare
+        ``Strategy`` lacks this method and gets a single implicit group.
+        """
+        return {
+            label: (self.strategy_weights[label], list(strat.symbol_list))
+            for label, strat in self.strategies.items()
+        }
 
     def update_bar(self, event: BarEvent) -> None:
         """Drive every child, then recompute the combined forecast.

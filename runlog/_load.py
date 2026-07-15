@@ -40,8 +40,8 @@ class RunRecord:
 
     Attributes: ``path`` (the run directory) and ``manifest`` (the parsed
     ``manifest.json`` dict). All table accessors are lazy and cached on
-    first read; each call returns a fresh (copy-on-write) view, so callers
-    may index/slice freely.
+    first read; each call returns a fresh copy, so callers may mutate
+    freely.
     """
 
     def __init__(self, path: Any):
@@ -66,12 +66,14 @@ class RunRecord:
     def _read_table(self, relpath: str, *,
                     missing_reason: Optional[str] = None) -> pd.DataFrame:
         """
-        Read one parquet table (cached). Paths listed in the manifest's
-        ``empty_tables`` return an empty DataFrame; a missing file raises
-        ``ValueError`` (with ``missing_reason`` appended when given).
+        Read one parquet table (cached; each call returns a fresh copy so
+        caller mutation can never reach the cache). Paths listed in the
+        manifest's ``empty_tables`` return an empty DataFrame; a missing
+        file raises ``ValueError`` (with ``missing_reason`` appended when
+        given).
         """
         if relpath in self._cache:
-            return self._cache[relpath]
+            return self._cache[relpath].copy()
         if relpath in self.manifest.get('empty_tables', []):
             df = pd.DataFrame()
         else:
@@ -83,7 +85,7 @@ class RunRecord:
                 )
             df = pd.read_parquet(file)
         self._cache[relpath] = df
-        return df
+        return df.copy()
 
     def _analytics_reason(self, name: str) -> Optional[str]:
         """Manifest-recorded skip/error reason for one analytics artifact."""
