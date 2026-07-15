@@ -11,6 +11,7 @@ Submodules (internal):
     _base        DataHandler ABC (rolling windows, HTF aggregation)
     _historic    HistoricDataHandler (backtesting)
     _live        LiveDataHandler (stub)
+    _tz          UTC-enforcement helpers (naive raises, aware converts)
 """
 
 from data._base import DataHandler
@@ -22,6 +23,7 @@ from data._timeframe import (
     parse_timeframe_to_seconds,
     TIMEFRAME_FALLBACK_ORDER,
 )
+from data._tz import ensure_utc_index, ensure_utc_series, ensure_utc_timestamp
 
 __all__ = [
     "DataHandler",
@@ -31,4 +33,7 @@ __all__ = [
     "get_period_start",
     "parse_timeframe_to_seconds",
     "TIMEFRAME_FALLBACK_ORDER",
+    "ensure_utc_index",
+    "ensure_utc_series",
+    "ensure_utc_timestamp",
 ]
