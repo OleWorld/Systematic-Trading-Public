@@ -166,9 +166,8 @@ def pnl_attribution(
         timestamp (last wins). Must carry the per-symbol
         ``realized_pnl`` and ``unrealized_pnl`` dict columns when
         non-empty. Empty frames are a clean edge case (empty result). A
-        timezone-naive equity-curve index (or trade-log timestamp
-        column) raises ``ValueError``; tz-aware non-UTC input is
-        converted to UTC.
+        timezone-naive equity-curve index raises ``ValueError``;
+        tz-aware non-UTC input is converted to UTC.
     system
         The forecast source the backtest traded — an
         ``orchestrator.Orchestrator`` (detected by its ``strategies``

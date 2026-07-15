@@ -14,7 +14,7 @@ import logging
 
 import pandas as pd
 
-from data import ensure_utc_timestamp
+from data import ensure_utc_series, ensure_utc_timestamp
 from volatility import bars_per_year as _bars_per_year
 
 from ._common import window_pnl, window_stats
@@ -49,11 +49,17 @@ def periodic_stats(
     period from its actual starting equity. Bad params raise; empty
     inputs yield an empty fixed-schema frame; degenerate periods carry NaN
     Sharpe/volatility; Sortino may still compute on a single negative bar
-    (matches the ``backtest_stats`` downside convention).
+    (matches the ``backtest_stats`` downside convention). A timezone-naive
+    trade-log ``timestamp`` column raises ``ValueError``; tz-aware non-UTC
+    converts.
     """
     if not isinstance(trade_log, pd.DataFrame):
         raise TypeError(
             f"trade_log must be a DataFrame, got {type(trade_log).__name__}")
+    if not trade_log.empty and 'timestamp' in trade_log.columns:
+        trade_log = trade_log.assign(
+            timestamp=ensure_utc_series(trade_log['timestamp'],
+                                        "trade_log['timestamp']"))
     bpy = _bars_per_year(timeframe, days_convention)     # raises on bad input
     try:
         offset = pd.tseries.frequencies.to_offset(freq)

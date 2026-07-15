@@ -1,5 +1,5 @@
 import datetime
-from typing import Tuple, Union
+from typing import Tuple
 
 
 # Preferred order for finding source data to resample from (most granular first)
