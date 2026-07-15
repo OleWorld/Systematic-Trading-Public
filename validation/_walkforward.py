@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from data import ensure_utc_timestamp
 from volatility import bars_per_year as _bars_per_year
 
 from ._common import is_lower_better, window_stats
@@ -229,9 +230,7 @@ def walk_forward(
         start = sweep.common_first_fill()
         if start is None:
             start = index[0]
-    start = pd.Timestamp(start)
-    if start.tzinfo is None:           # naive explicit start = UTC
-        start = start.tz_localize('UTC')
+    start = ensure_utc_timestamp(start, 'start')
     if is_window is not None:
         is_window = pd.Timedelta(is_window)
         if is_window <= pd.Timedelta(0):

@@ -15,6 +15,8 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
+from data import ensure_utc_index, ensure_utc_series, ensure_utc_timestamp
+
 logger = logging.getLogger(__name__)
 
 _NAN = float('nan')
@@ -33,13 +35,17 @@ def is_lower_better(metric: str) -> bool:
 def collapse_equity(equity_curve: pd.DataFrame) -> pd.DataFrame:
     """One row per timestamp (last row wins) — multi-symbol bars write N rows
     per timestamp; the last reflects every symbol's price plug-in. Mirrors
-    ``analytics.backtest_stats``. Raises ``TypeError`` on non-DataFrame input."""
+    ``analytics.backtest_stats``. Raises ``TypeError`` on non-DataFrame input.
+    A timezone-naive index raises ``ValueError``; tz-aware non-UTC converts
+    to UTC."""
     if not isinstance(equity_curve, pd.DataFrame):
         raise TypeError(
             f"equity_curve must be a DataFrame, got {type(equity_curve).__name__}"
         )
     if equity_curve.empty:
         return equity_curve
+    equity_curve = equity_curve.set_axis(
+        ensure_utc_index(equity_curve.index, 'equity_curve'))
     return equity_curve.groupby(level=0, sort=False).last()
 
 
@@ -54,8 +60,9 @@ def pnl_from_equity(
     collapse -> optional ``start`` trim -> ``balance.diff()`` with the first
     kept bar measured against ``initial_capital`` (pre-``start`` PnL folds
     into the first kept bar — the documented ``backtest_stats`` semantics).
-    A naive ``start`` is interpreted as UTC; a tz-aware ``start`` (e.g. the
-    output of ``first_fill``) passes through unchanged.
+    ``start`` must be tz-aware or a date-only string (UTC midnight); other
+    naive values raise ``ValueError``. A tz-aware ``start`` (e.g. the output
+    of ``first_fill``) passes through unchanged.
     Empty input yields an empty float Series; a non-empty curve without
     ``account_balance`` raises ``ValueError``; ``initial_capital <= 0`` raises.
     """
@@ -63,9 +70,7 @@ def pnl_from_equity(
         raise ValueError(f"initial_capital must be > 0, got {initial_capital}")
     eq = collapse_equity(equity_curve)
     if start is not None and not eq.empty:
-        start_ts = pd.Timestamp(start)
-        if start_ts.tzinfo is None:
-            start_ts = start_ts.tz_localize('UTC')
+        start_ts = ensure_utc_timestamp(start, 'start')
         eq = eq.loc[eq.index >= start_ts]
     if eq.empty:
         return pd.Series(dtype=float)
@@ -91,16 +96,15 @@ def window_pnl(
     into the first kept bar — a non-flat head would otherwise inject a
     synthetic spike bar that distorts the window's moments. This is the
     derivation for inference-grade statistics (bootstrap, PSR/DSR) and the
-    periodic regime table. A naive ``start`` is interpreted as UTC.
+    periodic regime table. ``start`` must be tz-aware or a date-only string
+    (UTC midnight); other naive values raise ``ValueError``.
     Returns ``(pnl, entering_balance)``; ``start=None`` returns the full
     series with ``initial_capital`` as the baseline.
     """
     pnl = pnl_from_equity(equity_curve, initial_capital=initial_capital)
     baseline = float(initial_capital)
     if start is not None and not pnl.empty:
-        start_ts = pd.Timestamp(start)
-        if start_ts.tzinfo is None:        # naive start = UTC
-            start_ts = start_ts.tz_localize('UTC')
+        start_ts = ensure_utc_timestamp(start, 'start')
         baseline += float(pnl[pnl.index < start_ts].sum())
         pnl = pnl[pnl.index >= start_ts]
     return pnl, baseline
@@ -162,10 +166,13 @@ def window_stats(
 
 def first_fill(trade_log: pd.DataFrame) -> Optional[pd.Timestamp]:
     """Earliest fill timestamp in a trade log; ``None`` for an empty log or
-    one without a ``timestamp`` column (never raises on data shape)."""
+    one without a ``timestamp`` column (never raises on shape; a
+    timezone-naive timestamp column DOES raise ``ValueError`` — the UTC
+    law)."""
     if not isinstance(trade_log, pd.DataFrame):
         raise TypeError(
             f"trade_log must be a DataFrame, got {type(trade_log).__name__}")
     if trade_log.empty or 'timestamp' not in trade_log.columns:
         return None
-    return pd.Timestamp(trade_log['timestamp'].min())
+    ts = ensure_utc_series(trade_log['timestamp'], "trade_log['timestamp']")
+    return pd.Timestamp(ts.min())

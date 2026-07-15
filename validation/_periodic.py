@@ -14,6 +14,7 @@ import logging
 
 import pandas as pd
 
+from data import ensure_utc_timestamp
 from volatility import bars_per_year as _bars_per_year
 
 from ._common import window_pnl, window_stats
@@ -39,7 +40,8 @@ def periodic_stats(
     """
     Per-period stats table (index = the pandas resample bin label, e.g. the
     period-end timestamp for ``'YE'``). ``freq`` is any pandas offset alias
-    (``'YE'`` default, ``'QE'``, ``'ME'``, ...). ``start`` (naive = UTC)
+    (``'YE'`` default, ``'QE'``, ``'ME'``, ...). ``start`` (tz-aware, or a
+    date-only string = UTC midnight; other naive values raise)
     trims to bars at/after it AND reseeds the baseline to the true balance
     entering the window — pre-start PnL never folds into the first kept
     period (deliberately different from the ``backtest_stats`` trim, whose
@@ -69,9 +71,7 @@ def periodic_stats(
     if not trade_log.empty and 'realized_pnl' in trade_log.columns:
         closing = trade_log[trade_log['realized_pnl'].astype(float) != 0.0]
         if start is not None and 'timestamp' in closing.columns:
-            start_ts = pd.Timestamp(start)
-            if start_ts.tzinfo is None:    # naive start = UTC
-                start_ts = start_ts.tz_localize('UTC')
+            start_ts = ensure_utc_timestamp(start, 'start')
             closing = closing[closing['timestamp'] >= start_ts]
     trades_by_period = {}
     if not closing.empty and 'timestamp' in closing.columns:
