@@ -29,9 +29,9 @@ _SNAPSHOT_RESTORE = {
     'margin_requirement': 'margin_requirements',
 }
 
-_LIST_RUNS_COLUMNS = ['run_id', 'created_utc', 'label', 'n_symbols',
-                      'n_trades', 'initial_capital', 'final_balance',
-                      'schema_version']
+_LIST_RUNS_COLUMNS = ['run_id', 'created_utc', 'label', 'start', 'end',
+                      'n_symbols', 'n_trades', 'initial_capital',
+                      'final_balance', 'schema_version']
 
 
 class RunRecord:
@@ -248,11 +248,13 @@ def list_runs(root: Any = 'results/runs') -> pd.DataFrame:
     """
     Cheap run-history browser: one row per archived run under ``root``,
     read from manifests only (no parquet touched), sorted by
-    ``created_utc``. Columns: ``run_id, created_utc, label, n_symbols,
-    n_trades, initial_capital, final_balance, schema_version``. In-flight
-    or crashed ``*.tmp`` folders and manifest-less directories are
-    skipped. Returns an empty fixed-schema frame when ``root`` is missing
-    or holds no runs.
+    ``created_utc``. Columns: ``run_id, created_utc, label, start, end,
+    n_symbols, n_trades, initial_capital, final_balance,
+    schema_version``. ``start``/``end`` are the ACTUAL derived backtest
+    range (``None`` for pre-schema-2 manifests, which predate
+    ``data_range``). In-flight or crashed ``*.tmp`` folders and
+    manifest-less directories are skipped. Returns an empty fixed-schema
+    frame when ``root`` is missing or holds no runs.
     """
     root = Path(root)
     rows = []
@@ -272,10 +274,13 @@ def list_runs(root: Any = 'results/runs') -> pd.DataFrame:
             run = manifest.get('run', {})
             counts = manifest.get('counts', {})
             portfolio = manifest.get('portfolio', {})
+            data_range = manifest.get('data_range') or {}
             rows.append({
                 'run_id': run.get('run_id', child.name),
                 'created_utc': run.get('created_utc'),
                 'label': run.get('label'),
+                'start': data_range.get('start'),
+                'end': data_range.get('end'),
                 'n_symbols': counts.get('n_symbols'),
                 'n_trades': counts.get('n_trades'),
                 'initial_capital': portfolio.get('initial_capital'),

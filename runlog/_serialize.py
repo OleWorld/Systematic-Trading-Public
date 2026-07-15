@@ -26,8 +26,9 @@ logger = logging.getLogger(__name__)
 
 #: Version of the on-disk archive layout. Bump when the folder layout or a
 #: table schema changes incompatibly; ``load_run`` records it in the manifest
-#: so future readers can dispatch.
-SCHEMA_VERSION = 1
+#: so future readers can dispatch. v2 (2026-07): manifest gains ``data_range``
+#: (derived actual backtest range); config no longer carries start/end dates.
+SCHEMA_VERSION = 2
 
 
 def replace_with_retry(src: Any, dst: Any, *, attempts: int = 6,
