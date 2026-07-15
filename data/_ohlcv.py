@@ -2,6 +2,7 @@ from typing import Any, Callable, Dict, List, Union
 
 import pandas as pd
 
+from data._tz import ensure_utc_index
 from data._timeframe import (
     _ms_to_utc,
     get_period_start,
@@ -30,12 +31,16 @@ def resample(df: pd.DataFrame, timeframe: str, agg: _AggSpec) -> pd.DataFrame:
     timeframe. Timeframes ``get_period_start`` rejects (e.g. '2d', '2w')
     raise ``ValueError`` here too. Only non-empty buckets are returned.
 
+    The input index must be a tz-aware ``DatetimeIndex`` (naive raises ``ValueError``); non-UTC input is converted to UTC before bucketing.
+
     ``agg`` maps column name to a pandas aggregation (string op or callable).
     The caller decides the agg dict and is responsible for dropping empty
     buckets afterwards (e.g. ``df.dropna(subset=[<sentinel_col>])``).
     """
     if df.empty:
         return df.iloc[0:0].copy()
+
+    df = df.set_axis(ensure_utc_index(df.index, 'df'))
 
     tf_seconds = parse_timeframe_to_seconds(timeframe)
 

@@ -6,28 +6,9 @@ from typing import Tuple, Union
 TIMEFRAME_FALLBACK_ORDER = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
 
 
-def _parse_date(date_input: Union[str, datetime.datetime]) -> datetime.datetime:
-    """Parse string or datetime; date-only strings get UTC attached, but
-    tz-less ISO datetime strings and naive datetime inputs pass through
-    NAIVE (no tz is forced)."""
-    if isinstance(date_input, datetime.datetime):
-        return date_input
-    if 'T' in date_input:
-        return datetime.datetime.fromisoformat(date_input.replace('Z', '+00:00'))
-    dt = datetime.datetime.strptime(date_input, '%Y-%m-%d')
-    return dt.replace(tzinfo=datetime.timezone.utc)
-
-
 def _ms_to_utc(ms: float) -> datetime.datetime:
     """Convert millisecond timestamp to UTC datetime."""
     return datetime.datetime.fromtimestamp(ms / 1000.0, datetime.timezone.utc)
-
-
-def _ensure_utc(dt: datetime.datetime) -> datetime.datetime:
-    """Ensure datetime has UTC timezone info, converting if necessary."""
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=datetime.timezone.utc)
-    return dt.astimezone(datetime.timezone.utc)
 
 
 # Unit suffixes are case-sensitive: lowercase 'm' is minutes while
