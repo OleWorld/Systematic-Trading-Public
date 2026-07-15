@@ -9,8 +9,6 @@ from config import BacktestConfig
 
 config = BacktestConfig(
     symbols=['BTC_USDT:USDT', 'BNB_USDT:USDT'],   # CCXT perp naming, as in the bundled sample data
-    start_date='2026-01-01',
-    end_date='2026-04-04',
     base_timeframe='4h',
     days_convention='calendar',   # 'calendar' (365 d/y, 24/7) or 'business' (252 trading d/y)
     # Timeframes — {tf: maxlen}. Omit for single-TF (defaults to {base: 500}).
@@ -139,9 +137,11 @@ risk_manager = SimpleRiskManager(
 ### Data — supply your own OHLCV
 
 You provide market data as a `{symbol: DataFrame}` dict — this is the only way data
-enters the engine. Each DataFrame is indexed by a timezone-aware `DatetimeIndex` and
-exposes `Open`/`High`/`Low`/`Close`/`Volume` columns; sourcing, cleaning, and windowing
-the data is up to you. A small bundled sample of daily bars lives at
+enters the engine. Each DataFrame is indexed by a timezone-aware `DatetimeIndex`
+(**UTC enforced**: a naive index raises `ValueError` at construction; other timezones
+are converted to UTC) and exposes `Open`/`High`/`Low`/`Close`/`Volume` columns;
+sourcing, cleaning, and windowing the data is up to you. A small bundled sample of
+daily bars lives at
 [backtests/sample_data/crypto_1d.csv](backtests/sample_data/crypto_1d.csv):
 
 ```python
