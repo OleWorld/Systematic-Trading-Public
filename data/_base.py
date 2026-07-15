@@ -3,10 +3,11 @@ import datetime
 import logging
 import queue as thread_queue
 from collections import deque
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import pandas as pd
 
+from data._alt import AltRecord
 from data._bar import Bar
 from data._timeframe import get_period_start
 
@@ -22,7 +23,8 @@ class DataHandler(abc.ABC):
     """
 
     def __init__(self, events_queue: thread_queue.Queue[Any], symbol_list: List[str],
-                 base_timeframe: str, timeframes: Dict[str, int]):
+                 base_timeframe: str, timeframes: Dict[str, int],
+                 alt_feeds: Optional[Dict[str, int]] = None):
         """Initialize the data handler with rolling windows and HTF accumulators.
 
         Parameters
@@ -36,6 +38,12 @@ class DataHandler(abc.ABC):
         timeframes : dict
             Mapping of ``{timeframe_string: maxlen}`` for rolling windows.
             Must include ``base_timeframe`` as a key.
+        alt_feeds : dict, optional
+            Mapping of ``{feed_name: maxlen}`` for alternative-data
+            rolling windows (funding rates, open interest, ...). One
+            deque per ``symbol_list × feed`` pair is pre-populated so
+            unknown-key lookups raise rather than silently creating
+            state. Default ``None`` — no alt feeds.
         """
         self.events_queue = events_queue
         self.symbol_list = symbol_list
@@ -70,6 +78,36 @@ class DataHandler(abc.ABC):
                 continue
             for symbol in symbol_list:
                 self._htf_bar_data[(symbol, tf)] = deque(maxlen=tf_maxlen)
+
+        # Alt-feed rolling windows — named per-symbol multi-field series
+        # (funding rates, open interest, ...). One deque per
+        # (symbol, feed) pair, pre-populated for every symbol × feed
+        # combination so unknown-key lookups raise rather than silently
+        # creating state. An empty deque means "no data yet": a feed
+        # does not have to cover every symbol (mirrors how a
+        # late-listing symbol looks on the bar side).
+        self.alt_feeds: Dict[str, int] = dict(alt_feeds) if alt_feeds else {}
+        for feed, maxlen in self.alt_feeds.items():
+            if not isinstance(feed, str) or not feed:
+                raise ValueError(
+                    f"Alt feed names must be non-empty strings, got {feed!r}"
+                )
+            if not isinstance(maxlen, int) or isinstance(maxlen, bool) \
+                    or maxlen <= 0:
+                raise ValueError(
+                    f"Alt feed {feed!r} maxlen must be a positive int, "
+                    f"got {maxlen!r}"
+                )
+        self._alt_data: Dict[Tuple[str, str], deque[AltRecord]] = {
+            (symbol, feed): deque(maxlen=maxlen)
+            for feed, maxlen in self.alt_feeds.items()
+            for symbol in symbol_list
+        }
+        # Timestamp of the last accepted record per (symbol, feed) — the
+        # duplicate and out-of-order gates in ``_append_alt``.
+        self._last_alt_ts: Dict[Tuple[str, str], Optional[datetime.datetime]] = {
+            key: None for key in self._alt_data
+        }
 
     @abc.abstractmethod
     def update_bar(self) -> None:
@@ -321,3 +359,151 @@ class DataHandler(abc.ABC):
             ``timeframe`` was not registered via ``timeframes``.
         """
         return len(self._select_deque(symbol, timeframe))
+
+    # ── alt-feed storage & queries ───────────────
+
+    def _append_alt(self, feed: str, symbol: str, ts: datetime.datetime,
+                    values: Mapping[str, float]) -> bool:
+        """Append one alt record to the ``(symbol, feed)`` rolling window.
+
+        The ingestion seam for alternative data, shaped like
+        ``_append_bar``: validates, stores, and returns
+        accepted/rejected so a future event-emitting variant (or a
+        portfolio-side consumer such as funding-PnL accounting) can gate
+        on the return value exactly like the bar path gates
+        ``events_queue.put`` on ``_append_bar``.
+
+        Gates (mirroring ``_append_bar``):
+        - Any NaN field value drops the WHOLE record (WARNING, returns
+          ``False``) — keeps the "everything in a window is non-NaN"
+          invariant uniform across bars and alt data.
+        - A second record at an already-accepted timestamp for this
+          ``(symbol, feed)`` is dropped (WARNING, first record wins).
+        - A record EARLIER than the last accepted one raises
+          ``ValueError`` — unreachable via the sorted+heap-merged
+          historic path, kept as the backstop for a future live handler.
+
+        Unlike bars there is no forming/completed distinction: every
+        accepted record is final on arrival.
+
+        Returns
+        -------
+        bool
+            ``True`` if the record was accepted and stored; ``False``
+            if it was rejected for a NaN field or as a duplicate.
+
+        Raises
+        ------
+        ValueError
+            If ``(symbol, feed)`` was not registered, or on an
+            out-of-order timestamp.
+        """
+        key = (symbol, feed)
+        deq = self._alt_data.get(key)
+        if deq is None:
+            raise ValueError(
+                f"Unknown alt target: feed={feed!r} symbol={symbol!r}. "
+                f"Registered feeds: {sorted(self.alt_feeds)}; registered "
+                f"symbols: {self.symbol_list}"
+            )
+        if any(pd.isna(v) for v in values.values()):
+            logger.warning(
+                "Dropping alt record with NaN field: feed=%s symbol=%s "
+                "ts=%s values=%s", feed, symbol, ts, dict(values),
+            )
+            return False
+        last_ts = self._last_alt_ts[key]
+        if last_ts is not None and ts < last_ts:
+            raise ValueError(
+                f"Out-of-order alt record for feed={feed!r} "
+                f"symbol={symbol!r}: ts={ts} is earlier than the last "
+                f"accepted record at {last_ts}. Records must arrive in "
+                f"ascending time order."
+            )
+        if ts == last_ts:
+            logger.warning(
+                "Dropping duplicate alt record: feed=%s symbol=%s ts=%s "
+                "(a record at this timestamp was already accepted; first "
+                "record wins)", feed, symbol, ts,
+            )
+            return False
+        deq.append(AltRecord(ts, values))
+        self._last_alt_ts[key] = ts
+        return True
+
+    def _select_alt_deque(self, symbol: str, feed: str) -> "deque[AltRecord]":
+        """Resolve the alt deque for ``(symbol, feed)``.
+
+        Raises
+        ------
+        ValueError
+            If ``feed`` was not registered via ``alt_feeds``, or
+            ``symbol`` was not registered via ``symbol_list``.
+        """
+        deq = self._alt_data.get((symbol, feed))
+        if deq is None:
+            if feed not in self.alt_feeds:
+                raise ValueError(
+                    f"Unknown alt feed '{feed}'. Registered: "
+                    f"{sorted(self.alt_feeds)}"
+                )
+            raise ValueError(
+                f"Unknown symbol '{symbol}'. Registered: {self.symbol_list}"
+            )
+        return deq
+
+    def get_latest_alt(self, symbol: str, feed: str,
+                       n: int = 1) -> List[AltRecord]:
+        """Return the last *n* alt records (oldest→newest) for a feed.
+
+        Reads straight from the deque — no DataFrame construction — the
+        cheap per-bar accessor for strategy hot paths. UNLIKE bar
+        windows, ``[-1]`` is a FINALIZED record: alt data has no
+        forming/completed distinction. Returns up to *n* records (fewer
+        if the window is shorter), empty list if none yet.
+
+        Raises
+        ------
+        ValueError
+            If ``symbol`` or ``feed`` was not registered.
+        """
+        deq = self._select_alt_deque(symbol, feed)
+        if n <= 0 or not deq:
+            return []
+        start = max(0, len(deq) - n)
+        return list(deq)[start:]
+
+    def get_latest_alt_df(self, symbol: str, feed: str,
+                          n: int = 1) -> pd.DataFrame:
+        """Return the last *n* alt records as a DataFrame.
+
+        Datetime index, one column per field — the research/plotting
+        counterpart to ``get_latest_alt``. An empty window returns an
+        empty DataFrame with no columns (field names are unknown until
+        the first record arrives).
+
+        Raises
+        ------
+        ValueError
+            If ``symbol`` or ``feed`` was not registered.
+        """
+        records = self.get_latest_alt(symbol, feed, n)
+        if not records:
+            return pd.DataFrame()
+        return pd.DataFrame(
+            [dict(r.values) for r in records],
+            index=[r.timestamp for r in records],
+        )
+
+    def count_alt(self, symbol: str, feed: str) -> int:
+        """Number of records stored for ``(symbol, feed)`` — O(1).
+
+        The cheap availability gate (e.g. "any funding data yet?")
+        mirroring ``count_bars``.
+
+        Raises
+        ------
+        ValueError
+            If ``symbol`` or ``feed`` was not registered.
+        """
+        return len(self._select_alt_deque(symbol, feed))
