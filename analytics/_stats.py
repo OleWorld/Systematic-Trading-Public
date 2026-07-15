@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from data import ensure_utc_index, ensure_utc_series, ensure_utc_timestamp
 from volatility import bars_per_year
 
 logger = logging.getLogger(__name__)
@@ -85,14 +86,14 @@ def backtest_stats(
         days/year); also fixes the days-per-year used to rescale
         per-bar volatility to the daily lines.
     start
-        Optional trim point (anything ``pd.Timestamp`` accepts; a naive
-        value is interpreted as UTC when the curve's index is tz-aware
-        (matching the validation package's convention); naive-on-naive
-        comparisons pass through unchanged). When given, the
-        collapsed equity curve and the trade log are restricted to
-        ``timestamp >= start`` before any statistic is computed —
-        intended to drop the **flat warmup head** (see the warmup-
-        dilution note below), e.g.
+        Optional trim point (anything ``pd.Timestamp`` accepts).
+        ``start`` must be tz-aware or a date-only string (interpreted as
+        UTC midnight); any other naive value raises ``ValueError``. A
+        naive ``equity_curve`` index or ``trade_log`` timestamp column
+        also raises. When given, the collapsed equity curve and the
+        trade log are restricted to ``timestamp >= start`` before any
+        statistic is computed — intended to drop the **flat warmup
+        head** (see the warmup-dilution note below), e.g.
         ``start=trade_log['timestamp'].min()``. ``initial_capital``
         stays the PnL/drawdown baseline, which is exact for a flat head
         (balance still equals initial capital at the first fill);
@@ -121,7 +122,11 @@ def backtest_stats(
         ``days_convention``/``timeframe`` is invalid, a non-empty
         ``equity_curve`` lacks required columns, a non-empty ``trade_log``
         lacks ``realized_pnl``, or ``start`` is given while a non-empty
-        ``trade_log`` lacks a ``timestamp`` column.
+        ``trade_log`` lacks a ``timestamp`` column. ``start`` must be
+        tz-aware or a date-only string (interpreted as UTC midnight);
+        any other naive value raises ``ValueError``. A naive
+        ``equity_curve`` index or ``trade_log`` timestamp column also
+        raises.
 
     Notes
     -----
@@ -171,17 +176,17 @@ def backtest_stats(
             "trade_log is missing required column 'realized_pnl' (a "
             "non-empty trade log must carry per-fill realized PnL)"
         )
+    if not equity_curve.empty:
+        equity_curve = equity_curve.set_axis(
+            ensure_utc_index(equity_curve.index, 'equity_curve'))
+    if not trade_log.empty and 'timestamp' in trade_log.columns:
+        trade_log = trade_log.assign(
+            timestamp=ensure_utc_series(trade_log['timestamp'],
+                                        "trade_log['timestamp']"))
 
     eq = _collapse_equity(equity_curve)
     if start is not None:
-        start = pd.Timestamp(start)
-        if (start.tzinfo is None
-                and isinstance(eq.index, pd.DatetimeIndex)
-                and eq.index.tz is not None):
-            # Naive start = UTC (the validation-package convention); only
-            # localized when the curve is tz-aware so naive synthetic
-            # curves keep comparing naive-to-naive.
-            start = start.tz_localize('UTC')
+        start = ensure_utc_timestamp(start, 'start')
         if not eq.empty:
             eq = eq.loc[eq.index >= start]
         if not trade_log.empty:

@@ -225,3 +225,12 @@ def test_missing_required_columns_raise():
     with pytest.raises(ValueError, match="trade_log is missing"):
         turnover_stats(_equity_curve([{'AAA': 1}]), tl, timeframe='1d',
                        days_convention='calendar')
+
+
+def test_turnover_stats_naive_curve_raises():
+    """UTC law (tz audit 2026-07): a naive equity-curve index raises."""
+    idx = pd.to_datetime(['2024-01-01', '2024-01-02'])      # tz-naive
+    eq = pd.DataFrame({'account_balance': [100.0, 110.0]}, index=idx)
+    with pytest.raises(ValueError, match="equity_curve.*timezone-naive"):
+        turnover_stats(eq, pd.DataFrame(), timeframe='1d',
+                       days_convention='calendar')

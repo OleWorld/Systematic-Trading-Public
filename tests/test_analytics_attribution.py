@@ -556,3 +556,18 @@ def test_missing_orchestrator_columns_raises():
     eq = _equity_curve([{'AAA': 0}, {'AAA': 5}])
     with pytest.raises(ValueError, match="missing orchestrator"):
         pnl_attribution(eq, system)
+
+
+def test_pnl_attribution_naive_curve_raises():
+    """UTC law (tz audit 2026-07): a naive equity-curve index raises."""
+    class _Sys:
+        symbol_list = ['BTC']
+
+        def get_records(self, symbol):
+            return pd.DataFrame()
+
+    idx = pd.to_datetime(['2024-01-01', '2024-01-02'])      # tz-naive
+    eq = pd.DataFrame({'account_balance': [100.0, 110.0],
+                       'total_commission': [0.0, 0.0]}, index=idx)
+    with pytest.raises(ValueError, match="equity_curve.*timezone-naive"):
+        pnl_attribution(eq, _Sys())
