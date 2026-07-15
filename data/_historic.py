@@ -1,7 +1,7 @@
 import heapq
 import logging
 import queue as thread_queue
-from typing import Any, Dict, Generator, Iterator, List, Tuple
+from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple
 
 import pandas as pd
 
@@ -10,6 +10,10 @@ from data._tz import ensure_utc_index
 from event import BarEvent
 
 logger = logging.getLogger(__name__)
+
+# Default rolling-window length for alt feeds when the caller does not
+# override via ``alt_maxlen`` — mirrors the ``{base: 500}`` bar default.
+DEFAULT_ALT_MAXLEN = 500
 
 
 class HistoricDataHandler(DataHandler):
@@ -30,13 +34,39 @@ class HistoricDataHandler(DataHandler):
     def __init__(self, events_queue: thread_queue.Queue[Any], symbol_list: List[str],
                  base_timeframe: str,
                  timeframes: Dict[str, int],
-                 data: Dict[str, pd.DataFrame]):
+                 data: Dict[str, pd.DataFrame],
+                 alt_data: Optional[Dict[str, Dict[str, pd.DataFrame]]] = None,
+                 alt_maxlen: Optional[Dict[str, int]] = None):
         """Initialize for backtesting from in-memory DataFrames.
 
         ``data`` maps each symbol to a time-indexed OHLCV DataFrame and is the
-        sole data source. Raises ``ValueError`` if it is missing or empty.
+        sole bar source. Raises ``ValueError`` if it is missing or empty.
+
+        ``alt_data`` optionally maps ``{feed: {symbol: DataFrame}}`` —
+        named per-symbol alternative-data series (funding rates, open
+        interest, ...). Each frame needs a tz-aware ``DatetimeIndex``
+        (naive raises; non-UTC converts) sorted ascending, and numeric,
+        uniquely-named columns (column names become the record field
+        names). Symbols must be a subset of ``symbol_list``. Alt record
+        timestamps mean "the moment the value became known" — supplying
+        correctly-stamped data is the caller's responsibility.
+        ``alt_maxlen`` optionally overrides the per-feed rolling-window
+        length (``{feed: maxlen}``, default ``DEFAULT_ALT_MAXLEN``);
+        naming a feed absent from ``alt_data`` raises (typo guard).
         """
-        super().__init__(events_queue, symbol_list, base_timeframe, timeframes)
+        alt_data = alt_data or {}
+        alt_maxlen = alt_maxlen or {}
+        unknown_feeds = set(alt_maxlen) - set(alt_data)
+        if unknown_feeds:
+            raise ValueError(
+                f"alt_maxlen names feeds absent from alt_data: "
+                f"{sorted(unknown_feeds)} — every maxlen override must "
+                f"correspond to a supplied feed (typo guard)."
+            )
+        alt_feeds = {feed: alt_maxlen.get(feed, DEFAULT_ALT_MAXLEN)
+                     for feed in alt_data}
+        super().__init__(events_queue, symbol_list, base_timeframe,
+                         timeframes, alt_feeds=alt_feeds)
 
         if not data:
             raise ValueError(
@@ -61,7 +91,72 @@ class HistoricDataHandler(DataHandler):
             # frame is never mutated and nothing is copied.
             normalized[sym] = df.set_axis(idx)
 
+        self._alt_frames = self._normalize_alt(alt_data)
         self._bar_generators = self._build_stream(normalized)
+
+    # ── alt-frame validation ─────────────────────
+
+    def _normalize_alt(
+        self, alt_data: Dict[str, Dict[str, pd.DataFrame]],
+    ) -> Dict[str, Dict[str, pd.DataFrame]]:
+        """Validate and UTC-normalize alt-feed frames at construction.
+
+        Per (feed, symbol) frame gates — all raise ``ValueError`` up
+        front, before the run starts:
+
+        - symbol must be registered in ``symbol_list`` (wiring typo);
+        - index must be tz-aware (naive raises via ``ensure_utc_index``;
+          non-UTC converts) and sorted ascending (mirrors the bar gate);
+        - columns must be uniquely named and numeric (they become the
+          record field names).
+
+        Empty/``None`` frames are skipped silently (mirrors the bar
+        path). Column ORDER is recorded in ``self._alt_columns`` per
+        (symbol, feed) — the same key order as the alt deques — so the
+        stream can zip positional ``itertuples`` values back to field
+        names regardless of pandas' identifier renaming.
+        """
+        normalized: Dict[str, Dict[str, pd.DataFrame]] = {}
+        self._alt_columns: Dict[Tuple[str, str], List[str]] = {}
+        for feed, per_symbol in alt_data.items():
+            clean: Dict[str, pd.DataFrame] = {}
+            for sym, df in per_symbol.items():
+                if sym not in self._base_bar_data:
+                    raise ValueError(
+                        f"alt_data[{feed!r}] covers unregistered symbol "
+                        f"{sym!r}: alt feeds must key to symbols in "
+                        f"symbol_list. Registered: {self.symbol_list}"
+                    )
+                if df is None or df.empty:
+                    continue
+                idx = ensure_utc_index(df.index,
+                                       f"alt_data[{feed!r}][{sym!r}]")
+                if not idx.is_monotonic_increasing:
+                    raise ValueError(
+                        f"alt_data[{feed!r}][{sym!r}] index is not sorted "
+                        f"ascending: records must be supplied in time "
+                        f"order."
+                    )
+                cols = list(df.columns)
+                if len(set(cols)) != len(cols):
+                    raise ValueError(
+                        f"alt_data[{feed!r}][{sym!r}] has duplicate "
+                        f"column names: {cols}. Field names must be "
+                        f"unique."
+                    )
+                non_numeric = [c for c in cols
+                               if not pd.api.types.is_numeric_dtype(df[c])]
+                if non_numeric:
+                    raise ValueError(
+                        f"alt_data[{feed!r}][{sym!r}] has non-numeric "
+                        f"columns {non_numeric}: alt fields must be "
+                        f"numeric."
+                    )
+                clean[sym] = df.set_axis(idx)
+                self._alt_columns[(sym, feed)] = [str(c) for c in cols]
+            if clean:
+                normalized[feed] = clean
+        return normalized
 
     # ── stream construction ─────────────────────
 

@@ -192,3 +192,90 @@ def test_no_alt_feeds_is_backward_compatible():
     assert dh.alt_feeds == {}
     with pytest.raises(ValueError, match="Unknown alt feed"):
         dh.count_alt('BTC', 'funding')
+
+
+# ──────────────────────────────────────────────
+# Section 3 — HistoricDataHandler construction gates for alt_data
+# ──────────────────────────────────────────────
+
+def _make_ohlcv(closes, *, start='2026-01-01', freq='1D', tz='UTC') -> pd.DataFrame:
+    """Small OHLCV frame with O=H=L=C=close[i] and Volume=1.0."""
+    idx = pd.date_range(start=start, periods=len(closes), freq=freq, tz=tz)
+    return pd.DataFrame({
+        'Open':   list(closes),
+        'High':   list(closes),
+        'Low':    list(closes),
+        'Close':  list(closes),
+        'Volume': [1.0] * len(closes),
+    }, index=idx)
+
+
+def _make_alt(values, times, *, column='rate', tz='UTC') -> pd.DataFrame:
+    """Single-column alt frame at explicit timestamps."""
+    idx = pd.DatetimeIndex(pd.to_datetime(list(times)), tz=tz)
+    return pd.DataFrame({column: list(values)}, index=idx)
+
+
+def _historic(alt_data=None, alt_maxlen=None, symbols=('BTC', 'ETH'),
+              n_bars=3):
+    """HistoricDataHandler over daily bars for every symbol."""
+    bars = {s: _make_ohlcv([100.0 + i for i in range(n_bars)])
+            for s in symbols}
+    return HistoricDataHandler(
+        FakeQueue(), list(symbols), '1d', {'1d': 500},
+        data=bars, alt_data=alt_data, alt_maxlen=alt_maxlen,
+    )
+
+
+def test_alt_data_registers_feeds_with_default_maxlen():
+    dh = _historic(alt_data={'funding': {'BTC': _make_alt([0.01], ['2026-01-01'])}})
+    assert dh.alt_feeds == {'funding': 500}
+    assert dh.count_alt('BTC', 'funding') == 0   # nothing streamed yet
+
+
+def test_alt_maxlen_override_and_typo_guard():
+    alt = {'funding': {'BTC': _make_alt([0.01], ['2026-01-01'])}}
+    dh = _historic(alt_data=alt, alt_maxlen={'funding': 42})
+    assert dh.alt_feeds == {'funding': 42}
+    with pytest.raises(ValueError, match="absent from alt_data"):
+        _historic(alt_data=alt, alt_maxlen={'fundng': 42})
+
+
+def test_alt_symbols_must_be_subset_of_symbol_list():
+    with pytest.raises(ValueError, match="unregistered symbol"):
+        _historic(alt_data={'funding': {'DOGE': _make_alt([0.01], ['2026-01-01'])}})
+
+
+def test_naive_alt_index_raises():
+    with pytest.raises(ValueError):
+        _historic(alt_data={'funding': {'BTC': _make_alt([0.01], ['2026-01-01'], tz=None)}})
+
+
+def test_unsorted_alt_index_raises():
+    df = _make_alt([1.0, 2.0], ['2026-01-02', '2026-01-01'])
+    with pytest.raises(ValueError, match="not sorted ascending"):
+        _historic(alt_data={'funding': {'BTC': df}})
+
+
+def test_non_numeric_alt_column_raises():
+    df = _make_alt(['high', 'low'], ['2026-01-01', '2026-01-02'])
+    with pytest.raises(ValueError, match="non-numeric"):
+        _historic(alt_data={'funding': {'BTC': df}})
+
+
+def test_duplicate_alt_columns_raise():
+    idx = pd.DatetimeIndex(pd.to_datetime(['2026-01-01']), tz='UTC')
+    df = pd.DataFrame([[1.0, 2.0]], columns=['rate', 'rate'], index=idx)
+    with pytest.raises(ValueError, match="duplicate column"):
+        _historic(alt_data={'funding': {'BTC': df}})
+
+
+def test_empty_alt_frames_are_skipped():
+    dh = _historic(alt_data={'funding': {'BTC': pd.DataFrame()}})
+    assert dh.alt_feeds == {'funding': 500}
+    assert dh.count_alt('BTC', 'funding') == 0
+
+
+def test_no_alt_data_is_backward_compatible():
+    dh = _historic()
+    assert dh.alt_feeds == {}
