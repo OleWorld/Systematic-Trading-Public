@@ -9,28 +9,25 @@ class BacktestConfig:
     """
     Parameter holder for a backtest run.
 
-    Centralizes the *run-level* infrastructure parameters (data window,
-    capital, vol-target knobs, fill timing). Construction validates only
-    the **structural coherence of its own fields** — non-empty ``symbols``,
-    ``base_timeframe`` registered in ``timeframes``, higher timeframes
-    strictly larger than base. Domain values (vol-target knobs, corr knobs,
-    size modes, ...) are validated by the module that consumes them, at
-    wiring time — e.g. ``VolTargetingRiskManager.__init__`` raises on a bad
-    ``corr_lookback``. **Per-symbol economics** (point_value, fractional,
-    slippage, commission, margin/leverage) live in ``InstrumentConfig``
-    (``config/_instrument.py``), supplied as a registry to the portfolio,
-    execution, and risk manager. Callers read the fields off this object as
-    they wire each module manually (see
-    ``backtests/sample_backtest/backtest_ewmac_crypto.py``).
+    Centralizes the *run-level* infrastructure parameters (capital,
+    timeframes, vol-target knobs). The actual backtest date range is not
+    configured here — the engine streams exactly the data supplied, and
+    ``runlog.save_run`` records the realized range in the manifest.
+    Construction validates only the **structural coherence of its own
+    fields** — non-empty ``symbols``, ``base_timeframe`` registered in
+    ``timeframes``, higher timeframes strictly larger than base. Domain
+    values (vol-target knobs, corr knobs, size modes, ...) are validated
+    by the module that consumes them, at wiring time — e.g.
+    ``VolTargetingRiskManager.__init__`` raises on a bad ``corr_lookback``.
+    **Per-symbol economics** (point_value, fractional, slippage, commission,
+    margin/leverage) live in ``InstrumentConfig`` (``config/_instrument.py``),
+    supplied as a registry to the portfolio, execution, and risk manager.
+    Callers read the fields off this object as they wire each module manually
+    (see ``backtests/sample_backtest/backtest_ewmac_crypto.py``).
     """
 
     # --- Data ---
     symbols: List[str]
-    # start_date / end_date are informational metadata only (run labeling,
-    # manifests): the engine streams exactly the data supplied in the
-    # {symbol: DataFrame} dict — windowing is the caller's responsibility.
-    start_date: str
-    end_date: str
     base_timeframe: str                                         # streaming TF (e.g. '1m')
     days_convention: str                                        # 'calendar' (365 days/year, 24/7) or 'business' (252 trading days/year)
     timeframes: Dict[str, int] = field(default_factory=dict)    # {tf: maxlen} e.g. {'1m': 500, '1h': 500, '4h': 200}

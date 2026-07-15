@@ -22,8 +22,6 @@ def _kwargs(**overrides):
     """Minimal valid kwargs for ``BacktestConfig`` construction."""
     base = dict(
         symbols=['BTC'],
-        start_date='2024-01-01',
-        end_date='2024-12-31',
         base_timeframe='1d',
         days_convention='calendar',
     )
@@ -98,6 +96,14 @@ def test_default_size_mode_is_fixed_quantity():
     """Futures-first default: size in contracts, not notional dollars."""
     cfg = BacktestConfig(**_kwargs())
     assert cfg.size_mode == 'fixed_quantity'
+
+
+def test_no_start_end_date_fields():
+    """start_date/end_date were removed 2026-07: the actual backtest range
+    is derived by runlog.save_run from the equity curve, not user-typed."""
+    cfg = BacktestConfig(**_kwargs())
+    assert not hasattr(cfg, 'start_date')
+    assert not hasattr(cfg, 'end_date')
 
 
 def test_default_corr_floor_and_idm_cap():

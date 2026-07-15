@@ -555,7 +555,7 @@ def test_integration_real_mini_backtest(tmp_path):
         }, index=idx)
 
     config = BacktestConfig(
-        symbols=list(data), start_date='2026-01-01', end_date='2026-03-02',
+        symbols=list(data),
         base_timeframe='1d', days_convention='calendar',
         timeframes={'1d': 100}, initial_capital=1_000_000.0,
         annual_target_vol=100_000.0,
