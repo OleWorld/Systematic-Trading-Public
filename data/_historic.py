@@ -6,6 +6,7 @@ from typing import Any, Dict, Generator, Iterator, List, Tuple
 import pandas as pd
 
 from data._base import DataHandler
+from data._tz import ensure_utc_index
 from event import BarEvent
 
 logger = logging.getLogger(__name__)
@@ -19,8 +20,9 @@ class HistoricDataHandler(DataHandler):
 
     Each DataFrame must be indexed by a timezone-aware ``DatetimeIndex`` and
     expose ``Open``/``High``/``Low``/``Close``/``Volume`` columns. Sourcing,
-    cleaning, and windowing the data is the caller's responsibility. Each
-    frame's index must be sorted ascending — unsorted input raises
+    cleaning, and windowing the data is the caller's responsibility. Naive-indexed
+    frames raise ``ValueError`` at construction; tz-aware non-UTC frames are converted
+    to UTC. Each frame's index must be sorted ascending — unsorted input raises
     ``ValueError`` at construction (same-timestamp adjacent duplicates are
     tolerated here and handled by the stream gate: first bar wins).
     """
@@ -42,10 +44,12 @@ class HistoricDataHandler(DataHandler):
                 "tz-aware DatetimeIndex and Open/High/Low/Close/Volume columns."
             )
 
+        normalized: Dict[str, pd.DataFrame] = {}
         for sym, df in data.items():
             if df is None or df.empty:
                 continue
-            if not df.index.is_monotonic_increasing:
+            idx = ensure_utc_index(df.index, f"data[{sym!r}]")
+            if not idx.is_monotonic_increasing:
                 raise ValueError(
                     f"data[{sym!r}] index is not sorted ascending: bars "
                     f"must be supplied in time order. An out-of-order bar "
@@ -53,8 +57,11 @@ class HistoricDataHandler(DataHandler):
                     f"recursion, and the latest-price cache, so the run "
                     f"is refused up front."
                 )
+            # set_axis returns a new frame sharing the data — the caller's
+            # frame is never mutated and nothing is copied.
+            normalized[sym] = df.set_axis(idx)
 
-        self._bar_generators = self._build_stream(data)
+        self._bar_generators = self._build_stream(normalized)
 
     # ── stream construction ─────────────────────
 

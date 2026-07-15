@@ -891,6 +891,46 @@ def test_historic_handler_stops_after_exhausting_stream():
     assert h.continue_backtest is False
 
 
+# ── UTC enforcement at construction (2026-07 tz audit) ───────────────
+
+def _ohlcv_frame(index):
+    return pd.DataFrame(
+        {'Open': 1.0, 'High': 2.0, 'Low': 0.5, 'Close': 1.5, 'Volume': 10.0},
+        index=index,
+    )
+
+
+def test_historic_naive_index_raises_naming_symbol():
+    idx = pd.to_datetime(['2024-01-01', '2024-01-02'])     # tz-naive
+    q = thread_queue.Queue()
+    with pytest.raises(ValueError, match=r"data\['BTC'\].*timezone-naive"):
+        HistoricDataHandler(q, ['BTC'], base_timeframe='1d',
+                            timeframes={'1d': 100},
+                            data={'BTC': _ohlcv_frame(idx)})
+
+
+def test_historic_non_utc_index_streams_utc_bars():
+    idx = pd.date_range('2024-01-01 12:00', periods=2, freq='D',
+                        tz='Europe/Berlin')                 # UTC+1 in Jan
+    q = thread_queue.Queue()
+    h = HistoricDataHandler(q, ['BTC'], base_timeframe='1d',
+                            timeframes={'1d': 100},
+                            data={'BTC': _ohlcv_frame(idx)})
+    h.update_bar()
+    bar = q.get_nowait()
+    assert bar.timestamp == pd.Timestamp('2024-01-01 11:00', tz='UTC')
+
+
+def test_historic_does_not_mutate_caller_frame():
+    idx = pd.date_range('2024-01-01', periods=2, freq='D',
+                        tz='Europe/Berlin')
+    df = _ohlcv_frame(idx)
+    q = thread_queue.Queue()
+    HistoricDataHandler(q, ['BTC'], base_timeframe='1d',
+                        timeframes={'1d': 100}, data={'BTC': df})
+    assert str(df.index.tz) == 'Europe/Berlin'              # untouched
+
+
 # ──────────────────────────────────────────────
 # Out-of-order bars fail loudly (F2)
 # ──────────────────────────────────────────────
