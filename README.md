@@ -153,6 +153,28 @@ data = {sym: g.set_index('timestamp')[['Open', 'High', 'Low', 'Close', 'Volume']
         for sym, g in raw.groupby('symbol')}
 ```
 
+**Alternative data (optional).** Non-OHLCV series — funding rates, open
+interest, and the like — ride along as named per-symbol *alt feeds*:
+`alt_data={feed: {symbol: df}}`, each frame a tz-aware `DatetimeIndex`
+plus numeric columns (column names become field names). Timestamps mean
+*"the moment the value became known"*. Records are merged into the same
+time-sorted stream as bars and stored in rolling windows — no events are
+emitted; a strategy reads the latest values inside `calculate_forecast`
+via `data_handler.get_latest_alt(symbol, feed, n)` (or
+`get_latest_alt_df` / `count_alt`). When the bar at open-time *T* is
+processed, a feed's window contains exactly the records with `ts ≤ T`. A
+feed doesn't have to cover every symbol — uncovered symbols simply never
+warm up for that strategy. A shared series (e.g. refinery utilization
+across several oil futures) is broadcast at wiring time:
+
+```python
+alt_data = {'refinery_util': {sym: util_df for sym in ['CL', 'RB', 'HO']}}
+data_handler = HistoricDataHandler(events_queue, config.symbols,
+                                   base_timeframe=config.base_timeframe,
+                                   timeframes=config.timeframes,
+                                   data=data, alt_data=alt_data)
+```
+
 ### Run — wire the modules and start the loop
 
 The trader instantiates each module explicitly, passes them into
