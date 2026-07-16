@@ -399,3 +399,88 @@ def test_nan_alt_row_dropped_in_stream():
         dh.update_bar()
     records = dh.get_latest_alt('BTC', 'funding', 10)
     assert [r.values['rate'] for r in records] == [0.002]
+
+
+# ──────────────────────────────────────────────
+# Section 5 — end-to-end integration through a real Backtester
+# ──────────────────────────────────────────────
+
+from backtester import Backtester
+from config import uniform_registry
+from execution import BacktestExecution
+from portfolio import BacktestPortfolio
+from riskmanager import SimpleRiskManager
+from strategy import Strategy
+
+
+class _FundingToyStrategy(Strategy):
+    """Toy alt consumer: forecast = -sign(latest funding rate) * 50.
+
+    Returns ``None`` (no forecast — warmup) until the symbol has at
+    least one funding record, exercising the existing liveness gate for
+    feed-coverage gaps.
+    """
+
+    def calculate_forecast(self, event):
+        if self.data_handler.count_alt(event.symbol, 'funding') == 0:
+            return None
+        rec = self.data_handler.get_latest_alt(event.symbol, 'funding', 1)[-1]
+        rate = rec.values['rate']
+        if rate > 0:
+            forecast = -50.0
+        elif rate < 0:
+            forecast = 50.0
+        else:
+            forecast = 0.0
+        return {'forecast': forecast, 'funding_rate': rate}
+
+
+def _run_end_to_end():
+    """Five daily bars for BTC+ETH; funding only for BTC, flipping sign.
+
+    Funding +0.01 known at the 01-01 bar (short from day 1) and -0.01
+    known at the 01-03 bar (long from day 3). ETH has no funding data
+    and must never warm up or trade.
+    """
+    q = thread_queue.Queue()
+    symbols = ['BTC', 'ETH']
+    bars = {s: _make_ohlcv([100.0, 101.0, 102.0, 103.0, 104.0])
+            for s in symbols}
+    funding = _make_alt([0.01, -0.01],
+                        ['2026-01-01 00:00', '2026-01-03 00:00'])
+    dh = HistoricDataHandler(q, symbols, '1d', {'1d': 500},
+                             data=bars,
+                             alt_data={'funding': {'BTC': funding}})
+    strat = _FundingToyStrategy(dh, symbols)
+    instruments = uniform_registry(symbols)
+    portfolio = BacktestPortfolio(q, dh, symbols, instruments,
+                                  initial_capital=1_000_000.0)
+    rm = SimpleRiskManager(portfolio, strat, size_mode='fixed_quantity',
+                           position_size=1.0)
+    execution = BacktestExecution(q, instruments)
+    bt = Backtester(events_queue=q, data_handler=dh, strategy=strat,
+                    portfolio=portfolio, risk_manager=rm,
+                    execution_handler=execution)
+    bt.run()
+    return strat, portfolio
+
+
+def test_forecast_responds_to_funding_and_position_flips():
+    strat, portfolio = _run_end_to_end()
+    records = strat.get_records('BTC')
+    # Latest-known funding at each bar: +0.01 on 01-01/01-02, -0.01 after.
+    assert records['funding_rate'].tolist() == [0.01, 0.01, -0.01, -0.01, -0.01]
+    assert records['forecast'].tolist() == [-50.0, -50.0, 50.0, 50.0, 50.0]
+    # Sign-of-forecast sizing at 1 contract: short first, long by the end.
+    assert portfolio.positions['BTC'] == 1.0
+
+
+def test_uncovered_symbol_never_warms_and_never_trades():
+    strat, portfolio = _run_end_to_end()
+    assert strat.is_warmed_up('BTC') is True
+    assert strat.is_warmed_up('ETH') is False
+    assert strat.get_forecast('ETH') is None
+    assert portfolio.positions['ETH'] == 0.0
+    trade_log = portfolio.get_trade_log()
+    assert not trade_log.empty            # BTC did trade
+    assert 'ETH' not in set(trade_log['symbol'])
