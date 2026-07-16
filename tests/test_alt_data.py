@@ -279,3 +279,123 @@ def test_empty_alt_frames_are_skipped():
 def test_no_alt_data_is_backward_compatible():
     dh = _historic()
     assert dh.alt_feeds == {}
+
+
+# ──────────────────────────────────────────────
+# Section 4 — stream merge + update_bar ingestion (causality contract)
+# ──────────────────────────────────────────────
+
+def _drive_one_bar(dh):
+    """Call update_bar once; return the BarEvents it queued (0 or 1)."""
+    before = len(dh.events_queue.items)
+    dh.update_bar()
+    return dh.events_queue.items[before:]
+
+
+def test_visibility_contract_ts_leq_T():
+    """The bar at open-time T sees exactly the alt records with ts <= T."""
+    bars = {'BTC': _make_ohlcv([100.0, 101.0, 102.0])}   # 01-01, 01-02, 01-03
+    funding = _make_alt(
+        [0.001, 0.002, 0.003, 0.004],
+        ['2025-12-31 12:00',   # before first bar  -> visible at bar 01-01
+         '2026-01-01 00:00',   # == bar-open T     -> visible at bar 01-01 (tie-break)
+         '2026-01-01 08:00',   # inside (T, T+1d)  -> visible at bar 01-02
+         '2026-01-03 12:00'])  # after last bar    -> ingested at stream end
+    dh = HistoricDataHandler(FakeQueue(), ['BTC'], '1d', {'1d': 500},
+                             data=bars, alt_data={'funding': {'BTC': funding}})
+
+    events = _drive_one_bar(dh)            # bar 2026-01-01
+    assert len(events) == 1
+    assert dh.count_alt('BTC', 'funding') == 2
+    assert dh.get_latest_alt('BTC', 'funding', 1)[-1].values['rate'] == 0.002
+
+    events = _drive_one_bar(dh)            # bar 2026-01-02
+    assert len(events) == 1
+    assert dh.count_alt('BTC', 'funding') == 3
+
+    events = _drive_one_bar(dh)            # bar 2026-01-03
+    assert len(events) == 1
+    assert dh.count_alt('BTC', 'funding') == 3
+
+    events = _drive_one_bar(dh)            # stream end: trailing alt row
+    assert events == []
+    assert dh.continue_backtest is False
+    assert dh.count_alt('BTC', 'funding') == 4
+
+
+def test_bar_stream_identical_with_and_without_alt_data():
+    """Alt data must not change which BarEvents are emitted, or their order."""
+    bars = {'BTC': _make_ohlcv([100.0, 101.0]),
+            'ETH': _make_ohlcv([200.0, 201.0])}
+    funding = _make_alt([0.001, 0.002],
+                        ['2026-01-01 08:00', '2026-01-01 16:00'])
+
+    def _all_events(alt_data):
+        dh = HistoricDataHandler(FakeQueue(), ['BTC', 'ETH'], '1d',
+                                 {'1d': 500},
+                                 data={k: v.copy() for k, v in bars.items()},
+                                 alt_data=alt_data)
+        while dh.continue_backtest:
+            dh.update_bar()
+        return [(e.symbol, e.timestamp, e.close) for e in dh.events_queue.items]
+
+    assert _all_events(None) == _all_events({'funding': {'BTC': funding}})
+
+
+def test_multi_symbol_feeds_stay_separate_through_the_stream():
+    bars = {'BTC': _make_ohlcv([100.0, 101.0]),
+            'ETH': _make_ohlcv([200.0, 201.0])}
+    alt = {'funding': {
+        'BTC': _make_alt([0.001], ['2026-01-01 00:00']),
+        'ETH': _make_alt([0.009], ['2026-01-01 00:00']),
+    }}
+    dh = HistoricDataHandler(FakeQueue(), ['BTC', 'ETH'], '1d', {'1d': 500},
+                             data=bars, alt_data=alt)
+    while dh.continue_backtest:
+        dh.update_bar()
+    assert dh.get_latest_alt('BTC', 'funding', 1)[-1].values['rate'] == 0.001
+    assert dh.get_latest_alt('ETH', 'funding', 1)[-1].values['rate'] == 0.009
+
+
+def test_multiple_feeds_ingest_independently():
+    bars = {'BTC': _make_ohlcv([100.0, 101.0])}
+    alt = {
+        'funding': {'BTC': _make_alt([0.001], ['2026-01-01 00:00'])},
+        'open_interest': {'BTC': _make_alt([5e9], ['2026-01-01 12:00'],
+                                           column='oi')},
+    }
+    dh = HistoricDataHandler(FakeQueue(), ['BTC'], '1d', {'1d': 500},
+                             data=bars, alt_data=alt)
+    _drive_one_bar(dh)                      # bar 01-01: funding print visible
+    assert dh.count_alt('BTC', 'funding') == 1
+    assert dh.count_alt('BTC', 'open_interest') == 0
+    _drive_one_bar(dh)                      # bar 01-02: OI print now visible
+    assert dh.count_alt('BTC', 'open_interest') == 1
+    assert dh.get_latest_alt('BTC', 'open_interest', 1)[-1].values['oi'] == 5e9
+
+
+def test_broadcast_same_frame_under_multiple_symbols():
+    """One shared frame object wired under several symbols (spec: refinery
+    utilization for CL/RB/HO) ingests independently per symbol."""
+    bars = {'BTC': _make_ohlcv([100.0, 101.0]),
+            'ETH': _make_ohlcv([200.0, 201.0])}
+    shared = _make_alt([0.5], ['2026-01-01 00:00'], column='util')
+    dh = HistoricDataHandler(FakeQueue(), ['BTC', 'ETH'], '1d', {'1d': 500},
+                             data=bars,
+                             alt_data={'util': {s: shared for s in ('BTC', 'ETH')}})
+    while dh.continue_backtest:
+        dh.update_bar()
+    assert dh.count_alt('BTC', 'util') == 1
+    assert dh.count_alt('ETH', 'util') == 1
+
+
+def test_nan_alt_row_dropped_in_stream():
+    bars = {'BTC': _make_ohlcv([100.0, 101.0])}
+    funding = _make_alt([float('nan'), 0.002],
+                        ['2025-12-31 12:00', '2026-01-01 12:00'])
+    dh = HistoricDataHandler(FakeQueue(), ['BTC'], '1d', {'1d': 500},
+                             data=bars, alt_data={'funding': {'BTC': funding}})
+    while dh.continue_backtest:
+        dh.update_bar()
+    records = dh.get_latest_alt('BTC', 'funding', 10)
+    assert [r.values['rate'] for r in records] == [0.002]

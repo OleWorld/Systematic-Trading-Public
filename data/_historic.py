@@ -15,6 +15,13 @@ logger = logging.getLogger(__name__)
 # override via ``alt_maxlen`` — mirrors the ``{base: 500}`` bar default.
 DEFAULT_ALT_MAXLEN = 500
 
+# Heap tie-break priorities: alt records sort BEFORE bars at equal
+# timestamps. A print at exactly T is known at T, while the bar stamped
+# T (open-time convention) is processed at its close one period later —
+# alt-first is causal and avoids one bar of staleness.
+_KIND_ALT = 0
+_KIND_BAR = 1
+
 
 class HistoricDataHandler(DataHandler):
     """HistoricDataHandler is designed for backtesting.
@@ -29,6 +36,13 @@ class HistoricDataHandler(DataHandler):
     to UTC. Each frame's index must be sorted ascending — unsorted input raises
     ``ValueError`` at construction (same-timestamp adjacent duplicates are
     tolerated here and handled by the stream gate: first bar wins).
+
+    Optionally, ``alt_data={feed: {symbol: df}}`` supplies named per-symbol
+    alternative-data series (funding rates, open interest, ...) that are
+    merged into the same time-sorted stream and stored in rolling windows —
+    no events emitted; strategies read them via ``get_latest_alt`` at bar
+    cadence. At equal timestamps alt rows sort before bar rows, so the bar
+    at open-time T sees exactly the records with ``ts <= T``.
     """
 
     def __init__(self, events_queue: thread_queue.Queue[Any], symbol_list: List[str],
@@ -92,7 +106,7 @@ class HistoricDataHandler(DataHandler):
             normalized[sym] = df.set_axis(idx)
 
         self._alt_frames = self._normalize_alt(alt_data)
-        self._bar_generators = self._build_stream(normalized)
+        self._bar_generators = self._build_stream(normalized, self._alt_frames)
 
     # ── alt-frame validation ─────────────────────
 
@@ -160,62 +174,107 @@ class HistoricDataHandler(DataHandler):
 
     # ── stream construction ─────────────────────
 
-    def _build_stream(self, dataframes: Dict[str, pd.DataFrame]) -> Generator[Tuple[str, Any], None, None]:
-        """Convert per-symbol DataFrames into a single time-sorted bar generator."""
-        generators = {sym: df.itertuples() for sym, df in dataframes.items()
-                      if df is not None and not df.empty}
+    def _build_stream(
+        self,
+        dataframes: Dict[str, pd.DataFrame],
+        alt_frames: Dict[str, Dict[str, pd.DataFrame]],
+    ) -> Generator[Tuple[Tuple[int, str, Optional[str]], Any], None, None]:
+        """Convert bar frames + alt frames into one time-sorted stream.
+
+        Stream items are ``(key, row)`` where ``key`` is
+        ``(_KIND_BAR, symbol, None)`` for bars and
+        ``(_KIND_ALT, symbol, feed)`` for alt records. Bar generators
+        are inserted first so bar-vs-bar ties keep the pre-existing
+        first-inserted-symbol order; the kind field in the heap entry
+        puts alt records ahead of bars at equal timestamps regardless
+        of insertion order.
+        """
+        generators: Dict[Tuple[int, str, Optional[str]], Iterator[Any]] = {}
+        for sym, df in dataframes.items():
+            if df is not None and not df.empty:
+                generators[(_KIND_BAR, sym, None)] = df.itertuples()
+        for feed, per_symbol in alt_frames.items():
+            for sym, df in per_symbol.items():
+                generators[(_KIND_ALT, sym, feed)] = df.itertuples()
         return self._merge_generators(generators)
 
-    def _merge_generators(self, generators: Dict[str, Iterator[Any]]) -> Generator[Tuple[str, Any], None, None]:
-        """Merge multiple symbol generators into a single time-sorted stream.
+    def _merge_generators(
+        self,
+        generators: Dict[Tuple[int, str, Optional[str]], Iterator[Any]],
+    ) -> Generator[Tuple[Tuple[int, str, Optional[str]], Any], None, None]:
+        """Merge bar and alt generators into a single time-sorted stream.
 
-        A heap of ``(timestamp, seq, symbol, row)`` heads yields the
-        earliest-timestamp row in O(log S) per bar (S = symbols with data
-        remaining). ``seq`` is the symbol's insertion index in
-        ``generators``, so equal timestamps break to the FIRST-inserted
-        symbol — exactly the tie-break the previous linear ``min()`` scan
-        over the heads dict produced. ``(timestamp, seq)`` is unique per
-        heap entry (one head per symbol), so the row itself is never
-        compared.
+        A heap of ``(timestamp, kind, seq, key, row)`` heads yields the
+        earliest row in O(log S) per item (S = generators with data
+        remaining). ``kind`` (``_KIND_ALT=0``, ``_KIND_BAR=1``) breaks
+        equal-timestamp ties in favor of alt records — the causality
+        contract. ``seq`` is the generator's insertion index, so
+        same-kind ties keep insertion order (for bars: byte-identical to
+        the previous single-kind behavior). ``(timestamp, kind, seq)``
+        is unique per heap entry (one head per generator), so
+        ``key``/``row`` are never compared.
         """
-        heap: List[Tuple[Any, int, str, Any]] = []
-        for seq, (sym, gen) in enumerate(generators.items()):
+        heap: List[Tuple[Any, int, int, Tuple[int, str, Optional[str]], Any]] = []
+        for seq, (key, gen) in enumerate(generators.items()):
             try:
                 row = next(gen)
             except StopIteration:
                 continue
-            heap.append((row.Index, seq, sym, row))
+            heap.append((row.Index, key[0], seq, key, row))
         heapq.heapify(heap)
 
         while heap:
-            _, seq, sym, row = heapq.heappop(heap)
+            _, _, seq, key, row = heapq.heappop(heap)
 
-            yield (sym, row)
+            yield (key, row)
 
             try:
-                nxt = next(generators[sym])
+                nxt = next(generators[key])
             except StopIteration:
                 continue
-            heapq.heappush(heap, (nxt.Index, seq, sym, nxt))
+            heapq.heappush(heap, (nxt.Index, key[0], seq, key, nxt))
 
     def update_bar(self) -> None:
-        """Pushes the next bar to the queue."""
+        """Ingest due alt rows, then push the next bar to the queue.
+
+        Loops the merged stream: every alt row that sorts before the
+        next bar row — including rows at the SAME timestamp, which the
+        heap orders alt-first — is stored via ``_append_alt`` with no
+        event emitted; the first bar row is appended and emitted as a
+        ``BarEvent`` exactly as before, ending the call. So when the
+        bar at open-time T reaches the queue, the alt windows contain
+        exactly the records with ``ts <= T``. Stream exhaustion
+        (including trailing alt rows after the final bar) ends the
+        backtest.
+        """
         try:
-            symbol, row = next(self._bar_generators)
+            while True:
+                key, row = next(self._bar_generators)
+                kind, symbol, feed = key
 
-            bar = BarEvent(
-                symbol=symbol,
-                timestamp=row.Index,
-                open=float(row.Open),
-                high=float(row.High),
-                low=float(row.Low),
-                close=float(row.Close),
-                volume=float(row.Volume),
-                period=self.base_timeframe
-            )
-
-            if self._append_bar(symbol, bar.timestamp, bar.open, bar.high, bar.low, bar.close, bar.volume):
-                self.events_queue.put(bar)
+                if kind == _KIND_ALT:
+                    columns = self._alt_columns[(symbol, feed)]
+                    values = {col: float(val)
+                              for col, val in zip(columns, row[1:])}
+                    self._append_alt(feed, symbol, row.Index, values)
+                elif kind == _KIND_BAR:
+                    bar = BarEvent(
+                        symbol=symbol,
+                        timestamp=row.Index,
+                        open=float(row.Open),
+                        high=float(row.High),
+                        low=float(row.Low),
+                        close=float(row.Close),
+                        volume=float(row.Volume),
+                        period=self.base_timeframe
+                    )
+                    if self._append_bar(symbol, bar.timestamp, bar.open,
+                                        bar.high, bar.low, bar.close,
+                                        bar.volume):
+                        self.events_queue.put(bar)
+                    return
+                else:
+                    raise ValueError(f"Unexpected stream kind: {kind!r}")
 
         except StopIteration:
             self.continue_backtest = False
