@@ -18,7 +18,8 @@ class DataHandler(abc.ABC):
     """Abstract Base Class for DataHandlers.
 
     Responsible for:
-    - Maintaining rolling windows of market data (bars, and future: liquidations, funding, etc.).
+    - Maintaining rolling windows of market data: bars, plus named per-symbol
+      alt feeds (funding rates, open interest, ...) via ``alt_feeds``.
     - Emitting events to the system event queue for strategy consumption.
     """
 

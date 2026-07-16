@@ -401,6 +401,28 @@ def test_nan_alt_row_dropped_in_stream():
     assert [r.values['rate'] for r in records] == [0.002]
 
 
+def test_multi_column_stream_decode_keys_values_to_right_fields():
+    """The positional itertuples decode must key each value to the RIGHT
+    field name after streaming — including column names that are not
+    valid Python identifiers (pandas renames those in itertuples; the
+    decode zips positionally against the recorded column order, so the
+    renaming must be irrelevant)."""
+    bars = {'BTC': _make_ohlcv([100.0, 101.0])}
+    idx = pd.DatetimeIndex(pd.to_datetime(['2026-01-01 00:00']), tz='UTC')
+    frame = pd.DataFrame(
+        {'funding rate': [0.001], '2oi': [5e9], 'basis': [-0.5]}, index=idx)
+    dh = HistoricDataHandler(FakeQueue(), ['BTC'], '1d', {'1d': 500},
+                             data=bars, alt_data={'mixed': {'BTC': frame}})
+    while dh.continue_backtest:
+        dh.update_bar()
+    rec = dh.get_latest_alt('BTC', 'mixed', 1)[-1]
+    assert rec.values['funding rate'] == 0.001
+    assert rec.values['2oi'] == 5e9
+    assert rec.values['basis'] == -0.5
+    df = dh.get_latest_alt_df('BTC', 'mixed', 1)
+    assert list(df.columns) == ['funding rate', '2oi', 'basis']
+
+
 # ──────────────────────────────────────────────
 # Section 5 — end-to-end integration through a real Backtester
 # ──────────────────────────────────────────────
