@@ -111,3 +111,43 @@ def test_first_fill():
     log = pd.DataFrame({'timestamp': ts, 'realized_pnl': [1.0, 0.0]})
     assert first_fill(log) == pd.Timestamp('2024-01-15', tz='UTC')
     assert first_fill(pd.DataFrame()) is None
+
+
+# ── UTC enforcement (tz audit 2026-07) ───────────────────────────────
+
+def _naive_curve():
+    idx = pd.to_datetime(['2024-01-01', '2024-01-02'])      # tz-naive
+    return pd.DataFrame({'account_balance': [100.0, 110.0],
+                         'total_commission': [0.0, 0.0]}, index=idx)
+
+
+def test_collapse_equity_naive_index_raises():
+    from validation._common import collapse_equity
+    with pytest.raises(ValueError, match="equity_curve.*timezone-naive"):
+        collapse_equity(_naive_curve())
+
+
+def test_pnl_from_equity_naive_start_with_time_raises():
+    from validation._common import pnl_from_equity
+    idx = pd.to_datetime(['2024-01-01', '2024-01-02'], utc=True)
+    eq = pd.DataFrame({'account_balance': [100.0, 110.0]}, index=idx)
+    with pytest.raises(ValueError, match="start.*timezone-naive"):
+        pnl_from_equity(eq, initial_capital=100.0,
+                        start=pd.Timestamp('2024-01-02 05:00'))
+
+
+def test_window_pnl_date_only_start_accepted():
+    from validation._common import window_pnl
+    idx = pd.to_datetime(['2024-01-01', '2024-01-02'], utc=True)
+    eq = pd.DataFrame({'account_balance': [100.0, 110.0]}, index=idx)
+    pnl, baseline = window_pnl(eq, initial_capital=100.0,
+                               start='2024-01-02')          # carve-out
+    assert len(pnl) == 1
+    assert baseline == 100.0
+
+
+def test_first_fill_naive_timestamp_column_raises():
+    from validation._common import first_fill
+    log = pd.DataFrame({'timestamp': pd.to_datetime(['2024-01-02'])})
+    with pytest.raises(ValueError, match=r"trade_log\['timestamp'\]"):
+        first_fill(log)

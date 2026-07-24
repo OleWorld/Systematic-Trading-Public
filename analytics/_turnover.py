@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 
 from analytics._stats import _collapse_equity
+from data import ensure_utc_index, ensure_utc_series
 from volatility import bars_per_year
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,9 @@ def turnover_stats(
     trade_log
         Output of ``portfolio.get_trade_log()`` — one row per
         ``FillEvent``, with ``timestamp``, ``symbol`` and ``quantity``
-        (positive magnitude).
+        (positive magnitude). A timezone-naive equity-curve index (or
+        trade-log timestamp column) raises ``ValueError``; tz-aware
+        non-UTC input is converted to UTC.
     timeframe
         Bar timeframe of the equity curve (the engine's
         ``base_timeframe``, e.g. ``'1d'``); with ``days_convention``,
@@ -102,8 +105,10 @@ def turnover_stats(
     TypeError
         If ``equity_curve`` or ``trade_log`` is not a DataFrame.
     ValueError
-        If ``timeframe``/``days_convention`` is invalid, or a non-empty
-        input lacks its required columns.
+        If ``timeframe``/``days_convention`` is invalid, a non-empty
+        equity-curve index or trade-log timestamp column is
+        timezone-naive, or a non-empty input lacks its required
+        columns.
     """
     if not isinstance(equity_curve, pd.DataFrame):
         raise TypeError(
@@ -113,6 +118,13 @@ def turnover_stats(
         raise TypeError(
             f"trade_log must be a DataFrame, got {type(trade_log).__name__}"
         )
+    if not equity_curve.empty:
+        equity_curve = equity_curve.set_axis(
+            ensure_utc_index(equity_curve.index, 'equity_curve'))
+    if not trade_log.empty and 'timestamp' in trade_log.columns:
+        trade_log = trade_log.assign(
+            timestamp=ensure_utc_series(trade_log['timestamp'],
+                                        "trade_log['timestamp']"))
     bpy = bars_per_year(timeframe, days_convention)  # raises on bad inputs
     dpy = bars_per_year('1d', days_convention)
     if not equity_curve.empty:

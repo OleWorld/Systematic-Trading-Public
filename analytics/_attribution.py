@@ -52,6 +52,7 @@ import numpy as np
 import pandas as pd
 
 from analytics._stats import _collapse_equity
+from data import ensure_utc_index
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +165,9 @@ def pnl_attribution(
         one row per ``BarEvent``; collapsed internally to one row per
         timestamp (last wins). Must carry the per-symbol
         ``realized_pnl`` and ``unrealized_pnl`` dict columns when
-        non-empty. Empty frames are a clean edge case (empty result).
+        non-empty. Empty frames are a clean edge case (empty result). A
+        timezone-naive equity-curve index raises ``ValueError``;
+        tz-aware non-UTC input is converted to UTC.
     system
         The forecast source the backtest traded — an
         ``orchestrator.Orchestrator`` (detected by its ``strategies``
@@ -194,10 +197,11 @@ def pnl_attribution(
         If ``equity_curve`` is not a DataFrame or ``system`` lacks the
         forecast-source surface (``get_records`` / ``symbol_list``).
     ValueError
-        If ``eps`` is invalid, a non-empty curve lacks the required
-        PnL columns, a strategy label collides with ``'unattributed'``,
-        a variation label collides with ``'all'``/``''``, or a managed
-        symbol's records lack the expected forecast/weight columns.
+        If ``eps`` is invalid, a non-empty curve has a timezone-naive
+        index, a non-empty curve lacks the required PnL columns, a
+        strategy label collides with ``'unattributed'``, a variation
+        label collides with ``'all'``/``''``, or a managed symbol's
+        records lack the expected forecast/weight columns.
     """
     if not isinstance(equity_curve, pd.DataFrame):
         raise TypeError(
@@ -214,6 +218,8 @@ def pnl_attribution(
     if not np.isfinite(eps) or eps <= 0:
         raise ValueError(f"eps must be finite and > 0, got {eps}")
     if not equity_curve.empty:
+        equity_curve = equity_curve.set_axis(
+            ensure_utc_index(equity_curve.index, 'equity_curve'))
         missing = [c for c in _REQUIRED_EQUITY_COLS
                    if c not in equity_curve.columns]
         if missing:

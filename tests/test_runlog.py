@@ -248,7 +248,7 @@ def test_save_creates_layout_and_manifest(tmp_path):
     assert not record.path.name.endswith('.tmp')
 
     m = record.manifest
-    assert m['schema_version'] == 1
+    assert m['schema_version'] == 2
     assert m['run']['label'] == 'unit run'              # original, unslugged
     assert m['run']['notes'] == 'hello'
     assert m['run']['extra'] == {'seed': 42}
@@ -499,8 +499,9 @@ def test_list_runs(tmp_path):
     runs = list_runs(tmp_path)
     assert len(runs) == 2
     assert list(runs.columns) == ['run_id', 'created_utc', 'label',
-                                  'n_symbols', 'n_trades', 'initial_capital',
-                                  'final_balance', 'schema_version']
+                                  'start', 'end', 'n_symbols', 'n_trades',
+                                  'initial_capital', 'final_balance',
+                                  'schema_version']
     assert runs['label'].tolist() == ['first', 'second']
     assert runs['created_utc'].is_monotonic_increasing
     assert runs['final_balance'].tolist() == [1042.0, 1042.0]
@@ -555,7 +556,7 @@ def test_integration_real_mini_backtest(tmp_path):
         }, index=idx)
 
     config = BacktestConfig(
-        symbols=list(data), start_date='2026-01-01', end_date='2026-03-02',
+        symbols=list(data),
         base_timeframe='1d', days_convention='calendar',
         timeframes={'1d': 100}, initial_capital=1_000_000.0,
         annual_target_vol=100_000.0,
@@ -719,3 +720,36 @@ def test_replace_with_retry_reraises_after_exhausted_attempts(tmp_path,
     src.mkdir()
     with pytest.raises(PermissionError):
         replace_with_retry(src, tmp_path / 'b', attempts=3)
+
+
+# ──────────────────────────────────────────────
+# data_range manifest field (2026-07)
+# ──────────────────────────────────────────────
+
+def test_manifest_records_actual_data_range(tmp_path):
+    """save_run derives data_range from the equity curve's first/last
+    timestamps — the ACTUAL backtest range (config dates were removed)."""
+    record = _save_fake_run(tmp_path)
+    dr = record.manifest['data_range']
+    eq = record.equity_curve()
+    assert dr['start'] == pd.Timestamp(eq.index[0]).isoformat()
+    assert dr['end'] == pd.Timestamp(eq.index[-1]).isoformat()
+
+
+def test_list_runs_carries_start_end_columns(tmp_path):
+    _save_fake_run(tmp_path)
+    table = list_runs(tmp_path)
+    assert 'start' in table.columns and 'end' in table.columns
+    assert table.loc[0, 'start'] is not None
+
+
+def test_list_runs_tolerates_manifest_without_data_range(tmp_path):
+    """Pre-schema-2 manifests lack data_range — the browser shows None."""
+    _save_fake_run(tmp_path)
+    run_dir = next(p for p in tmp_path.iterdir() if p.is_dir())
+    manifest_path = run_dir / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    del manifest['data_range']
+    manifest_path.write_text(json.dumps(manifest), encoding='utf-8')
+    table = list_runs(tmp_path)
+    assert table.loc[0, 'start'] is None

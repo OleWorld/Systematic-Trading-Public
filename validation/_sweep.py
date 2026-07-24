@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pandas as pd
 
 from analytics import backtest_stats
+from data import ensure_utc_series, ensure_utc_timestamp
 from runlog import replace_with_retry, sanitize_frame
 
 from ._common import collapse_equity, first_fill, is_lower_better, \
@@ -103,8 +104,11 @@ def _extract_cell(params: Dict[str, Any], portfolio_like,
     if initial_capital <= 0:
         raise ValueError(f"initial_capital must be > 0, got "
                          f"{initial_capital} for {params!r}")
-    return _Cell(params=params, equity=equity,
-                 trades=portfolio_like.get_trade_log().copy(),
+    trades = portfolio_like.get_trade_log().copy()
+    if not trades.empty and 'timestamp' in trades.columns:
+        trades['timestamp'] = ensure_utc_series(
+            trades['timestamp'], f"trade log for {params!r} ['timestamp']")
+    return _Cell(params=params, equity=equity, trades=trades,
                  initial_capital=initial_capital, runtime_s=runtime_s)
 
 
@@ -187,10 +191,8 @@ class SweepResult:
             elif self.stats_start == 'common_first_fill':
                 self._resolved_start = self.common_first_fill()
             else:
-                ts = pd.Timestamp(self.stats_start)
-                if ts.tzinfo is None:
-                    ts = ts.tz_localize('UTC')
-                self._resolved_start = ts
+                self._resolved_start = ensure_utc_timestamp(
+                    self.stats_start, 'stats_start')
         return self._resolved_start
 
     @property

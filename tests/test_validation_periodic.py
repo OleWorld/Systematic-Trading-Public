@@ -91,3 +91,16 @@ def test_edge_and_param_law():
                          initial_capital=1_000_000.0, timeframe='1d',
                          days_convention='calendar')
     assert out.empty and 'Sharpe Ratio' in out.columns
+
+
+def test_periodic_stats_naive_trade_log_raises():
+    """UTC law: a naive trade-log timestamp column raises (it previously
+    slipped past the gate and silently produced zero-trade periods)."""
+    idx = pd.to_datetime(['2024-01-01', '2024-01-02'], utc=True)
+    eq = pd.DataFrame({'account_balance': [100.0, 110.0],
+                       'total_commission': [0.0, 0.0]}, index=idx)
+    log = pd.DataFrame({'timestamp': pd.to_datetime(['2024-01-02']),  # naive
+                        'realized_pnl': [5.0]})
+    with pytest.raises(ValueError, match=r"trade_log\['timestamp'\]"):
+        periodic_stats(eq, log, initial_capital=100.0, timeframe='1d',
+                       days_convention='calendar')

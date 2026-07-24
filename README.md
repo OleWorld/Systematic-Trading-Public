@@ -9,8 +9,6 @@ from config import BacktestConfig
 
 config = BacktestConfig(
     symbols=['BTC_USDT:USDT', 'BNB_USDT:USDT'],   # CCXT perp naming, as in the bundled sample data
-    start_date='2026-01-01',
-    end_date='2026-04-04',
     base_timeframe='4h',
     days_convention='calendar',   # 'calendar' (365 d/y, 24/7) or 'business' (252 trading d/y)
     # Timeframes — {tf: maxlen}. Omit for single-TF (defaults to {base: 500}).
@@ -139,9 +137,11 @@ risk_manager = SimpleRiskManager(
 ### Data — supply your own OHLCV
 
 You provide market data as a `{symbol: DataFrame}` dict — this is the only way data
-enters the engine. Each DataFrame is indexed by a timezone-aware `DatetimeIndex` and
-exposes `Open`/`High`/`Low`/`Close`/`Volume` columns; sourcing, cleaning, and windowing
-the data is up to you. A small bundled sample of daily bars lives at
+enters the engine. Each DataFrame is indexed by a timezone-aware `DatetimeIndex`
+(**UTC enforced**: a naive index raises `ValueError` at construction; other timezones
+are converted to UTC) and exposes `Open`/`High`/`Low`/`Close`/`Volume` columns;
+sourcing, cleaning, and windowing the data is up to you. A small bundled sample of
+daily bars lives at
 [backtests/sample_data/crypto_1d.csv](backtests/sample_data/crypto_1d.csv):
 
 ```python
@@ -151,6 +151,28 @@ raw = pd.read_csv('backtests/sample_data/crypto_1d.csv')
 raw['timestamp'] = pd.to_datetime(raw['timestamp'], utc=True)
 data = {sym: g.set_index('timestamp')[['Open', 'High', 'Low', 'Close', 'Volume']]
         for sym, g in raw.groupby('symbol')}
+```
+
+**Alternative data (optional).** Non-OHLCV series — funding rates, open
+interest, and the like — ride along as named per-symbol *alt feeds*:
+`alt_data={feed: {symbol: df}}`, each frame a tz-aware `DatetimeIndex`
+plus numeric columns (column names become field names). Timestamps mean
+*"the moment the value became known"*. Records are merged into the same
+time-sorted stream as bars and stored in rolling windows — no events are
+emitted; a strategy reads the latest values inside `calculate_forecast`
+via `data_handler.get_latest_alt(symbol, feed, n)` (or
+`get_latest_alt_df` / `count_alt`). When the bar at open-time *T* is
+processed, a feed's window contains exactly the records with `ts ≤ T`. A
+feed doesn't have to cover every symbol — uncovered symbols simply never
+warm up for that strategy. A shared series (e.g. refinery utilization
+across several oil futures) is broadcast at wiring time:
+
+```python
+alt_data = {'refinery_util': {sym: util_df for sym in ['CL', 'RB', 'HO']}}
+data_handler = HistoricDataHandler(events_queue, config.symbols,
+                                   base_timeframe=config.base_timeframe,
+                                   timeframes=config.timeframes,
+                                   data=data, alt_data=alt_data)
 ```
 
 ### Run — wire the modules and start the loop

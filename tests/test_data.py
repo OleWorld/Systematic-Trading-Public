@@ -25,13 +25,11 @@ import pytest
 
 from data._base import DataHandler
 from data._historic import HistoricDataHandler
-from data._ohlcv import _candles_to_dataframe, _resample_ohlcv
+from data._ohlcv import _candles_to_dataframe, _resample_ohlcv, resample
 from data._timeframe import (
     TIMEFRAME_FALLBACK_ORDER,
-    _ensure_utc,
     get_period_start,
     _ms_to_utc,
-    _parse_date,
     parse_timeframe_to_seconds,
 )
 from event import BarEvent
@@ -106,29 +104,6 @@ def test_parse_timeframe_to_seconds_rejects_malformed(bad):
     assert bad in str(exc.value) or 'positive' in str(exc.value)
 
 
-def test_parse_date_date_only_string_is_utc_midnight():
-    dt = _parse_date('2026-01-01')
-    assert dt == datetime.datetime(2026, 1, 1, tzinfo=UTC)
-    assert dt.tzinfo is not None
-
-
-def test_parse_date_iso_with_z_is_utc():
-    dt = _parse_date('2026-01-01T12:00:00Z')
-    assert dt == datetime.datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-
-
-def test_parse_date_iso_with_offset_keeps_tz():
-    dt = _parse_date('2026-01-01T12:00:00+02:00')
-    # Same instant as 10:00 UTC.
-    assert dt.utcoffset() == datetime.timedelta(hours=2)
-    assert dt.astimezone(UTC) == datetime.datetime(2026, 1, 1, 10, 0, 0, tzinfo=UTC)
-
-
-def test_parse_date_passes_through_datetime_unchanged():
-    src = datetime.datetime(2026, 3, 15, 9, 30, tzinfo=UTC)
-    assert _parse_date(src) is src
-
-
 def test_ms_to_utc_epoch_zero():
     dt = _ms_to_utc(0)
     assert dt == datetime.datetime(1970, 1, 1, tzinfo=UTC)
@@ -140,22 +115,6 @@ def test_ms_to_utc_nonzero_with_fractional():
     expected = datetime.datetime.fromtimestamp(1_700_000_000.5, UTC)
     assert dt == expected
     assert dt.tzinfo == UTC
-
-
-def test_ensure_utc_naive_gets_utc_tag():
-    naive = datetime.datetime(2026, 1, 1, 5, 0)
-    out = _ensure_utc(naive)
-    assert out.tzinfo == UTC
-    # Wall-clock value preserved (just labelled UTC).
-    assert out.replace(tzinfo=None) == naive
-
-
-def test_ensure_utc_other_tz_converted_to_utc():
-    plus2 = datetime.timezone(datetime.timedelta(hours=2))
-    src = datetime.datetime(2026, 1, 1, 12, 0, tzinfo=plus2)
-    out = _ensure_utc(src)
-    assert out.tzinfo == UTC
-    assert out == datetime.datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
 
 
 def testget_period_start_1h_aligns_to_hour():
@@ -366,6 +325,14 @@ def test_resample_ohlcv_empty_returns_empty():
     out = _resample_ohlcv(empty, '4h')
     assert len(out) == 0
     assert list(out.columns) == ['Open', 'High', 'Low', 'Close', 'Volume']
+
+
+def test_resample_naive_index_raises():
+    idx = pd.to_datetime(['2024-01-01 00:00', '2024-01-01 01:00'])  # naive
+    df = _ohlcv_frame(idx)
+    with pytest.raises(ValueError, match="timezone-naive"):
+        resample(df, '1d', {'Open': 'first', 'High': 'max', 'Low': 'min',
+                            'Close': 'last', 'Volume': 'sum'})
 
 
 # ──────────────────────────────────────────────
@@ -889,6 +856,46 @@ def test_historic_handler_stops_after_exhausting_stream():
     assert h.continue_backtest is True
     h.update_bar()  # drains the StopIteration
     assert h.continue_backtest is False
+
+
+# ── UTC enforcement at construction (2026-07 tz audit) ───────────────
+
+def _ohlcv_frame(index):
+    return pd.DataFrame(
+        {'Open': 1.0, 'High': 2.0, 'Low': 0.5, 'Close': 1.5, 'Volume': 10.0},
+        index=index,
+    )
+
+
+def test_historic_naive_index_raises_naming_symbol():
+    idx = pd.to_datetime(['2024-01-01', '2024-01-02'])     # tz-naive
+    q = thread_queue.Queue()
+    with pytest.raises(ValueError, match=r"data\['BTC'\].*timezone-naive"):
+        HistoricDataHandler(q, ['BTC'], base_timeframe='1d',
+                            timeframes={'1d': 100},
+                            data={'BTC': _ohlcv_frame(idx)})
+
+
+def test_historic_non_utc_index_streams_utc_bars():
+    idx = pd.date_range('2024-01-01 12:00', periods=2, freq='D',
+                        tz='Europe/Berlin')                 # UTC+1 in Jan
+    q = thread_queue.Queue()
+    h = HistoricDataHandler(q, ['BTC'], base_timeframe='1d',
+                            timeframes={'1d': 100},
+                            data={'BTC': _ohlcv_frame(idx)})
+    h.update_bar()
+    bar = q.get_nowait()
+    assert bar.timestamp == pd.Timestamp('2024-01-01 11:00', tz='UTC')
+
+
+def test_historic_does_not_mutate_caller_frame():
+    idx = pd.date_range('2024-01-01', periods=2, freq='D',
+                        tz='Europe/Berlin')
+    df = _ohlcv_frame(idx)
+    q = thread_queue.Queue()
+    HistoricDataHandler(q, ['BTC'], base_timeframe='1d',
+                        timeframes={'1d': 100}, data={'BTC': df})
+    assert str(df.index.tz) == 'Europe/Berlin'              # untouched
 
 
 # ──────────────────────────────────────────────

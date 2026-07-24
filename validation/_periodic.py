@@ -14,6 +14,7 @@ import logging
 
 import pandas as pd
 
+from data import ensure_utc_series, ensure_utc_timestamp
 from volatility import bars_per_year as _bars_per_year
 
 from ._common import window_pnl, window_stats
@@ -39,7 +40,8 @@ def periodic_stats(
     """
     Per-period stats table (index = the pandas resample bin label, e.g. the
     period-end timestamp for ``'YE'``). ``freq`` is any pandas offset alias
-    (``'YE'`` default, ``'QE'``, ``'ME'``, ...). ``start`` (naive = UTC)
+    (``'YE'`` default, ``'QE'``, ``'ME'``, ...). ``start`` (tz-aware, or a
+    date-only string = UTC midnight; other naive values raise)
     trims to bars at/after it AND reseeds the baseline to the true balance
     entering the window — pre-start PnL never folds into the first kept
     period (deliberately different from the ``backtest_stats`` trim, whose
@@ -47,11 +49,17 @@ def periodic_stats(
     period from its actual starting equity. Bad params raise; empty
     inputs yield an empty fixed-schema frame; degenerate periods carry NaN
     Sharpe/volatility; Sortino may still compute on a single negative bar
-    (matches the ``backtest_stats`` downside convention).
+    (matches the ``backtest_stats`` downside convention). A timezone-naive
+    trade-log ``timestamp`` column raises ``ValueError``; tz-aware non-UTC
+    converts.
     """
     if not isinstance(trade_log, pd.DataFrame):
         raise TypeError(
             f"trade_log must be a DataFrame, got {type(trade_log).__name__}")
+    if not trade_log.empty and 'timestamp' in trade_log.columns:
+        trade_log = trade_log.assign(
+            timestamp=ensure_utc_series(trade_log['timestamp'],
+                                        "trade_log['timestamp']"))
     bpy = _bars_per_year(timeframe, days_convention)     # raises on bad input
     try:
         offset = pd.tseries.frequencies.to_offset(freq)
@@ -69,9 +77,7 @@ def periodic_stats(
     if not trade_log.empty and 'realized_pnl' in trade_log.columns:
         closing = trade_log[trade_log['realized_pnl'].astype(float) != 0.0]
         if start is not None and 'timestamp' in closing.columns:
-            start_ts = pd.Timestamp(start)
-            if start_ts.tzinfo is None:    # naive start = UTC
-                start_ts = start_ts.tz_localize('UTC')
+            start_ts = ensure_utc_timestamp(start, 'start')
             closing = closing[closing['timestamp'] >= start_ts]
     trades_by_period = {}
     if not closing.empty and 'timestamp' in closing.columns:

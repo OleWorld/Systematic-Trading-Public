@@ -250,6 +250,17 @@ def _build_pnl_snapshots(equity_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(tidy)
 
 
+def _data_range(equity_df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    """First/last equity-curve timestamps as ISO strings — the ACTUAL
+    backtest range (the curve carries one row per streamed BarEvent, so it
+    covers the full run even when the book stays flat). Both ``None`` for
+    an empty run."""
+    if equity_df.empty:
+        return {'start': None, 'end': None}
+    return {'start': pd.Timestamp(equity_df.index[0]).isoformat(),
+            'end': pd.Timestamp(equity_df.index[-1]).isoformat()}
+
+
 def _records_long_table(source: Any, symbols: List[str]) -> pd.DataFrame:
     """
     Concat ``source.get_records(symbol)`` across ``symbols`` into one long
@@ -395,6 +406,7 @@ def _build_manifest(*, run_id: str, created: datetime, label: Optional[str],
             'created_utc': created.isoformat(),
             'extra': json_safe(extra) if extra is not None else None,
         },
+        'data_range': _data_range(equity_df),
         'environment': {
             'python': sys.version.split()[0],
             'pandas': pd.__version__,

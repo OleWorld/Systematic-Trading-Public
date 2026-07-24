@@ -409,7 +409,7 @@ def test_start_with_timestampless_trade_log_rejected():
 
 
 # ──────────────────────────────────────────────
-# Param validation (F7) + naive-start UTC (F13)
+# Param validation (F7) + UTC enforcement (tz audit 2026-07)
 # ──────────────────────────────────────────────
 
 def _tiny_curve():
@@ -451,15 +451,32 @@ def test_backtest_stats_naive_start_interpreted_as_utc():
     naive = backtest_stats(_tiny_curve(), pd.DataFrame(),
                            initial_capital=100.0, timeframe='1d',
                            days_convention='calendar',
-                           start='2024-01-02')          # naive — was TypeError
+                           start='2024-01-02')  # date-only string carve-out = UTC midnight
     assert naive['Start'] == aware['Start']
     assert naive['Net PnL [$]'] == aware['Net PnL [$]']
 
 
-def test_backtest_stats_naive_start_on_naive_curve_unchanged():
+def test_backtest_stats_naive_start_with_time_component_raises():
+    with pytest.raises(ValueError, match="start.*timezone-naive"):
+        backtest_stats(_tiny_curve(), pd.DataFrame(),
+                       initial_capital=100.0, timeframe='1d',
+                       days_convention='calendar',
+                       start=pd.Timestamp('2024-01-02 05:00'))  # naive + time
+
+
+def test_backtest_stats_naive_trade_log_raises():
+    trades = pd.DataFrame({
+        'timestamp': pd.to_datetime(['2024-01-02']),        # naive column
+        'realized_pnl': [5.0],
+    })
+    with pytest.raises(ValueError, match=r"trade_log\['timestamp'\]"):
+        backtest_stats(_tiny_curve(), trades, initial_capital=100.0,
+                       timeframe='1d', days_convention='calendar')
+
+
+def test_backtest_stats_naive_curve_raises():
     eq = _tiny_curve()
     eq.index = eq.index.tz_localize(None)               # synthetic naive curve
-    stats = backtest_stats(eq, pd.DataFrame(), initial_capital=100.0,
-                           timeframe='1d', days_convention='calendar',
-                           start='2024-01-02')
-    assert stats['Start'] == pd.Timestamp('2024-01-02')
+    with pytest.raises(ValueError, match="equity_curve.*timezone-naive"):
+        backtest_stats(eq, pd.DataFrame(), initial_capital=100.0,
+                       timeframe='1d', days_convention='calendar')

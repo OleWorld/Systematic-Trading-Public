@@ -37,8 +37,6 @@ _symbols = list(str(x) for x in _grouped.keys())
 # --- Config (validated parameter holder) ---
 config = BacktestConfig(
     symbols=_symbols,
-    start_date='2021-01-01',
-    end_date='2026-04-23',
     base_timeframe='1d',
     days_convention='calendar',             # crypto is 24/7 → 365 d/y
     timeframes={'1d': 500},
