@@ -1,7 +1,6 @@
 """
 Parameter-sweep heatmaps: pivot one sweep metric over two grid axes and
-render a pandas Styler (background gradient + best-cell highlight),
-mirroring the ``equity`` package's heatmap conventions.
+render a pandas Styler (background gradient + best-cell highlight).
 """
 
 import logging
@@ -18,7 +17,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: Same highlight convention as the equity package's consensus cell.
+#: Best-cell highlight: bold red on yellow, so it survives the gradient.
 _HIGHLIGHT_CSS = 'background-color: #ffd54f; color: red; font-weight: bold;'
 
 

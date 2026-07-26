@@ -92,7 +92,7 @@ def make_run(fast, slow):
 # --- Sweep (fresh timestamped cache dir; exercises write AND load paths) --
 _ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H-%M-%S')
 CACHE_DIR = os.path.join('results', 'sweeps', f'{_ts}Z_ewmac-sweep-smoke')
-GRID = {'fast': [8, 16, 32], 'slow': [32, 64, 128]}
+GRID = {'fast': [4, 8, 16, 32, 64], 'slow': [16, 32, 64, 128, 256]}
 
 sweep = param_sweep(make_run, grid=GRID,
                     where=lambda fast, slow: fast < slow,
