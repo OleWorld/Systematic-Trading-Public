@@ -3,7 +3,7 @@
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from event._enums import OrderType, Direction
 
@@ -117,3 +117,31 @@ class UniverseEvent(Event):
     prev_live: bool
     prev_reasons: List[str]
     trigger: str
+
+
+@dataclass
+class CorrelationEvent(Event):
+    """
+    Correlation refresh — returned (at most one per bar) by
+    ``CorrelationManager.update_bar`` and dispatched synchronously by the
+    engine to ``risk_manager.on_correlation_event`` BEFORE the risk
+    manager's own ``update_bar`` for the same bar, so the triggering bar
+    and every same-timestamp symbol size on the refreshed weights. NEVER
+    enters the FIFO events queue.
+
+    Attributes:
+        matrix: the refreshed correlation matrix, typed ``Optional[Any]``
+            (not ``Optional[pd.DataFrame]``) so ``event/`` stays
+            pandas-free; at runtime it is a ``pandas.DataFrame`` (labels
+            = the kept non-constant live subset) on reason='ok', or None
+            on every other reason.
+        live_symbols: full live snapshot at event construction — what
+            degenerate-fallback equal weighting spreads over.
+        reason: 'ok' | 'empty_universe' | 'singleton'
+            | 'insufficient_observations' | 'too_few_symbols'
+            | 'nan_fallback'.
+    """
+    timestamp: datetime
+    matrix: Optional[Any]
+    live_symbols: List[str]
+    reason: str
