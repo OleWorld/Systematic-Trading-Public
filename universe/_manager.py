@@ -3,7 +3,7 @@
 Owns per-symbol liveness: two MEASURED gates (strategy warmup ->
 'warmup_forecast'; min_history_bars at history_timeframe ->
 'warmup_history') plus externally-pushed EXCLUSION MARKS (reasoned
-strings via mark_excluded/clear_excluded — Task 4). live <=> no reason
+strings via mark_excluded/clear_excluded). live <=> no reason
 present; nothing is permanent — symbols exit and re-enter as gates and
 marks change. Knows nothing about weights, correlation, or sizing.
 """
@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Protocol
 
 import pandas as pd
 
+from event import UniverseEvent
 from universe._status import UniverseStatus
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,7 @@ class UniverseManager:
 
         self._universe: Dict[str, UniverseStatus] = {}
         self._marks: Dict[str, List[str]] = {}      # exclusion marks, in mark order
-        self._pending_events: List[Any] = []        # UniverseEvent (Task 4)
+        self._pending_events: List[UniverseEvent] = []
         self._log_rows: List[Dict[str, Any]] = []
         self._last_bar_ts: Optional[Any] = None
         for s in self.strategy.symbol_list:
@@ -140,17 +141,56 @@ class UniverseManager:
 
     def _emit(self, symbol: str, old: UniverseStatus, new: UniverseStatus,
               timestamp: Any, trigger: str) -> None:
-        """Queue a UniverseEvent for the engine to drain (Task 4)."""
-        try:
-            from event import UniverseEvent    # local import; Task 4 adds the type
-        except ImportError:
-            return
+        """Queue a UniverseEvent for the engine to drain."""
         self._pending_events.append(UniverseEvent(
             timestamp=timestamp, symbol=symbol, live=new.live,
             excluded=new.excluded, reasons=list(new.reasons),
             prev_live=old.live, prev_reasons=list(old.reasons),
             trigger=trigger,
         ))
+
+    # ── Exclusion surface (the ONLY external liveness influence) ─────
+
+    def _check_mark_args(self, symbol: str, reason: str) -> None:
+        """Shared validation for mark/clear: known symbol, non-empty reason."""
+        if symbol not in self.strategy.symbol_list:
+            raise ValueError(f"Unknown symbol {symbol!r}: not in "
+                             f"strategy.symbol_list")
+        if not reason:
+            raise ValueError("reason must be a non-empty string — every "
+                             "mark/clear is recorded with its cause")
+
+    def mark_excluded(self, symbol: str, reason: str,
+                      timestamp: Any = None) -> None:
+        """Add exclusion mark ``reason`` (idempotent: existing mark = no-op,
+        no event). Nothing is permanent — ``clear_excluded`` lifts any mark."""
+        self._check_mark_args(symbol, reason)
+        self.status(symbol)                    # ensure record exists (lazy init)
+        marks = self._marks.setdefault(symbol, [])
+        if reason in marks:
+            return
+        marks.append(reason)
+        self._refresh(symbol, timestamp if timestamp is not None
+                      else self._last_bar_ts, f'mark_excluded:{reason}')
+
+    def clear_excluded(self, symbol: str, reason: str,
+                       timestamp: Any = None) -> None:
+        """Lift exclusion mark ``reason`` (idempotent: absent mark = no-op).
+        Lifts MARKS only — measured gates (warmup_*) cannot be forced."""
+        self._check_mark_args(symbol, reason)
+        marks = self._marks.get(symbol, [])
+        if reason not in marks:
+            return
+        marks.remove(reason)
+        self._refresh(symbol, timestamp if timestamp is not None
+                      else self._last_bar_ts, f'clear_excluded:{reason}')
+
+    def reassess_all(self) -> None:
+        """Refresh every symbol (trigger 'reassess') — called by the
+        correlation manager at each refresh; also the manual re-sync hook
+        for research code that mutated history."""
+        for s in self.strategy.symbol_list:
+            self._refresh(s, self._last_bar_ts, 'reassess')
 
     # ── Engine-driven per-bar hook ───────────────────────────────────
 
@@ -191,7 +231,7 @@ class UniverseManager:
                                          'excluded', 'reasons', 'trigger'])
         return pd.DataFrame(self._log_rows)
 
-    def drain_events(self) -> List[Any]:
+    def drain_events(self) -> List[UniverseEvent]:
         """Return and clear pending UniverseEvents (emission order)."""
         out, self._pending_events = self._pending_events, []
         return out

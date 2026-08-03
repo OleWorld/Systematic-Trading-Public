@@ -3,7 +3,7 @@
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from event._enums import OrderType, Direction
 
@@ -90,3 +90,30 @@ class FillEvent(Event):
     fill_notional: float
     commission: float = 0.0
     order_id: Optional[str] = None
+
+
+@dataclass
+class UniverseEvent(Event):
+    """
+    Universe transition — emitted by ``UniverseManager`` when a symbol's
+    ``(live, reasons)`` state changes. NEVER enters the FIFO events queue:
+    the engine drains pending events via ``drain_events()`` and dispatches
+    each synchronously to ``risk_manager.on_universe_event`` between the
+    correlation manager's update and the risk manager's sizing, so the
+    sizing pass always sees fresh universe state.
+
+    Attributes:
+        reasons: current reason list, canonically ordered (gate reasons
+            first, then exclusion marks in mark order); ``[]`` == live.
+        trigger: what caused the transition — ``'bar_refresh'`` |
+            ``'reassess'`` | ``'mark_excluded:<reason>'`` |
+            ``'clear_excluded:<reason>'``.
+    """
+    timestamp: Optional[datetime]
+    symbol: str
+    live: bool
+    excluded: bool
+    reasons: List[str]
+    prev_live: bool
+    prev_reasons: List[str]
+    trigger: str

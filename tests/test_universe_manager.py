@@ -125,3 +125,101 @@ class TestTransitionLog:
         um.update_bar(_bar('A'))       # still both warmup reasons — no change
         log = um.get_transition_log()
         assert len(log[log['trigger'] == 'bar_refresh']) == 0
+
+
+def _go_live(um, strat, dh, symbol):
+    """Arrange helper: push a symbol through both gates via one bar,
+    then discard the resulting go-live event so callers start clean."""
+    strat._warm.add(symbol)
+    dh.counts[symbol] = um.min_history_bars
+    um.update_bar(_bar(symbol))
+    um.drain_events()          # discard the go-live event for arrange phases
+
+
+class TestExclusionMarks:
+    def test_mark_excluded_takes_symbol_not_live(self):
+        um, strat, dh = _build(min_history=1)
+        _go_live(um, strat, dh, 'A')
+        um.mark_excluded('A', 'delisted', T0)
+        st = um.status('A')
+        assert st.live is False and st.excluded is True
+        assert st.reasons == ['delisted']
+        assert um.get_live_symbols() == []
+
+    def test_clear_excluded_re_enters_once_gates_pass(self):
+        um, strat, dh = _build(min_history=1)
+        _go_live(um, strat, dh, 'A')
+        um.mark_excluded('A', 'delisted', T0)
+        um.clear_excluded('A', 'delisted', T0)
+        assert um.status('A').live is True          # dynamic — no permanence
+
+    def test_marks_are_idempotent_no_event_no_log_row(self):
+        um, strat, dh = _build(min_history=1)
+        _go_live(um, strat, dh, 'A')
+        um.mark_excluded('A', 'delisted', T0)
+        um.drain_events()
+        n_rows = len(um.get_transition_log())
+        um.mark_excluded('A', 'delisted', T0)       # re-mark: no-op
+        um.clear_excluded('A', 'nonexistent', T0)   # absent mark: no-op
+        assert um.drain_events() == []
+        assert len(um.get_transition_log()) == n_rows
+
+    def test_mark_unknown_symbol_raises(self):
+        um, _, _ = _build()
+        with pytest.raises(ValueError):
+            um.mark_excluded('ZZZ', 'delisted', T0)
+
+    def test_clear_cannot_force_past_gates(self):
+        um, _, _ = _build(min_history=3)            # gates unmet
+        um.mark_excluded('A', 'delisted', T0)
+        um.clear_excluded('A', 'delisted', T0)
+        st = um.status('A')
+        assert st.live is False                      # warmup reasons remain
+        assert st.reasons == ['warmup_forecast', 'warmup_history']
+
+    def test_reason_required_non_empty(self):
+        um, _, _ = _build()
+        with pytest.raises(ValueError):
+            um.mark_excluded('A', '', T0)
+
+
+class TestUniverseEvents:
+    def test_go_live_emits_event_with_edge_and_trigger(self):
+        um, strat, dh = _build(min_history=1)
+        strat._warm.add('A')
+        dh.counts['A'] = 1
+        um.update_bar(_bar('A'))
+        events = um.drain_events()
+        assert len(events) == 1
+        evt = events[0]
+        assert evt.symbol == 'A' and evt.live is True and evt.prev_live is False
+        assert evt.prev_reasons == ['warmup_forecast', 'warmup_history']
+        assert evt.reasons == [] and evt.trigger == 'bar_refresh'
+        assert evt.timestamp == T0
+        assert um.drain_events() == []               # drained
+
+    def test_mark_and_clear_triggers(self):
+        um, strat, dh = _build(min_history=1)
+        _go_live(um, strat, dh, 'A')
+        um.mark_excluded('A', 'constant_price', T0)
+        um.clear_excluded('A', 'constant_price', T0)
+        triggers = [e.trigger for e in um.drain_events()]
+        assert triggers == ['mark_excluded:constant_price',
+                            'clear_excluded:constant_price']
+
+    def test_reassess_all_refreshes_every_symbol(self):
+        um, strat, dh = _build(min_history=1)
+        strat._warm.update({'A', 'B'})
+        dh.counts['A'] = dh.counts['B'] = 1
+        um.reassess_all()
+        events = um.drain_events()
+        assert {e.symbol for e in events} == {'A', 'B'}
+        assert all(e.trigger == 'reassess' for e in events)
+        assert um.get_live_symbols() == ['A', 'B']
+
+    def test_mark_outside_bar_processing_stamps_last_bar_ts(self):
+        um, strat, dh = _build(min_history=1)
+        _go_live(um, strat, dh, 'A')                 # last bar ts = T0
+        um.mark_excluded('A', 'manual')               # no timestamp passed
+        evt = um.drain_events()[0]
+        assert evt.timestamp == T0
