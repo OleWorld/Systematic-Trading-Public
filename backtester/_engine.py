@@ -13,38 +13,64 @@ class Backtester:
     Encapsulates the settings and components for carrying out
     an event-driven backtest.
 
-    Bar-processing order on each ``BarEvent``:
-        portfolio.update_bar  → execution.update_bar
-                              → strategy.update_bar     (updates forecast cache)
-                              → risk_manager.update_bar (reads strategy.get_forecast,
-                                                         submits resize order)
+    Bar-processing order on each ``BarEvent`` — six consumers:
+        portfolio.update_bar     → execution.update_bar
+                                  → strategy.update_bar        (updates forecast cache)
+                                  → universe_manager.update_bar (refreshes this bar's symbol)
+                                  → correlation_manager.update_bar (cadenced refresh;
+                                                                    returns Optional[CorrelationEvent])
+                                  → risk_manager.update_bar     (reads strategy.get_forecast,
+                                                                 submits resize order)
 
-    The risk manager runs *last* so it sees this bar's freshly-updated
-    forecast. ``OrderEvent`` and ``FillEvent`` stages drain in subsequent
-    iterations of the inner event loop.
+    Between the correlation manager's update and the risk manager's own
+    ``update_bar``, the engine dispatches any pending ``UniverseEvent``s
+    (drained from ``universe_manager.drain_events()``) and the
+    ``CorrelationEvent`` (if one was returned this bar) synchronously to
+    ``risk_manager.on_universe_event`` / ``on_correlation_event`` —
+    universe events first, then the correlation event, so a symbol's
+    liveness transition is visible before any weight recompute that
+    transition may have triggered. This dispatch is INLINE, never via
+    the FIFO events queue: a queued notification would only be drained on
+    a *later* iteration of the inner loop, i.e. after this bar's sizing
+    had already run on stale universe/weight state — same-timestamp
+    sibling symbols would then size on stale weights while the triggering
+    symbol alone got the fresh ones. Inline dispatch guarantees every
+    symbol sized on this bar sees the same fresh state.
+
+    The risk manager runs *last* in the bar chain so it sees this bar's
+    freshly-updated forecast AND freshly-updated universe/weights.
+    ``OrderEvent`` and ``FillEvent`` stages drain in subsequent iterations
+    of the inner event loop.
 
     Callers wire each module explicitly and pass them in. See
     ``backtests/sample_backtest/backtest_ewmac_crypto.py`` for a worked
     example.
     """
     def __init__(self, events_queue, data_handler, strategy, portfolio,
-                 risk_manager, execution_handler):
+                 risk_manager, execution_handler,
+                 universe_manager, correlation_manager):
         self.events = events_queue
         self.data_handler = data_handler
         self.strategy = strategy
         self.portfolio = portfolio
         self.risk_manager = risk_manager
         self.execution_handler = execution_handler
+        self.universe_manager = universe_manager
+        self.correlation_manager = correlation_manager
 
     def run(self):
         """
         Execute the backtest event loop.
 
-        ``DataHandler`` emits ``BarEvent``s. Each bar drives the four bar-
-        consumers (portfolio, execution, strategy, risk_manager) in order;
-        the risk manager may emit ``OrderEvent``s, which the execution
-        handler consumes to produce ``FillEvent``s, which the portfolio
-        applies.
+        ``DataHandler`` emits ``BarEvent``s. Each bar drives the six bar-
+        consumers (portfolio, execution, strategy, universe_manager,
+        correlation_manager, risk_manager) in order, with any
+        ``UniverseEvent``s/``CorrelationEvent`` dispatched inline to the
+        risk manager between the correlation manager's update and the
+        risk manager's own ``update_bar`` (see the class docstring for the
+        inline-vs-queued rationale). The risk manager may emit
+        ``OrderEvent``s, which the execution handler consumes to produce
+        ``FillEvent``s, which the portfolio applies.
         """
         logger.info("Starting backtest...")
 
@@ -64,6 +90,16 @@ class Backtester:
                     self.portfolio.update_bar(event)
                     self.execution_handler.update_bar(event)
                     self.strategy.update_bar(event)
+                    self.universe_manager.update_bar(event)
+                    corr_event = self.correlation_manager.update_bar(event)
+                    # Inline dispatch — NEVER via the FIFO queue: a queued
+                    # notification would land after this bar's sizing, so
+                    # the triggering symbol would size on stale weights
+                    # while same-timestamp siblings size on fresh ones.
+                    for u_evt in self.universe_manager.drain_events():
+                        self.risk_manager.on_universe_event(u_evt)
+                    if corr_event is not None:
+                        self.risk_manager.on_correlation_event(corr_event)
                     self.risk_manager.update_bar(event)
 
                 elif isinstance(event, OrderEvent):
