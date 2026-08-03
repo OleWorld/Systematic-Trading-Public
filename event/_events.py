@@ -54,6 +54,13 @@ class OrderEvent(Event):
             solvency-enforcement path. Liquidation orders are exempt from
             the FIFO cancel pass that fires when account_balance < 0, so
             they are not cancelled by the very mechanism that submitted them.
+        fill_on_next_bar: True for MKT orders that must NEVER fill against
+            a bar event dispatched before the order existed. ``execute_order``
+            parks such orders in ``pending_orders`` unconditionally; the fill
+            lands on the symbol's next bar event via ``_try_fill`` (close if
+            it is the decision-period bar arriving late, open of the next
+            period otherwise). Producers: the risk manager's universe
+            flatten and the portfolio's margin-call liquidations.
     """
     symbol: str
     order_type: OrderType
@@ -63,6 +70,7 @@ class OrderEvent(Event):
     price: Optional[float] = None
     timestamp: Optional[datetime] = None
     is_liquidation: bool = False
+    fill_on_next_bar: bool = False
 
 
 @dataclass

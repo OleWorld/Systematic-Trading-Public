@@ -242,7 +242,8 @@ class BacktestPortfolio(Portfolio):
     def submit_order(self, symbol: str, quantity: float, direction: Direction,
                      timestamp: Any, order_type: OrderType,
                      price: Optional[float] = None,
-                     is_liquidation: bool = False) -> Optional[OrderEvent]:
+                     is_liquidation: bool = False,
+                     fill_on_next_bar: bool = False) -> Optional[OrderEvent]:
         """
         Receive an order request from the risk manager (the "trader").
         The portfolio (the "exchange") performs a margin check, scales the
@@ -251,6 +252,11 @@ class BacktestPortfolio(Portfolio):
 
         ``is_liquidation`` marks the order as a solvency-driven liquidation;
         such orders are exempt from the FIFO cancel pass in ``check_solvency``.
+
+        ``fill_on_next_bar`` is forwarded onto the emitted ``OrderEvent`` —
+        see ``OrderEvent.fill_on_next_bar`` for the fill contract it enforces
+        at execution time (the order never fills against a bar dispatched
+        before it existed).
         """
         ref_price = self._validate_order_params(symbol, quantity, order_type, price)
         if ref_price is None:
@@ -293,6 +299,7 @@ class BacktestPortfolio(Portfolio):
             price=price,
             timestamp=timestamp,
             is_liquidation=is_liquidation,
+            fill_on_next_bar=fill_on_next_bar,
         )
 
         self.pending_orders[order.order_id] = order
@@ -304,6 +311,7 @@ class BacktestPortfolio(Portfolio):
             'quantity': quantity,
             'order_id': order.order_id,
             'is_liquidation': is_liquidation,
+            'fill_on_next_bar': fill_on_next_bar,
         })
         self.events_queue.put(order)
         return order

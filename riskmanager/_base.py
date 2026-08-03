@@ -33,7 +33,9 @@ class _PortfolioLike(Protocol):
 
     def submit_order(self, symbol: str, quantity: float, direction: Direction,
                      timestamp, order_type: OrderType,
-                     price: Optional[float] = None) -> Optional[OrderEvent]: ...
+                     price: Optional[float] = None,
+                     is_liquidation: bool = False,
+                     fill_on_next_bar: bool = False) -> Optional[OrderEvent]: ...
 
 
 # ──────────────────────────────────────────────
