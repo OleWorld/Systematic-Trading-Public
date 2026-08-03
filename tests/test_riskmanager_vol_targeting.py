@@ -312,3 +312,96 @@ class TestSizingSkipLadder:
         pf.positions['A'] = target * 0.9             # inside 25% buffer
         rm.update_bar(_bar('A'))
         assert rm.get_records('A').iloc[-1]['skip_reason'] == 'dead_band'
+
+
+def _not_live_edge(symbol, reasons=('delisted',), ts=T0):
+    """Build a not-live-EDGE ``UniverseEvent`` (``prev_live=True`` ->
+    ``live=False``) — the only transition ``on_universe_event`` acts on."""
+    return UniverseEvent(timestamp=ts, symbol=symbol, live=False,
+                         excluded=True, reasons=list(reasons),
+                         prev_live=True, prev_reasons=[],
+                         trigger=f'mark_excluded:{reasons[0]}')
+
+
+class TestOnUniverseEvent:
+    def test_not_live_edge_flattens_same_bar_with_fill_on_next_bar(self):
+        rm, pf, strat, dh, um, ve = _build()
+        pf.positions['A'] = 4.0
+        rm.on_universe_event(_not_live_edge('A'))
+        sub = pf.submitted[-1]
+        assert sub['symbol'] == 'A' and sub['quantity'] == pytest.approx(4.0)
+        assert sub['direction'] == Direction.SELL
+        assert sub['fill_on_next_bar'] is True
+        assert sub['order_type'] == OrderType.MKT
+
+    def test_flat_symbol_submits_nothing(self):
+        rm, pf, strat, dh, um, ve = _build()
+        rm.on_universe_event(_not_live_edge('A'))
+        assert pf.submitted == []
+
+    def test_projected_position_prevents_double_flatten(self):
+        rm, pf, strat, dh, um, ve = _build()
+        pf.positions['A'] = 4.0
+        rm.on_universe_event(_not_live_edge('A'))
+        assert len(pf.submitted) == 1
+        rm.on_universe_event(_not_live_edge('A'))     # projected already 0
+        assert len(pf.submitted) == 1
+
+    def test_pop_and_same_bar_rescale(self):
+        rm, pf, strat, dh, um, ve = _build(symbols=('A', 'B', 'C'))
+        rm.instrument_weight = {'A': 0.5, 'B': 0.3, 'C': 0.2}
+        rm.on_universe_event(_not_live_edge('A'))
+        assert rm.instrument_weight == pytest.approx({'B': 0.6, 'C': 0.4})
+
+    def test_idm_recomputed_from_cached_submatrix(self):
+        rm, pf, strat, dh, um, ve = _build(symbols=('A', 'B', 'C'))
+        labels = ['A', 'B', 'C']
+        rm.on_correlation_event(_corr_event('ok', labels,
+                                            _identityish(labels)))
+        assert rm.idm == pytest.approx(np.sqrt(3))
+        rm.on_universe_event(_not_live_edge('A'))
+        assert rm.idm == pytest.approx(np.sqrt(2))    # 2 uncorrelated survivors
+
+    def test_single_survivor_sets_idm_one(self):
+        rm, pf, strat, dh, um, ve = _build()
+        rm.on_correlation_event(_corr_event('ok', ['A', 'B'],
+                                            _identityish(['A', 'B'])))
+        rm.on_universe_event(_not_live_edge('A'))
+        assert rm.instrument_weight == {'B': 1.0}
+        assert rm.idm == 1.0
+
+    def test_no_cache_leaves_idm(self):
+        rm, pf, strat, dh, um, ve = _build(symbols=('A', 'B', 'C'))
+        rm.idm = 1.7
+        rm.instrument_weight = {'A': 0.5, 'B': 0.25, 'C': 0.25}
+        rm.on_universe_event(_not_live_edge('A'))
+        assert rm.idm == 1.7
+
+    def test_stale_cache_missing_survivor_leaves_idm_but_still_rescales(self):
+        """CRITICAL guard (Task 7 review carry-over): the cached matrix
+        must cover EVERY survivor, not just some — a survivor absent from
+        it (e.g. it went live only after the last correlation refresh)
+        makes the cache stale/incoherent for the current book, so the IDM
+        recompute must be skipped even though the cache is non-None and
+        even though it *does* cover some of the survivors. Weight rescale
+        is unconditional and must still happen."""
+        rm, pf, strat, dh, um, ve = _build(symbols=('A', 'B', 'C'))
+        # Cache covers only A, B — C is absent (never appeared in a
+        # correlation refresh, e.g. it went live afterward).
+        rm.on_correlation_event(_corr_event('ok', ['A', 'B'],
+                                            _identityish(['A', 'B'])))
+        assert rm.idm == pytest.approx(np.sqrt(2))
+        rm.idm = 1.7                                  # sentinel
+        rm.instrument_weight = {'A': 0.5, 'B': 0.3, 'C': 0.2}
+        rm.on_universe_event(_not_live_edge('A'))      # survivors: B, C
+        assert rm.instrument_weight == pytest.approx({'B': 0.6, 'C': 0.4})
+        assert rm.idm == 1.7                           # untouched, not recomputed
+
+    def test_live_edge_is_a_no_op(self):
+        rm, pf, strat, dh, um, ve = _build()
+        rm.instrument_weight = {'B': 1.0}
+        rm.on_universe_event(UniverseEvent(
+            timestamp=T0, symbol='A', live=True, excluded=False, reasons=[],
+            prev_live=False, prev_reasons=['warmup_history'],
+            trigger='bar_refresh'))
+        assert rm.instrument_weight == {'B': 1.0} and pf.submitted == []

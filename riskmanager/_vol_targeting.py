@@ -73,8 +73,15 @@ universe or correlation estimation — those live in ``universe/`` and
   derived here, no data handler is held, and there is no cadence state —
   the ``CorrelationManager`` owns all three. Weights start **empty** and
   populate on the first event.
-* ``on_universe_event(event)`` — inherited no-op for now (the not-live
-  flatten / weight-pop rescale lands in a follow-up).
+* ``on_universe_event(event)`` — reacts only to a not-live edge
+  (``prev_live=True`` -> ``live=False``): flattens any held/pending
+  position with a ``fill_on_next_bar=True`` MKT order (the flatten can
+  never fill retroactively against the bar that produced the event), and
+  pops the symbol out of ``self.instrument_weight``, proportionally
+  rescaling the survivors and recomputing ``self.idm`` from the cached
+  matrix's principal submatrix over the survivors (when coherent — see
+  ``_rescale_weights_after_pop``). Live edges are no-ops: the symbol
+  simply waits for the next correlation refresh to earn a weight.
 
 Liveness is read from the injected ``UniverseManager``:
 ``universe_manager.status(symbol)`` gives ``live`` plus the
@@ -128,7 +135,7 @@ if TYPE_CHECKING:  # avoid a config<->riskmanager import cycle at module load
 from analytics import (
     diversification_multiplier, equal_weight, min_variance, risk_parity,
 )
-from event import BarEvent, CorrelationEvent, OrderType, Direction
+from event import BarEvent, CorrelationEvent, OrderType, Direction, UniverseEvent
 from riskmanager._base import (
     RiskManager, _OrchestratorLike, _PortfolioLike, _StrategyLike,
     _UniverseManagerLike,
@@ -427,7 +434,9 @@ class VolTargetingRiskManager(RiskManager):
         * ``'insufficient_observations'`` / ``'too_few_symbols'`` /
           ``'nan_fallback'`` — no usable matrix: budget-grouped **equal
           weight** over ``event.live_symbols`` (the ρ=1 degenerate case),
-          IDM untouched, WARNING naming the reason.
+          WARNING naming the reason; IDM left as-is EXCEPT the
+          singleton-live sub-case, which resets it to ``1.0`` (same rule
+          as ``'singleton'`` below).
         * ``'empty_universe'`` — clear the weights (INFO); IDM untouched.
         * ``'singleton'`` — ``{symbol: 1.0}`` with ``idm = 1.0``
           (precedence over budget grouping: the live-subset
@@ -449,7 +458,8 @@ class VolTargetingRiskManager(RiskManager):
         elif event.reason in _DEGENERATE_CORR_REASONS:
             logger.warning(
                 "correlation refresh degenerate (%s): equal-weight fallback "
-                "over %d live symbols; IDM untouched",
+                "over %d live symbols; IDM left as-is (except the "
+                "singleton-live case below, which resets it to 1.0)",
                 event.reason, len(live),
             )
             if not live:
@@ -475,6 +485,50 @@ class VolTargetingRiskManager(RiskManager):
             raise ValueError(
                 f"Unexpected CorrelationEvent.reason: {event.reason!r}"
             )
+
+    def on_universe_event(self, event: UniverseEvent) -> None:
+        """Not-live edge: same-bar flatten + weight pop/rescale (spec §7.2).
+
+        Only a not-live EDGE (``event.prev_live is True`` and
+        ``event.live is False``) triggers anything; every other
+        transition (already not-live, a live edge, a reason-only churn
+        while staying live/not-live) is a no-op — the symbol either was
+        already flattened/popped on its original not-live edge or is
+        not affected.
+
+        The flatten order carries ``fill_on_next_bar=True`` — it rests
+        and fills on the symbol's next bar event, never retroactively
+        against the bar that produced this event. ``update_bar``'s
+        sizing re-asserts the flatten as an idempotent backstop (covers
+        a margin-call cancel pass voiding this order). A flat/zero
+        projected position submits nothing.
+
+        Popping the symbol out of ``self.instrument_weight`` (when
+        present) triggers ``_rescale_weights_after_pop``, which
+        proportionally renormalizes the survivors and recomputes the
+        IDM from the cached matrix's principal submatrix when coherent.
+        Live edges are no-ops: the symbol simply picks up a weight at
+        the next correlation refresh.
+        """
+        if not (event.prev_live and not event.live):
+            return
+        symbol = event.symbol
+        projected = self.portfolio.projected_position(symbol)
+        if projected != 0:
+            logger.warning(
+                "%s went not-live (%s) holding %.6f projected — flattening "
+                "on this bar (fills on the symbol's next bar event)",
+                symbol, event.reasons, projected,
+            )
+            direction = Direction.SELL if projected > 0 else Direction.BUY
+            self.portfolio.submit_order(
+                symbol=symbol, quantity=abs(projected), direction=direction,
+                timestamp=event.timestamp, order_type=OrderType.MKT,
+                fill_on_next_bar=True,
+            )
+        if symbol in self.instrument_weight:
+            self.instrument_weight.pop(symbol)
+            self._rescale_weights_after_pop()
 
     # ── Weight machinery ─────────────────────────────────────────────
 
@@ -632,6 +686,47 @@ class VolTargetingRiskManager(RiskManager):
         if self.idm_cap is not None:
             idm = min(idm, self.idm_cap)
         self.idm = idm
+
+    def _rescale_weights_after_pop(self) -> None:
+        """Proportionally renormalize survivors to sum 1 (simple rescale —
+        the next scheduled refresh re-optimizes properly) and recompute the
+        IDM from the cached matrix's principal submatrix when possible.
+
+        Called immediately after ``on_universe_event`` pops a symbol out
+        of ``self.instrument_weight``. If no survivors remain, this is a
+        no-op (the dict is already empty). A single survivor gets weight
+        1.0 and ``idm = 1.0`` (a lone instrument earns no diversification
+        uplift — mirrors ``analytics.diversification_multiplier`` at
+        N=1). Otherwise the IDM is recomputed from
+        ``self._corr_matrix_cache``'s principal submatrix over the
+        survivors — but ONLY when that cache exists AND every survivor is
+        one of its labels; a survivor absent from the cache (e.g. it went
+        live only after the last correlation refresh, or the cache is
+        simply ``None`` because no refresh has landed yet) means the
+        cached ρ can no longer describe the current book, so the IDM is
+        left untouched rather than computed from a stale/incoherent
+        matrix.
+        """
+        survivors = list(self.instrument_weight)
+        if not survivors:
+            return
+        total = sum(self.instrument_weight.values())
+        if total > 0:
+            self.instrument_weight = {
+                s: w / total for s, w in self.instrument_weight.items()
+            }
+        else:
+            self.instrument_weight = {
+                s: 1.0 / len(survivors) for s in survivors
+            }
+        if len(survivors) == 1:
+            self.idm = 1.0
+            return
+        cache = self._corr_matrix_cache
+        if cache is None or not set(survivors).issubset(set(cache.index)):
+            return                     # no coherent rho — leave IDM as-is
+        sub = cache.loc[survivors, survivors]
+        self._update_idm_from_corr(sub)
 
     # ── Sizing ───────────────────────────────────────────────────────
 
