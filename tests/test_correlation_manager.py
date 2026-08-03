@@ -1,6 +1,6 @@
 """Unit tests for correlation.CorrelationManager (cadence + refresh)."""
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -144,3 +144,94 @@ class TestDegenerateRefresh:
         assert um.get_live_symbols() == []            # stale until reassess
         cm.update_bar(_bar('A', T('2024-01-01')))
         assert um.get_live_symbols() == ['A']         # refresh ran reassess_all
+
+
+def _rng_walk(n, seed, start=100.0):
+    rng = np.random.default_rng(seed)
+    return start + np.cumsum(rng.normal(0, 1, n))
+
+
+class TestRefreshPipeline:
+    def _live_pair(self, lookback=32, step_size=1, symbols=('A', 'B')):
+        cm, um, dh, strat = _build(symbols=symbols, lookback=lookback,
+                                   step_size=step_size)
+        for i, s in enumerate(symbols):
+            _feed_closes(dh, s, _rng_walk(lookback, seed=i))
+        return cm, um, dh, strat
+
+    def test_ok_refresh_publishes_psd_matrix_over_live_labels(self):
+        cm, um, dh, _ = self._live_pair()
+        evt = cm.update_bar(_bar('A', T('2024-01-01')))
+        assert evt.reason == 'ok'
+        assert list(evt.matrix.index) == ['A', 'B']
+        assert evt.live_symbols == ['A', 'B']
+        vals = evt.matrix.to_numpy(dtype=float)
+        assert np.allclose(np.diag(vals), 1.0)
+        assert np.linalg.eigvalsh(vals)[0] >= -1e-10
+        assert cm.matrix is evt.matrix
+
+    def test_constant_symbol_marked_and_dropped(self):
+        cm, um, dh, _ = self._live_pair(symbols=('A', 'B', 'C'))
+        _feed_closes(dh, 'C', [50.0] * 32)                # constant
+        evt = cm.update_bar(_bar('A', T('2024-01-01')))
+        assert evt.reason == 'ok'
+        assert list(evt.matrix.index) == ['A', 'B']       # C dropped
+        st = um.status('C')
+        assert st.reasons == ['constant_price'] and st.excluded is True
+        assert 'C' not in evt.live_symbols                # snapshot post-mark
+
+    def test_still_constant_no_churn_moved_re_enters(self):
+        cm, um, dh, _ = self._live_pair(symbols=('A', 'B', 'C'))
+        _feed_closes(dh, 'C', [50.0] * 32)
+        cm.update_bar(_bar('A', T('2024-01-01')))
+        um.drain_events()
+        n_rows = len(um.get_transition_log())
+        # Second refresh, C still constant: NO new transition (idempotent).
+        cm.update_bar(_bar('A', T('2024-01-02')))
+        assert um.drain_events() == [] or all(
+            e.symbol != 'C' for e in um.drain_events())
+        assert len(um.get_transition_log()) == n_rows
+        # C starts moving: cleared, re-enters live.
+        _feed_closes(dh, 'C', _rng_walk(32, seed=7))
+        evt = cm.update_bar(_bar('A', T('2024-01-03')))
+        assert 'C' in list(evt.matrix.index)
+        assert um.status('C').live is True
+
+    def test_too_few_symbols(self):
+        cm, um, dh, _ = self._live_pair(symbols=('A', 'B'))
+        _feed_closes(dh, 'A', [10.0] * 32)                # both constant
+        _feed_closes(dh, 'B', [20.0] * 32)
+        evt = cm.update_bar(_bar('A', T('2024-01-01')))
+        assert evt.reason == 'too_few_symbols'
+        assert evt.matrix is None
+        assert evt.live_symbols == []                     # both marked
+
+    def test_insufficient_observations_via_data_gap(self):
+        cm, um, dh, _ = self._live_pair(lookback=32)
+        # A's frame returns rows whose index doesn't overlap B's -> the
+        # aligned diff() frame drops below 30 rows after dropna.
+        real_get = dh.get_latest_bars_df
+
+        def _shifted(symbol, n=1, timeframe=None):
+            df = real_get(symbol, n, timeframe)
+            if symbol == 'A':
+                df = df.set_index(df.index + pd.Timedelta(days=400))
+            return df
+
+        dh.get_latest_bars_df = _shifted
+        evt = cm.update_bar(_bar('A', T('2024-01-01')))
+        assert evt.reason == 'insufficient_observations'
+        assert evt.matrix is None
+        assert evt.live_symbols == ['A', 'B']             # no marks recorded
+
+    def test_floor_produces_floored_psd_matrix(self):
+        cm, um, dh, _ = self._live_pair()
+        cm.floor = 0.0
+        evt = cm.update_bar(_bar('A', T('2024-01-01')))
+        assert (evt.matrix.to_numpy() >= -1e-12).all()
+
+    def test_simple_return_mode(self):
+        cm, um, dh, _ = self._live_pair()
+        cm.mode = 'simple_return'
+        evt = cm.update_bar(_bar('A', T('2024-01-01')))
+        assert evt.reason == 'ok'

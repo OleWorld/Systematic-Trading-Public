@@ -192,8 +192,91 @@ class CorrelationManager:
 
     def _refresh_full(self, timestamp: Any,
                       candidates: List[str]) -> CorrelationEvent:
-        """Window pull + constancy lifecycle + estimate (Task 6)."""
-        raise NotImplementedError            # implemented in the next task
+        """Window pull, mode transform, constancy re-measurement (mark new
+        constants / clear moved ones — the 'constant_price' lifecycle this
+        manager owns), then estimate -> shrink -> floor -> PSD repair."""
+        closes = {
+            s: self.data_handler.get_latest_bars_df(
+                s, self.lookback, timeframe=self.timeframe)['Close']
+            for s in candidates
+        }
+        frame = pd.DataFrame(closes)
+        if self.mode == 'simple_return':
+            returns = frame.pct_change(fill_method=None).dropna()
+        elif self.mode == 'absolute_price_chg':
+            returns = frame.diff().dropna()
+        else:
+            raise ValueError(f"Unexpected mode: {self.mode!r}")
+        if len(returns) < _MIN_CORR_OBS:
+            logger.warning(
+                "correlation refresh: only %d valid return observations "
+                "(need >= %d); publishing insufficient_observations",
+                len(returns), _MIN_CORR_OBS,
+            )
+            return self._publish(timestamp, None, 'insufficient_observations')
+
+        # Constancy re-measurement over the candidates in the window.
+        variances = returns.var(ddof=0)
+        constant = [c for c in returns.columns if variances[c] == 0.0]
+        if constant:
+            logger.warning(
+                "correlation refresh: %d constant-price symbol(s) excluded "
+                "this refresh: %s", len(constant), constant,
+            )
+        for s in constant:
+            self.universe_manager.mark_excluded(s, 'constant_price', timestamp)
+        for s in returns.columns:
+            if s not in constant:
+                self.universe_manager.clear_excluded(s, 'constant_price',
+                                                     timestamp)
+        returns = returns.drop(columns=constant)
+        if returns.shape[1] < 2:
+            logger.warning(
+                "correlation refresh: fewer than 2 non-constant symbols; "
+                "publishing too_few_symbols",
+            )
+            return self._publish(timestamp, None, 'too_few_symbols')
+
+        corr = correlation_matrix(returns, shrinkage=self.shrinkage)
+        if self.shrinkage is not None:
+            logger.debug(
+                "correlation refresh: %s shrinkage intensity %.4f over %d "
+                "observations", self.shrinkage,
+                corr.attrs.get('lw_shrinkage', float('nan')), len(returns),
+            )
+        if corr.isna().any().any():
+            logger.warning(
+                "correlation refresh: matrix contains NaN despite "
+                "zero-variance filtering; publishing nan_fallback",
+            )
+            return self._publish(timestamp, None, 'nan_fallback')
+        if self.floor is not None:
+            corr = corr.clip(lower=self.floor)
+        return self._publish(timestamp, self._nearest_psd_correlation(corr),
+                             'ok')
+
+    @staticmethod
+    def _nearest_psd_correlation(corr: pd.DataFrame) -> pd.DataFrame:
+        """Project ``corr`` back to a valid (PSD) correlation matrix.
+
+        Cheap ``eigvalsh`` check first: PSD input is returned unchanged
+        (the common case — repair only triggers when ``corr_floor``
+        clipping actually broke PSD-ness). Otherwise: clip negative
+        eigenvalues to zero, reconstruct, rescale to a unit diagonal
+        (a congruence transform, so PSD-ness is preserved exactly), and
+        re-symmetrize. The result is a small perturbation of the input,
+        not a rebuild — labels and the unit diagonal are preserved.
+        """
+        vals = corr.to_numpy(dtype=float)
+        if float(np.linalg.eigvalsh(vals)[0]) >= 0.0:
+            return corr
+        eigvals, eigvecs = np.linalg.eigh(vals)
+        repaired = (eigvecs * np.clip(eigvals, 0.0, None)) @ eigvecs.T
+        d = np.sqrt(np.diag(repaired))
+        repaired = repaired / np.outer(d, d)
+        repaired = 0.5 * (repaired + repaired.T)
+        np.fill_diagonal(repaired, 1.0)
+        return pd.DataFrame(repaired, index=corr.index, columns=corr.columns)
 
     def _publish(self, timestamp: Any, matrix: Optional[pd.DataFrame],
                  reason: str) -> CorrelationEvent:
