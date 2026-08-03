@@ -39,28 +39,29 @@ class _PortfolioLike(Protocol):
 
 
 # ──────────────────────────────────────────────
-# DataHandler dependency (rolling-window history)
+# UniverseManager dependency (tradable-universe state)
 # ──────────────────────────────────────────────
 
-class _DataHandlerLike(Protocol):
-    """Subset of the DataHandler surface that VolTargetingRiskManager reads.
+class _UniverseManagerLike(Protocol):
+    """Read surface of ``universe.UniverseManager`` the RiskManager consumes.
 
-    ``get_latest_bars_df`` pulls a trailing window of closes (as a DataFrame)
-    for the inline correlation-matrix derivation in
-    ``calculate_instrument_weight`` (``mode='min_variance'`` / ``'risk_parity'``,
-    ``corr_matrix=None``); ``count_bars`` is the O(1) data-availability gate
-    used by ``_data_gate_met`` / ``get_live_symbols``. ``timeframes`` is read
-    at construction time to validate that the configured ``corr_timeframe`` is
-    registered.
+    The universe manager is the single source of truth for symbol
+    liveness; the risk manager only *reads* it (marks are pushed by
+    policy sources such as the correlation manager, never by the RM).
+
+    ``status(symbol)`` returns a defensive-copy ``UniverseStatus``
+    (``live`` / ``excluded`` / canonically-ordered ``reasons``) — read on
+    every sized bar to drive the universal not-live rule and to label the
+    skip ladder with the symbol's primary recorded reason. Typed ``Any``
+    so ``riskmanager`` need not import ``universe``.
+    ``get_live_symbols()`` returns the live subset in
+    ``strategy.symbol_list`` order — the introspection counterpart used
+    by wiring/diagnostic code.
     """
 
-    timeframes: Dict[str, int]
+    def status(self, symbol: str) -> Any: ...
 
-    def get_latest_bars_df(self, symbol: str, n: int = 1,
-                           timeframe: Optional[str] = None) -> pd.DataFrame: ...
-
-    def count_bars(self, symbol: str,
-                   timeframe: Optional[str] = None) -> int: ...
+    def get_live_symbols(self) -> List[str]: ...
 
 
 # ──────────────────────────────────────────────
@@ -75,13 +76,14 @@ class _StrategyLike(Protocol):
     SignalEvents — they update an internal forecast cache that the risk
     manager reads here.
 
-    ``symbol_list`` is read at risk-manager construction time to seed
-    the equal-weight ``instrument_weight`` dict.
+    ``symbol_list`` is read at risk-manager construction time to build
+    the default ``InstrumentConfig`` registry.
 
     ``is_warmed_up(symbol)`` is the strategy's measured end-of-warmup
     signal (True once the first non-NaN forecast has been cached) —
-    consumed by ``VolTargetingRiskManager.get_live_symbols`` as
-    the strategy gate of the universe liveness check.
+    consumed by ``universe.UniverseManager`` as the strategy gate of the
+    liveness check (reason ``'warmup_forecast'``), not by the risk
+    manager itself.
     """
 
     symbol_list: List[str]
@@ -103,7 +105,7 @@ class _OrchestratorLike(Protocol):
     the same three forecast-source members the risk manager consumes, plus
     ``get_budget_groups`` — the budget-group structure
     ``{label: (budget_weight, universe)}`` that
-    ``VolTargetingRiskManager.calculate_instrument_weight`` uses to build
+    ``VolTargetingRiskManager.on_correlation_event`` uses to build
     strategy-budgeted instrument weights (sum-of-books). The risk manager
     detects the extra method via ``hasattr`` at recalc time, so a single
     strategy and a multi-strategy orchestrator remain interchangeable as
@@ -183,6 +185,22 @@ class RiskManager(ABC):
     @abstractmethod
     def update_bar(self, event: BarEvent) -> None:
         raise NotImplementedError
+
+    def on_universe_event(self, event) -> None:
+        """React to a universe transition (engine-dispatched inline).
+
+        Default: no-op. ``VolTargetingRiskManager`` overrides to flatten
+        positions on not-live edges and re-normalize weights.
+        """
+        return None
+
+    def on_correlation_event(self, event) -> None:
+        """React to a correlation refresh (engine-dispatched inline).
+
+        Default: no-op. ``VolTargetingRiskManager`` overrides to rebuild
+        instrument weights and the IDM from the event payload.
+        """
+        return None
 
     @abstractmethod
     def _compute_target_qty(self, event: BarEvent) -> Dict[str, Any]:
