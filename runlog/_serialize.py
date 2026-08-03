@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 #: table schema changes incompatibly; ``load_run`` records it in the manifest
 #: so future readers can dispatch. v2 (2026-07): manifest gains ``data_range``
 #: (derived actual backtest range); config no longer carries start/end dates.
-SCHEMA_VERSION = 2
+#: v3 (2026-08): universe.parquet transition log; RM state no longer
+#: snapshots live_symbols (universe manager owns liveness).
+SCHEMA_VERSION = 3
 
 
 def replace_with_retry(src: Any, dst: Any, *, attempts: int = 6,

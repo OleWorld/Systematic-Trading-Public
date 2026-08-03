@@ -5,8 +5,9 @@ Writes a self-contained run folder under ``root`` (default
 ``results/runs/``): the portfolio's equity curve / PnL snapshots / trade
 log / order log, one long per-symbol record table per strategy (plus the
 orchestrator's combined table on multi-strategy runs), the risk manager's
-sizing records, best-effort derived analytics, and a ``manifest.json``
-capturing config, end-of-run state, and environment metadata.
+sizing records, the universe manager's transition log (when supplied),
+best-effort derived analytics, and a ``manifest.json`` capturing config,
+end-of-run state, and environment metadata.
 
 Robustness contract: raw tables are written first and each derived
 analytics artifact is computed inside its own ``try/except`` — an
@@ -59,6 +60,7 @@ _SNAPSHOT_FIELDS = {
 
 def save_run(*, portfolio: Any, strategy: Any, risk_manager: Any,
              config: Any = None, instruments: Optional[Dict[str, Any]] = None,
+             universe_manager: Any = None,
              root: Any = 'results/runs', label: Optional[str] = None,
              notes: Optional[str] = None,
              extra: Optional[Dict[str, Any]] = None) -> RunRecord:
@@ -73,14 +75,21 @@ def save_run(*, portfolio: Any, strategy: Any, risk_manager: Any,
                       dict-valued ``strategies`` attribute); must expose
                       ``symbol_list`` and ``get_records(symbol)``.
       risk_manager  — exposes ``get_records(symbol)``; ``idm`` /
-                      ``instrument_weight`` / ``get_live_symbols`` are
-                      snapshotted when present.
+                      ``instrument_weight`` are snapshotted when present
+                      (liveness/universe state is no longer the risk
+                      manager's — see ``universe_manager`` below).
       config        — optional ``BacktestConfig`` dataclass. Without it the
                       raw archive still saves, but ``backtest_stats`` and
                       ``turnover_stats`` are skipped with a WARNING (they
                       need ``base_timeframe``/``days_convention``).
       instruments   — optional ``{symbol: InstrumentConfig}`` registry,
                       flattened into the manifest (documentation-grade).
+      universe_manager — optional ``universe.UniverseManager``; when given,
+                      its ``get_transition_log()`` output is archived to
+                      ``universe.parquet`` (read back via
+                      ``RunRecord.universe_transitions()``). Absent ->
+                      the table is recorded empty, same as any other
+                      never-populated table.
       root          — archive root directory (default ``results/runs``).
       label         — optional human label, slug-appended to the run id.
       notes / extra — free text / JSON-able dict stored in the manifest.
@@ -128,6 +137,11 @@ def save_run(*, portfolio: Any, strategy: Any, risk_manager: Any,
                      f'strategies/{labels_map[child_label]}', empty_tables)
     _write_table(_records_long_table(risk_manager, strategy.symbol_list),
                  tmp_dir, 'riskmanager.parquet', empty_tables)
+    if universe_manager is not None:
+        _write_table(universe_manager.get_transition_log(), tmp_dir,
+                     'universe.parquet', empty_tables)
+    else:
+        empty_tables.append('universe.parquet')
 
     # ── Derived analytics (best-effort, each in its own guard) ──
     analytics_status, analytics_errors = _save_analytics(
@@ -375,8 +389,6 @@ def _build_manifest(*, run_id: str, created: datetime, label: Optional[str],
     for attr in ('idm', 'instrument_weight'):
         if hasattr(risk_manager, attr):
             rm_state[attr] = json_safe(getattr(risk_manager, attr))
-    if hasattr(risk_manager, 'get_live_symbols'):
-        rm_state['live_symbols'] = json_safe(risk_manager.get_live_symbols())
 
     system: Dict[str, Any] = {
         'kind': 'orchestrator' if is_orchestrator else 'strategy',

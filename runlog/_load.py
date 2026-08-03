@@ -199,6 +199,12 @@ class RunRecord:
         """The risk manager's long sizing-diagnostics table."""
         return self._read_table('riskmanager.parquet')
 
+    def universe_transitions(self) -> pd.DataFrame:
+        """The universe manager's transition log (one row per initial
+        evaluation + per status transition; empty for runs saved without a
+        universe manager)."""
+        return self._read_table('universe.parquet')
+
     # ── Derived analytics ────────────────────────────────────────────
 
     def stats(self) -> pd.Series:
