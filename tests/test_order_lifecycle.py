@@ -120,20 +120,27 @@ def test_stable_target_produces_exactly_one_fill():
 
 def test_margin_call_bar_resizes_against_projected_position():
     """Crash bar: long 10, equity gap-down triggers the maintenance-margin
-    call (liquidation SELL 10 in flight) while the vol spike shrinks the
-    target to 4. The RM must size against the PROJECTED position (0) and
-    submit BUY 4 (the old realized-only diff submitted SELL 6 and ended
-    the bar SHORT 6 with a +50 LONG forecast). The portfolio then scales
-    the re-open to what the post-liquidation balance actually backs:
-    balance 20 × leverage 10 / price 51 = 200/51 ≈ 3.92 — an account
-    below its maintenance floor gets no free full-size re-open netted
-    against the in-flight liquidation."""
+    call (liquidation SELL 10 in flight, deferred via ``fill_on_next_bar``)
+    while the vol spike shrinks the target to 4. The RM must size against
+    the PROJECTED position (0) and submit BUY 4 (the old realized-only
+    diff submitted SELL 6 and ended the bar SHORT 6 with a +50 LONG
+    forecast). The portfolio then scales the re-open to what the
+    post-liquidation balance actually backs: balance 20 × leverage 10 /
+    price 51 = 200/51 ≈ 3.92 — an account below its maintenance floor
+    gets no free full-size re-open netted against the in-flight
+    liquidation. Because the liquidation now defers to the symbol's next
+    bar event (never retroactively against the already-streamed crash
+    bar), the scaled re-open fills FIRST, on the crash bar's close,
+    against the still-open pre-liquidation position (10 + 3.92 ≈ 13.92);
+    the liquidation catches up one bar later, at that bar's open, landing
+    the book at the same balance-backed size."""
     closes = [100.0] * 40 + [51.0] * 3
     pf, rm, idx = _run_engine(
         closes, capital=510.0,
         vol=StubVol(base=10.0, spiked=25.0, crash_bar=41),
     )
     crash_ts = idx[40]
+    next_ts = idx[41]
     scaled_reopen = 510.0 - 490.0  # crash-bar balance …
     scaled_reopen = scaled_reopen * 10.0 / 51.0  # × leverage / price ≈ 3.92
 
@@ -143,10 +150,19 @@ def test_margin_call_bar_resizes_against_projected_position():
     trades = pf.get_trade_log()
     crash_trades = trades[trades['timestamp'] == crash_ts]
     assert crash_trades['position_after'].tolist() == pytest.approx(
-        [0.0, scaled_reopen]
+        [10.0 + scaled_reopen]
     ), (
-        "crash bar must liquidate to flat then re-establish at the "
-        f"balance-backed size, got {list(crash_trades['position_after'])}"
+        "crash bar: the scaled re-open fills against the still-open "
+        "pre-liquidation position (the liquidation itself is now "
+        f"deferred), got {list(crash_trades['position_after'])}"
+    )
+    next_trades = trades[trades['timestamp'] == next_ts]
+    assert next_trades['position_after'].tolist() == pytest.approx(
+        [scaled_reopen]
+    ), (
+        "the deferred liquidation must fill on the symbol's next bar "
+        "event, at that bar's open, bringing the book down to the "
+        f"balance-backed size, got {list(next_trades['position_after'])}"
     )
     assert (trades['position_after'] >= 0.0).all(), (
         "a long-forecast book must never go short"
@@ -223,23 +239,33 @@ def test_margin_call_bar_reopen_scaled_no_phantom_churn():
     same-bar re-open used to fill at the FULL previous size on ~zero
     equity, get margin-called again within the bar, and liquidate again —
     a phantom full-size round trip per margin-call bar. Now the re-open
-    is scaled to the balance-backed 200/51 ≈ 3.92, the bar ends solvent
-    (maintenance 10 < balance 20), and no further liquidation or resize
-    fills occur."""
+    is scaled to the balance-backed 200/51 ≈ 3.92; because the liquidation
+    defers to the symbol's next bar event (``fill_on_next_bar``), the
+    scaled re-open fills FIRST on the crash bar (against the still-open
+    pre-liquidation position, 10 + 3.92 ≈ 13.92) and the liquidation
+    catches up one bar later, at that bar's open, landing the book at the
+    same balance-backed size. The book ends solvent (maintenance 10 <
+    balance 20) and no further liquidation or resize fills occur."""
     closes = [100.0] * 40 + [51.0] * 5
     pf, _, idx = _run_engine(closes, capital=510.0, vol=StubVol(base=10.0))
     crash_ts = idx[40]
+    next_ts = idx[41]
     scaled_reopen = 20.0 * 10.0 / 51.0  # balance × leverage / price
 
     trades = pf.get_trade_log()
-    # Exactly 3 fills in the whole run: entry, liquidation, scaled re-open.
+    # Exactly 3 fills in the whole run: entry, scaled re-open, liquidation.
     assert len(trades) == 3, trades
     crash_trades = trades[trades['timestamp'] == crash_ts]
     assert crash_trades['position_after'].tolist() == pytest.approx(
-        [0.0, scaled_reopen]
+        [10.0 + scaled_reopen]
     )
-    # No churn after the crash bar: position holds at the scaled size
-    # (subsequent resize attempts are rejected — zero margin headroom).
-    assert not (trades['timestamp'] > crash_ts).any()
+    next_trades = trades[trades['timestamp'] == next_ts]
+    assert next_trades['position_after'].tolist() == pytest.approx(
+        [scaled_reopen]
+    )
+    # No churn after the liquidation catches up: position holds at the
+    # scaled size (subsequent resize attempts are rejected — zero margin
+    # headroom).
+    assert not (trades['timestamp'] > next_ts).any()
     assert pf.positions[SYM] == pytest.approx(scaled_reopen)
     assert pf.calculate_balance() == pytest.approx(20.0)

@@ -872,13 +872,23 @@ class BacktestPortfolio(Portfolio):
         are skipped (no duplicates). Symbols without a safe price are
         skipped with a warning and will be retried on a future tick.
 
+        Every liquidation order carries ``fill_on_next_bar=True``: it always
+        rests and fills on the symbol's next bar event — at that bar's open
+        when the decision-period bar has already streamed (never
+        retroactively against a bar that already closed), or at the
+        decision-period bar's own close when that bar arrives late (the
+        symbol's bar for this period had not streamed yet). See
+        ``OrderEvent.fill_on_next_bar`` / ``BacktestExecution._try_fill`` for
+        the fill-timing contract.
+
         Caveat on the duplicate-submission guard: the guard is "any pending
         liquidation for this symbol blocks a new one." If a prior liquidation
-        is stuck pending — e.g. deferred to the symbol's next bar (its bar
-        for the decision period had not streamed yet) and the symbol never
-        prints again, or the position has grown via direct state mutation
-        in a test — no replacement order is enqueued. There is no automatic
-        re-arm; in production this would require operator intervention.
+        is stuck pending — every liquidation now defers to the symbol's next
+        bar, so this is the ordinary case, not just the decision-period-bar
+        gap — and the symbol never prints again, or the position has grown
+        via direct state mutation in a test, no replacement order is
+        enqueued. There is no automatic re-arm; in production this would
+        require operator intervention.
         """
         symbols_with_pending_liquidation = {
             o.symbol for o in self.pending_orders.values() if o.is_liquidation
@@ -899,7 +909,7 @@ class BacktestPortfolio(Portfolio):
             self.submit_order(
                 symbol=sym, quantity=qty, direction=direction,
                 timestamp=timestamp, order_type=OrderType.MKT,
-                is_liquidation=True,
+                is_liquidation=True, fill_on_next_bar=True,
             )
 
     # ── Helpers ───────────────────────────────

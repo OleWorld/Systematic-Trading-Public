@@ -5,13 +5,18 @@ Uses minimal FakeQueue / FakeDataHandler stubs so the portfolio's margin
 math, fill bookkeeping, and equity accounting are exercised in isolation,
 independent of execution.py and riskmanager.py. These tests pin the
 current behavior of `BacktestPortfolio` and must pass both before and
-after any future refactor of the margin / fill path.
+after any future refactor of the margin / fill path. One exception:
+``test_liquidation_orders_carry_fill_on_next_bar_and_fill_at_next_open``
+wires a real ``BacktestExecution`` alongside the FakeQueue stub, because
+its purpose IS the portfolio/execution fill-timing interaction — the
+liquidation order's ``fill_on_next_bar`` contract can only be observed by
+also driving the exchange simulator.
 
 Run from the repo root:  pytest tests/test_portfolio.py -v
 """
 
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -26,6 +31,7 @@ from event import (
     OrderEvent,
     OrderType,
 )
+from execution import BacktestExecution
 from portfolio import BacktestPortfolio, Portfolio, PortfolioMarginModel
 
 
@@ -1349,6 +1355,70 @@ def test_fill_at_worse_price_than_submission_can_drive_insolvency_and_triggers_l
     )
     assert liq_orders[0].symbol == 'BTC'
     assert liq_orders[0].direction == Direction.SELL  # close the long
+
+
+def test_liquidation_orders_carry_fill_on_next_bar_and_fill_at_next_open():
+    """Regression for the fill_on_next_bar migration (Task 2 of the
+    universe/correlation-split refactor): a margin-call liquidation must
+    never fill retroactively against the bar that just streamed — it
+    always rests (``fill_on_next_bar=True``) and fills on the symbol's
+    next bar event, at that bar's open.
+
+    Arrange mirrors ``test_margin_call_triggers_below_maintenance_floor``:
+    capital $1,000, leverage 10 (10% initial margin), long 100 BTC @ $100,
+    5% maintenance rate. A 6% drop (close=94) breaches the $470
+    maintenance floor and fires a full-close liquidation SELL 100. Unlike
+    the sibling tests in this module, a real ``BacktestExecution`` is
+    wired alongside the FakeQueue so the deferred-fill contract can
+    actually be exercised (see the module docstring).
+    """
+    pf, q, _ = _new_portfolio(capital=1_000.0, leverage=10.0,
+                              maintenance_margin_rate=0.05,
+                              prices={'BTC': 100.0})
+    execution = BacktestExecution(q, pf.instruments)
+    pf.positions['BTC'] = 100.0
+    pf.avg_cost['BTC'] = 100.0
+    pf.margin_requirements['BTC'] = 100.0
+
+    t_call = DEFAULT_TS
+    call_bar = _bar(close=94.0, ts=t_call)
+    pf.update_bar(call_bar)         # marks to 94 -> breaches maintenance -> submits liquidation
+    execution.update_bar(call_bar)  # execution observes the same (fresh) bar for BTC
+
+    order_events = [item for item in q.items
+                    if isinstance(item, OrderEvent) and item.is_liquidation]
+    assert len(order_events) == 1
+    execution.execute_order(order_events[0])  # parked unconditionally; no fill emitted yet
+
+    liq_orders = [o for o in pf.pending_orders.values() if o.is_liquidation]
+    assert liq_orders and all(o.fill_on_next_bar for o in liq_orders)
+    liq_order_ids = {o.order_id for o in liq_orders}
+    # No liquidation fill may exist at t_call:
+    assert all(f['timestamp'] != t_call
+               for f in pf.get_trade_log().to_dict('records')
+               if f.get('order_id') in liq_order_ids)
+
+    # Stream the symbol's next bar through execution + drain into the portfolio.
+    t_next = t_call + timedelta(hours=1)
+    NEXT_OPEN = 90.0
+    next_bar = BarEvent(
+        symbol='BTC', timestamp=t_next,
+        open=NEXT_OPEN, high=95.0, low=88.0, close=92.0, volume=1.0,
+        period='1h', is_forming=False,
+    )
+    execution.update_bar(next_bar)
+    new_fills = [item for item in q.items
+                 if isinstance(item, FillEvent) and item.order_id in liq_order_ids]
+    assert len(new_fills) == 1
+    for fill in new_fills:
+        pf.update_fill(fill)
+
+    trade_log = pf.get_trade_log()
+    liq_fills = trade_log[trade_log['order_id'].isin(liq_order_ids)]
+    assert not liq_fills.empty
+    assert (liq_fills['timestamp'] == t_next).all()
+    assert liq_fills['fill_price'].tolist() == pytest.approx([NEXT_OPEN])
+    assert pf.positions['BTC'] == pytest.approx(0.0)
 
 
 # ──────────────────────────────────────────────
