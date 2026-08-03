@@ -81,6 +81,10 @@ class TestConstruction:
             CorrelationManager(dh, um, lookback=31)          # < 32
         with pytest.raises(ValueError):
             CorrelationManager(dh, um, lookback=64, step_size=-1)
+        with pytest.raises(ValueError, match="not registered"):
+            CorrelationManager(dh, um, lookback=64, timeframe='bogus')
+        with pytest.raises(ValueError, match="deque maxlen"):
+            CorrelationManager(dh, um, lookback=600)          # > maxlen=500
         with pytest.raises(ValueError):
             CorrelationManager(dh, um, lookback=64, mode='bogus')
         with pytest.raises(ValueError):
