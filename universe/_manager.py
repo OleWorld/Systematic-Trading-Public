@@ -19,12 +19,32 @@ logger = logging.getLogger(__name__)
 
 
 class _StrategyLike(Protocol):
+    """Subset of the Strategy surface that UniverseManager reads from.
+
+    ``symbol_list`` is the declared universe the manager evaluates and
+    exposes back via its own ``symbol_list`` property.
+    ``is_warmed_up(symbol)`` is the strategy's measured end-of-warmup
+    signal (True once the first non-NaN forecast has been cached) —
+    consumed by ``_derive_reasons`` as the strategy gate: unmet, it
+    contributes the ``'warmup_forecast'`` reason.
+    """
+
     symbol_list: List[str]
 
     def is_warmed_up(self, symbol: str) -> bool: ...
 
 
 class _DataHandlerLike(Protocol):
+    """Subset of the DataHandler surface that UniverseManager reads from.
+
+    ``timeframes`` is read at construction time to validate that the
+    configured ``history_timeframe`` is registered (and to read its
+    deque maxlen for the ``min_history_bars`` bound). ``count_bars`` is
+    the O(1) data-availability gate ``_derive_reasons`` uses as the data
+    gate: fewer than ``min_history_bars`` at ``history_timeframe``
+    contributes the ``'warmup_history'`` reason.
+    """
+
     timeframes: Dict[str, int]
 
     def count_bars(self, symbol: str,
