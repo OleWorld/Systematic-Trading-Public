@@ -17,6 +17,8 @@ from strategy import RSIMRStrategy
 from portfolio import BacktestPortfolio, PortfolioMarginModel
 from execution import BacktestExecution, SlippageModel, CommissionModel
 from volatility import EWMAVolEstimator, bars_per_year
+from universe import UniverseManager
+from correlation import CorrelationManager
 from riskmanager import VolTargetingRiskManager
 from backtester import Backtester
 from plotting import plot_strategy
@@ -123,20 +125,33 @@ vol_estimator = EWMAVolEstimator(
     timeframe=vol_timeframe, span=36,
 )
 
+# Universe liveness (strategy warmup + data-availability gates) and
+# walk-forward correlation estimation now live in their own manager
+# classes, decoupled from the risk manager's sizing arithmetic.
+universe_manager = UniverseManager(
+    strategy, data_handler,
+    min_history_bars=config.corr_lookback,
+    history_timeframe=config.corr_timeframe,
+)
+
+correlation_manager = CorrelationManager(
+    data_handler, universe_manager,
+    lookback=config.corr_lookback,
+    step_size=config.corr_step_size,
+    timeframe=config.corr_timeframe,
+    mode=config.corr_mode,
+    floor=config.corr_floor,
+    shrinkage=config.corr_shrinkage,
+)
+
 risk_manager = VolTargetingRiskManager(
     portfolio, strategy, vol_estimator,
-    data_handler=data_handler,
+    universe_manager=universe_manager,
     instruments=instruments,
     annual_target_vol=config.annual_target_vol,
     vol_target_mode=config.vol_target_mode,
     position_buffer=config.position_buffer,
     instrument_weight_mode=config.instrument_weight_mode,
-    corr_lookback=config.corr_lookback,
-    corr_step_size=config.corr_step_size,
-    corr_timeframe=config.corr_timeframe,
-    corr_mode=config.corr_mode,
-    corr_floor=config.corr_floor,
-    corr_shrinkage=config.corr_shrinkage,
     idm_cap=config.idm_cap,
 )
 
@@ -146,7 +161,7 @@ execution = BacktestExecution(
 )
 
 bt = Backtester(events_queue, data_handler, strategy, portfolio,
-                risk_manager, execution)
+                risk_manager, execution, universe_manager, correlation_manager)
 
 # --- Run ---
 bt.run()
@@ -156,6 +171,7 @@ bt.run()
 run_record = save_run(
     portfolio=bt.portfolio, strategy=strategy, risk_manager=risk_manager,
     config=config, instruments=instruments, label='rsimr-smoke',
+    universe_manager=universe_manager,
 )
 print(f"Run archived: {run_record.path}")
 
