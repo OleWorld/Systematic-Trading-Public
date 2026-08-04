@@ -178,7 +178,12 @@ data_handler = HistoricDataHandler(events_queue, config.symbols,
 ### Run — wire the modules and start the loop
 
 The trader instantiates each module explicitly, passes them into
-`Backtester(...)`, and calls `run()`. The full pattern lives in
+`Backtester(...)`, and calls `run()`. Two more modules feed the risk manager's
+sizing and are required by `Backtester` alongside the rest: `universe.UniverseManager`
+(tracks which symbols are currently tradable — strategy warmup + minimum
+price history) and `correlation.CorrelationManager` (estimates the instrument
+correlation matrix on a walk-forward cadence, used for instrument weights and
+the diversification multiplier). The full pattern lives in
 [backtests/sample_backtest/backtest_ewmac_crypto.py](backtests/sample_backtest/backtest_ewmac_crypto.py); the condensed shape is:
 
 ```python
@@ -187,6 +192,8 @@ from data import HistoricDataHandler
 from portfolio import BacktestPortfolio
 from execution import BacktestExecution, SlippageModel, CommissionModel
 from volatility import EWMAVolEstimator, bars_per_year
+from universe import UniverseManager
+from correlation import CorrelationManager
 from riskmanager import VolTargetingRiskManager
 from backtester import Backtester
 
@@ -203,8 +210,17 @@ portfolio    = BacktestPortfolio(events_queue, data_handler, config.symbols,
 vol_estimator = EWMAVolEstimator(config.symbols, data_handler=data_handler,
                                  bars_per_year=bars_per_year('1d', config.days_convention),
                                  timeframe='1d', span=36)
+
+# Tradable-universe liveness and correlation estimation are engine-driven
+# modules of their own — both required by Backtester, both reach the risk
+# manager as events (never a per-bar concern for the RM itself).
+universe_manager    = UniverseManager(strategy, data_handler,
+                                      min_history_bars=60, history_timeframe='1d')
+correlation_manager = CorrelationManager(data_handler, universe_manager,
+                                         lookback=60, step_size=30, timeframe='1d')
+
 risk_manager  = VolTargetingRiskManager(portfolio, strategy, vol_estimator,
-                                              data_handler=data_handler,
+                                              universe_manager=universe_manager,
                                               instruments=instruments,
                                               annual_target_vol=config.annual_target_vol,
                                               vol_target_mode=config.vol_target_mode,
@@ -212,7 +228,8 @@ risk_manager  = VolTargetingRiskManager(portfolio, strategy, vol_estimator,
 execution     = BacktestExecution(events_queue,
                                   instruments=instruments)
 
-bt = Backtester(events_queue, data_handler, strategy, portfolio, risk_manager, execution)
+bt = Backtester(events_queue, data_handler, strategy, portfolio, risk_manager,
+                execution, universe_manager, correlation_manager)
 bt.run()
 
 # Access results
