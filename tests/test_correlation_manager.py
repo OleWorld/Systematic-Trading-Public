@@ -188,8 +188,8 @@ class TestRefreshPipeline:
         n_rows = len(um.get_transition_log())
         # Second refresh, C still constant: NO new transition (idempotent).
         cm.update_bar(_bar('A', T('2024-01-02')))
-        assert um.drain_events() == [] or all(
-            e.symbol != 'C' for e in um.drain_events())
+        events = um.drain_events()
+        assert all(e.symbol != 'C' for e in events)
         assert len(um.get_transition_log()) == n_rows
         # C starts moving: cleared, re-enters live.
         _feed_closes(dh, 'C', _rng_walk(32, seed=7))

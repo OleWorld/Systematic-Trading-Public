@@ -252,7 +252,7 @@ def test_save_creates_layout_and_manifest(tmp_path):
     assert m['run']['notes'] == 'hello'
     assert m['run']['extra'] == {'seed': 42}
     assert m['counts'] == {'n_symbols': 2, 'n_trades': 2, 'n_orders': 1,
-                           'n_equity_rows': 6}
+                           'n_equity_rows': 6, 'n_universe_transitions': 0}
     assert m['portfolio']['initial_capital'] == 1000.0
     assert m['portfolio']['positions'] == {'AAA': 2.0, 'BBB': -2.0}
     assert m['risk_manager']['idm'] == 1.5
@@ -375,6 +375,7 @@ def test_universe_transition_log_round_trips(tmp_path):
     assert df['live'].tolist() == [False, True]
     assert record.manifest['schema_version'] == 3
     assert 'universe.parquet' not in record.manifest['empty_tables']
+    assert record.manifest['counts']['n_universe_transitions'] == 2
 
 
 def test_universe_absent_yields_empty_table(tmp_path):
@@ -393,6 +394,7 @@ def test_universe_absent_yields_empty_table(tmp_path):
     )
     assert record.universe_transitions().empty
     assert 'universe.parquet' in record.manifest['empty_tables']
+    assert record.manifest['counts']['n_universe_transitions'] == 0
 
 
 def test_universe_empty_transition_log_yields_empty_table(tmp_path):
@@ -409,6 +411,7 @@ def test_universe_empty_transition_log_yields_empty_table(tmp_path):
     )
     assert record.universe_transitions().empty
     assert 'universe.parquet' in record.manifest['empty_tables']
+    assert record.manifest['counts']['n_universe_transitions'] == 0
 
 
 def test_strategy_records_round_trip(tmp_path):

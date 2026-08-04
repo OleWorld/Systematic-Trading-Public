@@ -54,14 +54,9 @@ class _UniverseManagerLike(Protocol):
     every sized bar to drive the universal not-live rule and to label the
     skip ladder with the symbol's primary recorded reason. Typed ``Any``
     so ``riskmanager`` need not import ``universe``.
-    ``get_live_symbols()`` returns the live subset in
-    ``strategy.symbol_list`` order — the introspection counterpart used
-    by wiring/diagnostic code.
     """
 
     def status(self, symbol: str) -> Any: ...
-
-    def get_live_symbols(self) -> List[str]: ...
 
 
 # ──────────────────────────────────────────────
