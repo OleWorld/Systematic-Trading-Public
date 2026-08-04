@@ -337,6 +337,24 @@ class TestOnUniverseEvent:
         assert sub['fill_on_next_bar'] is True
         assert sub['order_type'] == OrderType.MKT
 
+    def test_not_live_edge_warns_on_held_position(self, caplog):
+        """Ports ``test_held_position_absent_from_universe_warns``: the
+        flatten WARNING (``on_universe_event``, riskmanager/_vol_targeting.py
+        ~517-522) fires at WARNING level on the riskmanager logger, naming
+        the symbol and its universe reasons — anchored to the (already
+        separately covered) flatten submission so the log line is pinned
+        to the exact branch that emits it, not just "some warning fired
+        somewhere"."""
+        rm, pf, strat, dh, um, ve = _build()
+        pf.positions['A'] = 4.0
+        with caplog.at_level(logging.WARNING, logger='riskmanager._vol_targeting'):
+            rm.on_universe_event(_not_live_edge('A', reasons=('delisted',)))
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('A went not-live' in r.message and 'delisted' in r.message
+                  for r in warnings)
+        sub = pf.submitted[-1]
+        assert sub['symbol'] == 'A' and sub['quantity'] == pytest.approx(4.0)
+
     def test_flat_symbol_submits_nothing(self):
         rm, pf, strat, dh, um, ve = _build()
         rm.on_universe_event(_not_live_edge('A'))
