@@ -23,8 +23,9 @@ class BarEvent(Event):
         period: Bar timeframe string, e.g. '1m', '1h', '4h', '1d'.
         is_forming: True for live bars still accumulating ticks.
             Forming bars flow through the full bar pipeline
-            (portfolio -> execution -> strategy -> risk_manager) just like
-            completed bars. The risk manager itself gates on
+            (portfolio -> execution -> strategy -> universe_manager ->
+            correlation_manager -> risk_manager) just like completed
+            bars. The risk manager itself gates on
             ``is_forming`` to avoid intra-period resize thrash; strategies
             recompute forecasts from ``iloc[-2]``-based finalized values
             so forming-bar processing is idempotent.
