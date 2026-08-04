@@ -5,8 +5,9 @@ Writes a self-contained run folder under ``root`` (default
 ``results/runs/``): the portfolio's equity curve / PnL snapshots / trade
 log / order log, one long per-symbol record table per strategy (plus the
 orchestrator's combined table on multi-strategy runs), the risk manager's
-sizing records, best-effort derived analytics, and a ``manifest.json``
-capturing config, end-of-run state, and environment metadata.
+sizing records, the universe manager's transition log (when supplied),
+best-effort derived analytics, and a ``manifest.json`` capturing config,
+end-of-run state, and environment metadata.
 
 Robustness contract: raw tables are written first and each derived
 analytics artifact is computed inside its own ``try/except`` — an
@@ -59,6 +60,7 @@ _SNAPSHOT_FIELDS = {
 
 def save_run(*, portfolio: Any, strategy: Any, risk_manager: Any,
              config: Any = None, instruments: Optional[Dict[str, Any]] = None,
+             universe_manager: Any = None,
              root: Any = 'results/runs', label: Optional[str] = None,
              notes: Optional[str] = None,
              extra: Optional[Dict[str, Any]] = None) -> RunRecord:
@@ -73,14 +75,23 @@ def save_run(*, portfolio: Any, strategy: Any, risk_manager: Any,
                       dict-valued ``strategies`` attribute); must expose
                       ``symbol_list`` and ``get_records(symbol)``.
       risk_manager  — exposes ``get_records(symbol)``; ``idm`` /
-                      ``instrument_weight`` / ``get_live_symbols`` are
-                      snapshotted when present.
+                      ``instrument_weight`` are snapshotted when present
+                      (liveness/universe state is no longer the risk
+                      manager's — see ``universe_manager`` below).
       config        — optional ``BacktestConfig`` dataclass. Without it the
                       raw archive still saves, but ``backtest_stats`` and
                       ``turnover_stats`` are skipped with a WARNING (they
                       need ``base_timeframe``/``days_convention``).
       instruments   — optional ``{symbol: InstrumentConfig}`` registry,
                       flattened into the manifest (documentation-grade).
+      universe_manager — optional ``universe.UniverseManager``; when given,
+                      its ``get_transition_log()`` output is archived to
+                      ``universe.parquet`` (read back via
+                      ``RunRecord.universe_transitions()``) and its row
+                      count is recorded as
+                      ``manifest['counts']['n_universe_transitions']``.
+                      Absent -> the table is recorded empty, same as any
+                      other never-populated table, and the count is 0.
       root          — archive root directory (default ``results/runs``).
       label         — optional human label, slug-appended to the run id.
       notes / extra — free text / JSON-able dict stored in the manifest.
@@ -128,6 +139,14 @@ def save_run(*, portfolio: Any, strategy: Any, risk_manager: Any,
                      f'strategies/{labels_map[child_label]}', empty_tables)
     _write_table(_records_long_table(risk_manager, strategy.symbol_list),
                  tmp_dir, 'riskmanager.parquet', empty_tables)
+    if universe_manager is not None:
+        transition_log = universe_manager.get_transition_log()
+        n_universe_transitions = len(transition_log)
+        _write_table(transition_log, tmp_dir,
+                     'universe.parquet', empty_tables)
+    else:
+        n_universe_transitions = 0
+        empty_tables.append('universe.parquet')
 
     # ── Derived analytics (best-effort, each in its own guard) ──
     analytics_status, analytics_errors = _save_analytics(
@@ -141,6 +160,7 @@ def save_run(*, portfolio: Any, strategy: Any, risk_manager: Any,
         strategy=strategy, risk_manager=risk_manager, children=children,
         labels_map=labels_map, is_orchestrator=is_orchestrator,
         equity_df=equity_df, trade_df=trade_df, order_df=order_df,
+        n_universe_transitions=n_universe_transitions,
         empty_tables=empty_tables, analytics_status=analytics_status,
         analytics_errors=analytics_errors,
     )
@@ -360,9 +380,17 @@ def _build_manifest(*, run_id: str, created: datetime, label: Optional[str],
                     children: Dict[str, Any], labels_map: Dict[str, str],
                     is_orchestrator: bool, equity_df: pd.DataFrame,
                     trade_df: pd.DataFrame, order_df: pd.DataFrame,
+                    n_universe_transitions: int,
                     empty_tables: List[str], analytics_status: Dict[str, str],
                     analytics_errors: Dict[str, str]) -> Dict[str, Any]:
-    """Assemble the JSON-safe manifest dict (see the module docstring)."""
+    """Assemble the JSON-safe manifest dict (see the module docstring).
+
+    ``n_universe_transitions`` is the row count of the universe manager's
+    transition log at save time (0 when no ``universe_manager`` was
+    passed to ``save_run``) — computed once by the caller, next to the
+    ``universe.parquet`` write, so the count and the archived table never
+    drift apart. Surfaced in ``manifest['counts']``.
+    """
     portfolio_state = {'class': type(portfolio).__name__}
     for attr in ('initial_capital', 'cash', 'total_commission',
                  'account_balance', 'available_balance', 'positions',
@@ -375,8 +403,6 @@ def _build_manifest(*, run_id: str, created: datetime, label: Optional[str],
     for attr in ('idm', 'instrument_weight'):
         if hasattr(risk_manager, attr):
             rm_state[attr] = json_safe(getattr(risk_manager, attr))
-    if hasattr(risk_manager, 'get_live_symbols'):
-        rm_state['live_symbols'] = json_safe(risk_manager.get_live_symbols())
 
     system: Dict[str, Any] = {
         'kind': 'orchestrator' if is_orchestrator else 'strategy',
@@ -423,6 +449,7 @@ def _build_manifest(*, run_id: str, created: datetime, label: Optional[str],
             'n_trades': len(trade_df),
             'n_orders': len(order_df),
             'n_equity_rows': len(equity_df),
+            'n_universe_transitions': n_universe_transitions,
         },
         'empty_tables': empty_tables,
         'analytics': {'status': analytics_status, 'errors': analytics_errors},

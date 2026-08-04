@@ -3,7 +3,7 @@
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Any, List, Optional
 
 from event._enums import OrderType, Direction
 
@@ -23,8 +23,9 @@ class BarEvent(Event):
         period: Bar timeframe string, e.g. '1m', '1h', '4h', '1d'.
         is_forming: True for live bars still accumulating ticks.
             Forming bars flow through the full bar pipeline
-            (portfolio -> execution -> strategy -> risk_manager) just like
-            completed bars. The risk manager itself gates on
+            (portfolio -> execution -> strategy -> universe_manager ->
+            correlation_manager -> risk_manager) just like completed
+            bars. The risk manager itself gates on
             ``is_forming`` to avoid intra-period resize thrash; strategies
             recompute forecasts from ``iloc[-2]``-based finalized values
             so forming-bar processing is idempotent.
@@ -54,6 +55,13 @@ class OrderEvent(Event):
             solvency-enforcement path. Liquidation orders are exempt from
             the FIFO cancel pass that fires when account_balance < 0, so
             they are not cancelled by the very mechanism that submitted them.
+        fill_on_next_bar: True for MKT orders that must NEVER fill against
+            a bar event dispatched before the order existed. ``execute_order``
+            parks such orders in ``pending_orders`` unconditionally; the fill
+            lands on the symbol's next bar event via ``_try_fill`` (close if
+            it is the decision-period bar arriving late, open of the next
+            period otherwise). Producers: the risk manager's universe
+            flatten and the portfolio's margin-call liquidations.
     """
     symbol: str
     order_type: OrderType
@@ -63,6 +71,7 @@ class OrderEvent(Event):
     price: Optional[float] = None
     timestamp: Optional[datetime] = None
     is_liquidation: bool = False
+    fill_on_next_bar: bool = False
 
 
 @dataclass
@@ -82,3 +91,58 @@ class FillEvent(Event):
     fill_notional: float
     commission: float = 0.0
     order_id: Optional[str] = None
+
+
+@dataclass
+class UniverseEvent(Event):
+    """
+    Universe transition — emitted by ``UniverseManager`` when a symbol's
+    ``(live, reasons)`` state changes. NEVER enters the FIFO events queue:
+    the engine drains pending events via ``drain_events()`` and dispatches
+    each synchronously to ``risk_manager.on_universe_event`` between the
+    correlation manager's update and the risk manager's sizing, so the
+    sizing pass always sees fresh universe state.
+
+    Attributes:
+        reasons: current reason list, canonically ordered (gate reasons
+            first, then exclusion marks in mark order); ``[]`` == live.
+        trigger: what caused the transition — ``'bar_refresh'`` |
+            ``'reassess'`` | ``'mark_excluded:<reason>'`` |
+            ``'clear_excluded:<reason>'``.
+    """
+    timestamp: Optional[datetime]
+    symbol: str
+    live: bool
+    excluded: bool
+    reasons: List[str]
+    prev_live: bool
+    prev_reasons: List[str]
+    trigger: str
+
+
+@dataclass
+class CorrelationEvent(Event):
+    """
+    Correlation refresh — returned (at most one per bar) by
+    ``CorrelationManager.update_bar`` and dispatched synchronously by the
+    engine to ``risk_manager.on_correlation_event`` BEFORE the risk
+    manager's own ``update_bar`` for the same bar, so the triggering bar
+    and every same-timestamp symbol size on the refreshed weights. NEVER
+    enters the FIFO events queue.
+
+    Attributes:
+        matrix: the refreshed correlation matrix, typed ``Optional[Any]``
+            (not ``Optional[pd.DataFrame]``) so ``event/`` stays
+            pandas-free; at runtime it is a ``pandas.DataFrame`` (labels
+            = the kept non-constant live subset) on reason='ok', or None
+            on every other reason.
+        live_symbols: full live snapshot at event construction — what
+            degenerate-fallback equal weighting spreads over.
+        reason: 'ok' | 'empty_universe' | 'singleton'
+            | 'insufficient_observations' | 'too_few_symbols'
+            | 'nan_fallback'.
+    """
+    timestamp: datetime
+    matrix: Optional[Any]
+    live_symbols: List[str]
+    reason: str

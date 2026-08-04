@@ -202,9 +202,10 @@ class Orchestrator:
         (no new attributes): the weights are read fresh on every call, so a
         direct ``strategy_weights`` overwrite propagates at the risk
         manager's next weight recalc. Consumed — via ``hasattr`` — by
-        ``VolTargetingRiskManager.calculate_instrument_weight`` to build
-        strategy-budgeted instrument weights (sum-of-books); a bare
-        ``Strategy`` lacks this method and gets a single implicit group.
+        ``VolTargetingRiskManager.on_correlation_event`` (through
+        ``_grouped_weights``) to build strategy-budgeted instrument
+        weights (sum-of-books); a bare ``Strategy`` lacks this method and
+        gets a single implicit group.
         """
         return {
             label: (self.strategy_weights[label], list(strat.symbol_list))

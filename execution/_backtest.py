@@ -72,7 +72,11 @@ class BacktestExecution(ExecutionHandler):
     def execute_order(self, event: OrderEvent) -> None:
         """
         Route a new order. A MKT order fills immediately at the current
-        (signal-generation) bar's close. A LMT order always RESTS: it joins
+        (signal-generation) bar's close, unless ``event.fill_on_next_bar``
+        is True — such an order is parked in ``pending_orders``
+        unconditionally, regardless of how fresh the current bar is, and
+        fills on the symbol's next bar event via ``_try_fill`` (see
+        ``OrderEvent.fill_on_next_bar``). A LMT order always RESTS: it joins
         ``pending_orders`` and is evaluated from the next bar onward via
         ``_try_fill`` — never against its own signal bar's range, whose
         high/low printed before the order existed (filling there would be
@@ -96,6 +100,13 @@ class BacktestExecution(ExecutionHandler):
             self.pending_orders[event.order_id] = event
             return
         if event.order_type == OrderType.MKT:
+            if event.fill_on_next_bar:
+                # Contract: never fill against a bar event dispatched before
+                # this order existed. Park unconditionally; _try_fill fills
+                # it on the symbol's next bar (decision-period close if that
+                # bar arrives late, next-period open otherwise).
+                self.pending_orders[event.order_id] = event
+                return
             self._emit_fill(event, bar.close, bar)
         elif event.order_type == OrderType.LMT:
             # Rests on the book; evaluated from the next bar via _try_fill.

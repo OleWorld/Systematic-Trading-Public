@@ -429,10 +429,12 @@ def test_multi_column_stream_decode_keys_values_to_right_fields():
 
 from backtester import Backtester
 from config import uniform_registry
+from correlation import CorrelationManager
 from execution import BacktestExecution
 from portfolio import BacktestPortfolio
 from riskmanager import SimpleRiskManager
 from strategy import Strategy
+from universe import UniverseManager
 
 
 class _FundingToyStrategy(Strategy):
@@ -480,9 +482,21 @@ def _run_end_to_end():
     rm = SimpleRiskManager(portfolio, strat, size_mode='fixed_quantity',
                            position_size=1.0)
     execution = BacktestExecution(q, instruments)
+    # SimpleRiskManager doesn't consume universe/correlation state (it
+    # inherits RiskManager's no-op on_universe_event/on_correlation_event),
+    # so these two REQUIRED Backtester args are just structurally wired
+    # here — lookback=32 is the smallest value CorrelationManager accepts,
+    # and min_history_bars must be >= it (the drift guard).
+    universe_manager = UniverseManager(strat, dh, min_history_bars=32,
+                                       history_timeframe='1d')
+    correlation_manager = CorrelationManager(dh, universe_manager,
+                                             lookback=32, step_size=0,
+                                             timeframe='1d')
     bt = Backtester(events_queue=q, data_handler=dh, strategy=strat,
                     portfolio=portfolio, risk_manager=rm,
-                    execution_handler=execution)
+                    execution_handler=execution,
+                    universe_manager=universe_manager,
+                    correlation_manager=correlation_manager)
     bt.run()
     return strat, portfolio
 

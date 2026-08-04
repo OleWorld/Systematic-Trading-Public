@@ -31,6 +31,7 @@ from event import BarEvent
 from orchestrator import Orchestrator
 from riskmanager import VolTargetingRiskManager
 from strategy import EWMACStrategy, RSIMRStrategy, Strategy
+from universe import UniverseManager
 
 
 # ──────────────────────────────────────────────
@@ -462,13 +463,20 @@ class _FakeVol:
 
 
 class _FakeDH:
+    """Minimal data-handler double: a settable ``count_bars`` per symbol so
+    the test can put a symbol past ``UniverseManager``'s data gate without
+    streaming real bars through it."""
+
     timeframes = {'1d': 500}
+
+    def __init__(self):
+        self.counts: Dict[str, int] = {}
 
     def get_latest_bars_df(self, symbol, n=1, timeframe=None):
         return pd.DataFrame(columns=['Open', 'High', 'Low', 'Close', 'Volume'])
 
     def count_bars(self, symbol, timeframe=None):
-        return 0
+        return self.counts.get(symbol, 0)
 
 
 def test_risk_manager_accepts_orchestrator_and_sizes_off_combined_forecast():
@@ -479,20 +487,25 @@ def test_risk_manager_accepts_orchestrator_and_sizes_off_combined_forecast():
     orch = Orchestrator({'a': a, 'b': b})           # combined 50
 
     pf = _FakePortfolio(positions={'BTC': 0.0})
+    dh = _FakeDH()
+    ev = _bar_event('BTC', _START, 100.0)
+    orch.update_bar(ev)                             # engine order: source first
+    # Satisfy the universe manager's gates directly (no real bar stream
+    # here): the strategy gate is already met (orch just warmed on the
+    # update_bar above) and the data gate needs count_bars >= 1.
+    dh.counts['BTC'] = 1
+    um = UniverseManager(orch, dh, min_history_bars=1, history_timeframe='1d')
     rm = VolTargetingRiskManager(
-        pf, orch, _FakeVol({'BTC': 8000.0}),
-        data_handler=_FakeDH(),
+        pf, orch, _FakeVol({'BTC': 8000.0}), um,
         instruments=uniform_registry(['BTC']),
         annual_target_vol=0.25,
         vol_target_mode='percent_volatility',
         position_buffer=0.0,
-        corr_step_size=0,                           # freeze weights for the test
     )
     assert rm.strategy is orch
-    rm.instrument_weight = {'BTC': 1.0}             # pin a tradable weight
+    rm.instrument_weight = {'BTC': 1.0}             # pin a tradable weight (no
+                                                     # CorrelationManager wired here)
 
-    ev = _bar_event('BTC', _START, 100.0)
-    orch.update_bar(ev)                             # engine order: source first
     rm.update_bar(ev)
     # cash = 100k * 1 * 1 * 0.25 * (50/50) = 25_000 ; qty = 25_000 / 8_000
     assert len(pf.submitted) == 1

@@ -18,7 +18,9 @@ class BacktestConfig:
     ``timeframes``, higher timeframes strictly larger than base. Domain
     values (vol-target knobs, corr knobs, size modes, ...) are validated
     by the module that consumes them, at wiring time — e.g.
-    ``VolTargetingRiskManager.__init__`` raises on a bad ``corr_lookback``.
+    ``CorrelationManager.__init__`` raises on a bad ``corr_lookback`` (the
+    same value also feeds ``UniverseManager.__init__`` as
+    ``min_history_bars``).
     **Per-symbol economics** (point_value, fractional, slippage, commission,
     margin/leverage) live in ``InstrumentConfig`` (``config/_instrument.py``),
     supplied as a registry to the portfolio, execution, and risk manager.
@@ -40,20 +42,24 @@ class BacktestConfig:
     initial_capital: float = 100_000.0
 
     # --- Risk / Sizing ---
-    # Carver vol-targeting knobs consumed by `VolTargetingRiskManager`.
-    # ``idm`` is not in config — pass it directly to the risk manager
-    # constructor if a non-default value is needed.
+    # Carver vol-targeting knobs consumed by `VolTargetingRiskManager`
+    # (annual_target_vol, vol_target_mode, position_buffer,
+    # instrument_weight_mode, idm_cap). ``idm`` is not in config — pass it
+    # directly to the risk manager constructor if a non-default value is
+    # needed. The corr_* knobs below instead feed `UniverseManager`
+    # (corr_lookback -> min_history_bars, corr_timeframe -> history_timeframe)
+    # and `CorrelationManager` (all six) — not the risk manager directly.
     annual_target_vol: Optional[float] = None  # Carver's τ — $ amount ('dollar_volatility') or fraction in (0,1) ('percent_volatility'); required (validated) when wiring VolTargetingRiskManager, may stay None for SimpleRiskManager runs
     vol_target_mode: str = 'dollar_volatility'     # 'dollar_volatility' (fixed annual $ vol budget) or 'percent_volatility' (fraction of equity)
     position_buffer: float = 0.25        # Carver §10.7 dead-band (0.0 to trade every gap)
     instrument_weight_mode: str = 'equal_weight'   # 'equal_weight', 'min_variance', or 'risk_parity'
-    corr_lookback: int = 60          # corr trailing window AND universe liveness threshold (in corr_timeframe bars; >= 31, <= deque maxlen)
-    corr_step_size: int = 30              # auto-recalc cadence in completed bars; 0 disables
-    corr_timeframe: str = '1d'            # data-handler timeframe to read closes from
-    corr_mode: str = 'absolute_price_chg' # 'absolute_price_chg' (futures-safe: negative/zero prices) or 'simple_return' (positive-price assets)
-    corr_floor: Optional[float] = None    # element-wise floor on the inline-derived rho; None (default) disables; 0.0 is the recommended Carver-style setting (zero out spurious negative correlations; bounds pre-cap IDM by sqrt(N))
-    corr_shrinkage: Optional[str] = 'ledoit_wolf'  # shrinkage on the inline-derived rho ('ledoit_wolf' — well-conditioned at high N); None disables (raw sample corr)
-    idm_cap: Optional[float] = 2.5       # cap on the auto-updated IDM; None disables (Carver's 2.5; >= 1.0 since DM >= 1 for long-only sum-to-1 weights)
+    corr_lookback: int = 60          # corr trailing window (CorrelationManager.lookback) AND universe liveness threshold (UniverseManager.min_history_bars), in corr_timeframe bars; >= 32, <= deque maxlen
+    corr_step_size: int = 30              # CorrelationManager auto-recalc cadence in completed corr_timeframe periods; 0 disables
+    corr_timeframe: str = '1d'            # data-handler timeframe read by both UniverseManager (history_timeframe) and CorrelationManager (timeframe)
+    corr_mode: str = 'absolute_price_chg' # CorrelationManager.mode — 'absolute_price_chg' (futures-safe: negative/zero prices) or 'simple_return' (positive-price assets)
+    corr_floor: Optional[float] = None    # CorrelationManager.floor — element-wise floor on the inline-derived rho; None (default) disables; 0.0 is the recommended Carver-style setting (zero out spurious negative correlations; bounds pre-cap IDM by sqrt(N))
+    corr_shrinkage: Optional[str] = 'ledoit_wolf'  # CorrelationManager.shrinkage — shrinkage on the inline-derived rho ('ledoit_wolf' — well-conditioned at high N); None disables (raw sample corr)
+    idm_cap: Optional[float] = 2.5       # VolTargetingRiskManager.idm_cap — cap on the auto-updated IDM; None disables (Carver's 2.5; >= 1.0 since DM >= 1 for long-only sum-to-1 weights)
 
     # NOTE: size_mode and position_size are consumed only by
     # SimpleRiskManager (sign-of-forecast follower). Ignored when
@@ -92,5 +98,6 @@ class BacktestConfig:
 
         # Domain-value validation (vol-target knobs, corr knobs, size
         # modes, days_convention) is owned by the consuming modules and
-        # fires at wiring time: VolTargetingRiskManager.__init__,
-        # SimpleRiskManager.__init__, volatility.bars_per_year.
+        # fires at wiring time: VolTargetingRiskManager.__init__ (vol-target
+        # knobs), UniverseManager.__init__ / CorrelationManager.__init__
+        # (corr knobs), SimpleRiskManager.__init__, volatility.bars_per_year.

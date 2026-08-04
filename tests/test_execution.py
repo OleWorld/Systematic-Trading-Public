@@ -71,10 +71,12 @@ def _order(symbol: str = 'BTC', qty: float = 1.0,
            order_type: OrderType = OrderType.MKT,
            price: Optional[float] = None,
            order_id: Optional[str] = None,
-           ts: Optional[datetime] = None) -> OrderEvent:
+           ts: Optional[datetime] = None,
+           fill_on_next_bar: bool = False) -> OrderEvent:
     kwargs = dict(
         symbol=symbol, order_type=order_type, quantity=qty, direction=direction,
         price=price, timestamp=ts if ts is not None else DEFAULT_TS,
+        fill_on_next_bar=fill_on_next_bar,
     )
     if order_id is not None:
         kwargs['order_id'] = order_id
@@ -701,3 +703,61 @@ def test_commission_model_rejects_non_finite_or_negative_value(mode, bad):
 def test_slippage_and_commission_accept_zero_value():
     assert SlippageModel(mode='absolute', value=0.0).value == 0.0
     assert CommissionModel(mode='per_contract', value=0.0).value == 0.0
+
+
+# ──────────────────────────────────────────────
+# execute_order — fill_on_next_bar (flagged MKT orders never fill against
+# an already-dispatched bar)
+# ──────────────────────────────────────────────
+
+def test_fill_on_next_bar_parks_instead_of_filling_immediately():
+    """A flagged MKT order must NOT fill against the already-streamed bar."""
+    ex, q = _new_execution()
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=100.0, high=110.0, low=90.0,
+                       close=105.0))
+    order = _order(qty=1.0, order_type=OrderType.MKT, order_id='F1',
+                   ts=DEFAULT_TS, fill_on_next_bar=True)
+    ex.execute_order(order)
+    assert q.items == []
+    assert 'F1' in ex.pending_orders
+
+
+def test_fill_on_next_bar_fills_next_period_at_open():
+    ex, q = _new_execution()
+    t1 = DEFAULT_TS + timedelta(days=1)
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=100.0, high=110.0, low=90.0,
+                       close=105.0))
+    ex.execute_order(_order(qty=1.0, order_type=OrderType.MKT, order_id='F2',
+                            ts=DEFAULT_TS, fill_on_next_bar=True))
+
+    ex.update_bar(_bar(ts=t1, open=200.0, high=210.0, low=190.0, close=205.0))
+    assert len(q.items) == 1
+    fill = q.items[0]
+    assert fill.timestamp == t1
+    assert math.isclose(fill.fill_notional, 200.0)  # t1 OPEN, not t0 close
+
+
+def test_fill_on_next_bar_decision_period_bar_arriving_late_fills_at_close():
+    """Order submitted at t0 BEFORE the symbol's t0 bar streams: fills at
+    that bar's close when it arrives (the existing deferral convention)."""
+    ex, q = _new_execution()
+    tm1 = DEFAULT_TS - timedelta(days=1)
+    ex.update_bar(_bar(ts=tm1, open=90.0, high=95.0, low=85.0, close=92.0))  # only an OLD bar seen
+    ex.execute_order(_order(qty=1.0, order_type=OrderType.MKT, order_id='F3',
+                            ts=DEFAULT_TS, fill_on_next_bar=True))
+    assert q.items == []
+
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=100.0, high=110.0, low=90.0,
+                       close=105.0))
+    assert len(q.items) == 1
+    assert math.isclose(q.items[0].fill_notional, 105.0)  # t0 CLOSE
+
+
+def test_fill_on_next_bar_default_false_keeps_immediate_fill():
+    ex, q = _new_execution()
+    ex.update_bar(_bar(ts=DEFAULT_TS, open=100.0, high=110.0, low=90.0,
+                       close=105.0))
+    ex.execute_order(_order(qty=1.0, order_type=OrderType.MKT, order_id='F4',
+                            ts=DEFAULT_TS))
+    assert len(q.items) == 1
+    assert math.isclose(q.items[0].fill_notional, 105.0)

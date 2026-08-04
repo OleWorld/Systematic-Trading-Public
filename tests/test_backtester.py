@@ -12,7 +12,10 @@ leaked bar-timestamp context) would pass the rest of the suite.
 These tests pin the documented contract directly, with recording stubs
 for the six wired modules:
 
-- Bar-processing order: portfolio → execution → strategy → risk_manager.
+- Bar-processing order: portfolio → execution → strategy → universe_manager
+  → correlation_manager → risk_manager, with the universe/correlation
+  events dispatched inline (never via the FIFO queue) between the
+  correlation manager's update and the risk manager's own ``update_bar``.
 - ``OrderEvent`` → ``execution.execute_order``.
 - ``FillEvent`` → ``portfolio.update_fill``.
 - An unknown event type raises ``TypeError`` (no silent fall-through).
@@ -20,6 +23,8 @@ for the six wired modules:
   processed and cleared once the loop finishes.
 - The loop terminates when ``data_handler.continue_backtest`` goes False
   and the queue is drained.
+- Both ``universe_manager`` and ``correlation_manager`` are required
+  positional constructor params.
 
 Run from the repo root:  pytest tests/test_backtester.py -v
 """
@@ -31,7 +36,10 @@ from typing import Any, List, Optional
 import pytest
 
 from backtester import Backtester
-from event import BarEvent, Direction, FillEvent, OrderEvent, OrderType
+from event import (
+    BarEvent, CorrelationEvent, Direction, FillEvent, OrderEvent, OrderType,
+    UniverseEvent,
+)
 from logging_setup import clear_current_bar_timestamp
 from logging_setup._context import _current_bar_ts, _format_ts
 
@@ -122,9 +130,49 @@ class RecordingStrategy:
         self._log.append('strategy.update_bar')
 
 
+class RecordingUniverseManager:
+    """Logs update_bar; ``drain_events`` returns one pre-scripted list of
+    ``UniverseEvent``s per call (mirroring ``UniverseManager.drain_events``
+    draining whatever accumulated since the last drain)."""
+
+    def __init__(self, call_log: List[Any],
+                 events_by_call: Optional[List[List[UniverseEvent]]] = None):
+        self._log = call_log
+        self._events_by_call = list(events_by_call or [])
+        self._i = 0
+
+    def update_bar(self, event: BarEvent) -> None:
+        self._log.append('universe.update_bar')
+
+    def drain_events(self) -> List[UniverseEvent]:
+        out = (self._events_by_call[self._i]
+               if self._i < len(self._events_by_call) else [])
+        self._i += 1
+        return list(out)
+
+
+class RecordingCorrelationManager:
+    """Logs update_bar; returns one pre-scripted ``CorrelationEvent`` (or
+    ``None``) per call, mirroring ``CorrelationManager.update_bar``."""
+
+    def __init__(self, call_log: List[Any],
+                 events_by_call: Optional[List[Optional[CorrelationEvent]]] = None):
+        self._log = call_log
+        self._events_by_call = list(events_by_call or [])
+        self._i = 0
+
+    def update_bar(self, event: BarEvent) -> Optional[CorrelationEvent]:
+        self._log.append('correlation.update_bar')
+        out = (self._events_by_call[self._i]
+               if self._i < len(self._events_by_call) else None)
+        self._i += 1
+        return out
+
+
 class RecordingRiskManager:
-    """Logs update_bar. Optionally emits one OrderEvent the first time
-    ``update_bar`` is called (to exercise order routing)."""
+    """Logs update_bar and the two engine-dispatched event handlers.
+    Optionally emits one OrderEvent the first time ``update_bar`` is
+    called (to exercise order routing)."""
 
     def __init__(self, call_log: List[Any], events_queue,
                  emit_order: Optional[OrderEvent] = None):
@@ -137,6 +185,12 @@ class RecordingRiskManager:
         if self._emit_order is not None:
             self._queue.put(self._emit_order)
             self._emit_order = None
+
+    def on_universe_event(self, event: UniverseEvent) -> None:
+        self._log.append(('rm.on_universe_event', event))
+
+    def on_correlation_event(self, event: CorrelationEvent) -> None:
+        self._log.append(('rm.on_correlation_event', event))
 
 
 # ──────────────────────────────────────────────
@@ -179,10 +233,13 @@ def _build(items: List[Any], *, emit_order: Optional[OrderEvent] = None,
     execution = RecordingExecution(call_log, q, emit_fill=emit_fill)
     strategy = RecordingStrategy(call_log)
     risk_manager = RecordingRiskManager(call_log, q, emit_order=emit_order)
+    universe_manager = RecordingUniverseManager(call_log)
+    correlation_manager = RecordingCorrelationManager(call_log)
     bt = Backtester(
         events_queue=q, data_handler=dh, strategy=strategy,
         portfolio=portfolio, risk_manager=risk_manager,
-        execution_handler=execution,
+        execution_handler=execution, universe_manager=universe_manager,
+        correlation_manager=correlation_manager,
     )
     return bt, call_log, portfolio
 
@@ -192,26 +249,30 @@ def _build(items: List[Any], *, emit_order: Optional[OrderEvent] = None,
 # ──────────────────────────────────────────────
 
 def test_bar_consumers_called_in_documented_order():
-    """A single BarEvent drives the four consumers in the exact documented
-    order: portfolio → execution → strategy → risk_manager."""
+    """A single BarEvent drives the six consumers in the exact documented
+    order: portfolio → execution → strategy → universe_manager →
+    correlation_manager → risk_manager."""
     bt, call_log, _ = _build([_bar()])
     bt.run()
     assert call_log == [
         'portfolio.update_bar',
         'execution.update_bar',
         'strategy.update_bar',
+        'universe.update_bar',
+        'correlation.update_bar',
         'risk_manager.update_bar',
     ]
 
 
 def test_order_preserved_across_multiple_bars():
-    """Two bars → the 4-consumer cycle repeats once per bar, in order."""
+    """Two bars → the 6-consumer cycle repeats once per bar, in order."""
     bt, call_log, _ = _build([_bar(ts=datetime(2026, 1, 1)),
                               _bar(ts=datetime(2026, 1, 2))])
     bt.run()
     one_cycle = [
         'portfolio.update_bar', 'execution.update_bar',
-        'strategy.update_bar', 'risk_manager.update_bar',
+        'strategy.update_bar', 'universe.update_bar',
+        'correlation.update_bar', 'risk_manager.update_bar',
     ]
     assert call_log == one_cycle * 2
 
@@ -222,7 +283,7 @@ def test_order_preserved_across_multiple_bars():
 
 def test_order_event_routed_to_execute_order():
     """An OrderEvent emitted by the risk manager is drained in the same
-    inner loop and routed to execution.execute_order — after the four
+    inner loop and routed to execution.execute_order — after the six
     bar-consumers have run."""
     order = _order()
     bt, call_log, _ = _build([_bar()], emit_order=order)
@@ -231,6 +292,8 @@ def test_order_event_routed_to_execute_order():
         'portfolio.update_bar',
         'execution.update_bar',
         'strategy.update_bar',
+        'universe.update_bar',
+        'correlation.update_bar',
         'risk_manager.update_bar',
         ('execution.execute_order', order),
     ]
@@ -247,6 +310,8 @@ def test_fill_event_routed_to_update_fill():
         'portfolio.update_bar',
         'execution.update_bar',
         'strategy.update_bar',
+        'universe.update_bar',
+        'correlation.update_bar',
         'risk_manager.update_bar',
         ('execution.execute_order', order),
         ('portfolio.update_fill', fill),
@@ -291,3 +356,64 @@ def test_empty_stream_processes_nothing_and_terminates():
     bt, call_log, _ = _build([])
     bt.run()
     assert call_log == []
+
+
+# ──────────────────────────────────────────────
+# Inline UniverseEvent / CorrelationEvent dispatch
+# ──────────────────────────────────────────────
+
+def test_bar_chain_order_with_inline_dispatch():
+    """UniverseEvents drain BEFORE the correlation event, and both land
+    BEFORE risk_manager.update_bar — so sizing always sees fresh universe
+    state and fresh weights, never a stale copy from the prior bar."""
+    log = []
+    q = thread_queue.Queue()
+    bar = BarEvent(symbol='A', timestamp=DEFAULT_TS, open=1, high=1, low=1,
+                   close=1, volume=1)
+    u_evt = UniverseEvent(timestamp=DEFAULT_TS, symbol='A', live=True,
+                          excluded=False, reasons=[], prev_live=False,
+                          prev_reasons=['warmup_history'],
+                          trigger='bar_refresh')
+    c_evt = CorrelationEvent(timestamp=DEFAULT_TS, matrix=None,
+                             live_symbols=['A'], reason='singleton')
+    dh = RecordingDataHandler(q, [bar])
+    bt = Backtester(q, dh, RecordingStrategy(log), RecordingPortfolio(log),
+                    RecordingRiskManager(log, q), RecordingExecution(log, q),
+                    RecordingUniverseManager(log, events_by_call=[[u_evt]]),
+                    RecordingCorrelationManager(log, events_by_call=[c_evt]))
+    bt.run()
+    names = [c if isinstance(c, str) else c[0] for c in log]
+    assert names == [
+        'portfolio.update_bar', 'execution.update_bar', 'strategy.update_bar',
+        'universe.update_bar', 'correlation.update_bar',
+        'rm.on_universe_event',        # universe events BEFORE correlation
+        'rm.on_correlation_event',     # correlation BEFORE sizing
+        'risk_manager.update_bar',     # sizing sees fresh weights
+    ]
+
+
+def test_no_corr_event_skips_dispatch():
+    """No pre-scripted UniverseEvents/CorrelationEvent → neither handler
+    fires; the RM sees only its own update_bar."""
+    log = []
+    q = thread_queue.Queue()
+    bar = BarEvent(symbol='A', timestamp=DEFAULT_TS, open=1, high=1, low=1,
+                   close=1, volume=1)
+    dh = RecordingDataHandler(q, [bar])
+    bt = Backtester(q, dh, RecordingStrategy(log), RecordingPortfolio(log),
+                    RecordingRiskManager(log, q), RecordingExecution(log, q),
+                    RecordingUniverseManager(log),
+                    RecordingCorrelationManager(log))
+    bt.run()
+    names = [c if isinstance(c, str) else c[0] for c in log]
+    assert 'rm.on_correlation_event' not in names
+    assert 'rm.on_universe_event' not in names
+
+
+def test_universe_and_correlation_params_are_required():
+    """``universe_manager`` and ``correlation_manager`` are required
+    positional params — omitting them raises TypeError, not a silent
+    None-default that would blow up later inside the loop."""
+    with pytest.raises(TypeError):
+        Backtester(thread_queue.Queue(), object(), object(), object(),
+                   object(), object())

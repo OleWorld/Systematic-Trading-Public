@@ -16,7 +16,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -174,16 +174,15 @@ class _FakeOrchestrator:
 
 class _FakeRiskManager:
     """Duck-typed VolTargetingRiskManager double: None-bearing object
-    columns exactly as the real per-bar rows carry them."""
+    columns exactly as the real per-bar rows carry them. No
+    ``get_live_symbols`` — liveness now lives on ``UniverseManager``, not
+    the risk manager."""
 
     def __init__(self, carver: bool = True, empty: bool = False):
         self._empty = empty
         if carver:
             self.idm = 1.5
             self.instrument_weight = {'AAA': 0.5, 'BBB': 0.5}
-
-    def get_live_symbols(self) -> List[str]:
-        return list(SYMBOLS)
 
     def get_records(self, symbol: str) -> pd.DataFrame:
         if self._empty:
@@ -248,16 +247,16 @@ def test_save_creates_layout_and_manifest(tmp_path):
     assert not record.path.name.endswith('.tmp')
 
     m = record.manifest
-    assert m['schema_version'] == 2
+    assert m['schema_version'] == 3
     assert m['run']['label'] == 'unit run'              # original, unslugged
     assert m['run']['notes'] == 'hello'
     assert m['run']['extra'] == {'seed': 42}
     assert m['counts'] == {'n_symbols': 2, 'n_trades': 2, 'n_orders': 1,
-                           'n_equity_rows': 6}
+                           'n_equity_rows': 6, 'n_universe_transitions': 0}
     assert m['portfolio']['initial_capital'] == 1000.0
     assert m['portfolio']['positions'] == {'AAA': 2.0, 'BBB': -2.0}
     assert m['risk_manager']['idm'] == 1.5
-    assert m['risk_manager']['live_symbols'] == SYMBOLS
+    assert 'live_symbols' not in m['risk_manager']       # RM no longer owns liveness
     assert m['system']['kind'] == 'strategy'
     assert m['system']['children']['_FakeStrategy']['weights'] == {'v1': 1.0}
     assert m['config']['days_convention'] == 'calendar'
@@ -342,6 +341,77 @@ def test_riskmanager_records_none_columns(tmp_path):
     assert one['skip_reason'].iloc[0] == 'warmup_volatility'
     assert pd.isna(one['skip_reason'].iloc[1])
     assert bool(one['submitted'].iloc[1]) is True
+
+
+# ──────────────────────────────────────────────
+# Universe transition log (schema v3)
+# ──────────────────────────────────────────────
+
+class StubUniverseManager:
+    """Duck-typed ``universe.UniverseManager`` double: a pre-built
+    transition log, exactly the ``get_transition_log()`` surface
+    ``save_run`` reads."""
+
+    def __init__(self, rows: List[Dict[str, Any]]):
+        self._rows = rows
+
+    def get_transition_log(self) -> pd.DataFrame:
+        return pd.DataFrame(self._rows)
+
+
+def test_universe_transition_log_round_trips(tmp_path):
+    um = StubUniverseManager([
+        {'timestamp': pd.Timestamp('2024-01-01', tz='UTC'), 'symbol': 'A',
+         'live': False, 'excluded': False,
+         'reasons': 'warmup_forecast,warmup_history', 'trigger': 'initial'},
+        {'timestamp': pd.Timestamp('2024-02-01', tz='UTC'), 'symbol': 'A',
+         'live': True, 'excluded': False, 'reasons': '',
+         'trigger': 'bar_refresh'},
+    ])
+    record = _save_fake_run(tmp_path, universe_manager=um)
+    df = record.universe_transitions()
+    assert list(df['trigger']) == ['initial', 'bar_refresh']
+    assert list(df['symbol']) == ['A', 'A']
+    assert df['live'].tolist() == [False, True]
+    assert record.manifest['schema_version'] == 3
+    assert 'universe.parquet' not in record.manifest['empty_tables']
+    assert record.manifest['counts']['n_universe_transitions'] == 2
+
+
+def test_universe_absent_yields_empty_table(tmp_path):
+    """No ``universe_manager`` passed -> ``universe.parquet`` is recorded
+    empty, never missing. All-empty fakes (as ``test_empty_run_saves_cleanly``
+    uses below) keep this test parquet-free: every ``_write_table`` call
+    sees an empty frame and short-circuits before ``to_parquet``, so this
+    test actually PASSES (not just fails environmentally) even with the
+    parquet engine blocked — real evidence for the ``universe_manager=None``
+    branch, not just code-reading."""
+    record = _save_fake_run(
+        tmp_path,
+        portfolio=_FakePortfolio(empty=True),
+        strategy=_FakeStrategy(empty=True),
+        risk_manager=_FakeRiskManager(empty=True),
+    )
+    assert record.universe_transitions().empty
+    assert 'universe.parquet' in record.manifest['empty_tables']
+    assert record.manifest['counts']['n_universe_transitions'] == 0
+
+
+def test_universe_empty_transition_log_yields_empty_table(tmp_path):
+    """A UniverseManager that has logged nothing yet (e.g. saved before any
+    bar streamed) still round-trips to an empty table, not a missing one.
+    All-empty fakes keep this one parquet-free too (see the sibling test's
+    docstring)."""
+    record = _save_fake_run(
+        tmp_path,
+        portfolio=_FakePortfolio(empty=True),
+        strategy=_FakeStrategy(empty=True),
+        risk_manager=_FakeRiskManager(empty=True),
+        universe_manager=StubUniverseManager([]),
+    )
+    assert record.universe_transitions().empty
+    assert 'universe.parquet' in record.manifest['empty_tables']
+    assert record.manifest['counts']['n_universe_transitions'] == 0
 
 
 def test_strategy_records_round_trip(tmp_path):
@@ -539,11 +609,13 @@ def test_integration_real_mini_backtest(tmp_path):
 
     from backtester import Backtester
     from config import BacktestConfig, uniform_registry
+    from correlation import CorrelationManager
     from data import HistoricDataHandler
     from execution import BacktestExecution
     from portfolio import BacktestPortfolio
     from riskmanager import SimpleRiskManager
     from strategy import EWMACStrategy
+    from universe import UniverseManager
 
     rng = np.random.default_rng(7)
     idx = pd.date_range('2026-01-01', periods=60, freq='D', tz='UTC')
@@ -582,13 +654,24 @@ def test_integration_real_mini_backtest(tmp_path):
         position_size=config.position_size, instruments=instruments,
     )
     execution = BacktestExecution(events_queue, instruments=instruments)
+    # SimpleRiskManager doesn't consume universe/correlation state; these
+    # two REQUIRED Backtester args are just structurally wired here.
+    # lookback=32 is the smallest CorrelationManager accepts, and
+    # min_history_bars must be >= it (the drift guard).
+    universe_manager = UniverseManager(strategy, data_handler,
+                                       min_history_bars=32,
+                                       history_timeframe='1d')
+    correlation_manager = CorrelationManager(data_handler, universe_manager,
+                                             lookback=32, step_size=0,
+                                             timeframe='1d')
     Backtester(events_queue, data_handler, strategy, portfolio,
-               risk_manager, execution).run()
+               risk_manager, execution, universe_manager,
+               correlation_manager).run()
 
     record = save_run(
         portfolio=portfolio, strategy=strategy, risk_manager=risk_manager,
         config=config, instruments=instruments, root=tmp_path,
-        label='mini',
+        label='mini', universe_manager=universe_manager,
     )
 
     # Counts reconcile with the live objects.

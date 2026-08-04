@@ -23,11 +23,13 @@ logging.getLogger('validation._sweep').setLevel(logging.INFO)
 
 from backtester import Backtester
 from config import uniform_registry
+from correlation import CorrelationManager
 from data import HistoricDataHandler
 from execution import BacktestExecution, CommissionModel, SlippageModel
 from portfolio import BacktestPortfolio, PortfolioMarginModel
 from riskmanager import VolTargetingRiskManager
 from strategy import EWMACStrategy
+from universe import UniverseManager
 from validation import (bootstrap_stats, deflated_sharpe, load_sweep,
                         param_sweep, periodic_stats, walk_forward)
 from volatility import EWMAVolEstimator, bars_per_year
@@ -79,13 +81,23 @@ def make_run(fast, slow):
     vol = EWMAVolEstimator(SYMBOLS, data_handler=data_handler,
                            bars_per_year=bars_per_year('1d', 'calendar'),
                            timeframe='1d', span=36)
+    # Fresh universe/correlation managers per cell, same as every other
+    # stateful module the factory contract requires (param_sweep re-runs
+    # this factory once per grid cell).
+    universe_manager = UniverseManager(
+        strategy, data_handler, min_history_bars=60, history_timeframe='1d')
+    correlation_manager = CorrelationManager(
+        data_handler, universe_manager,
+        lookback=60, step_size=30, timeframe='1d',
+        mode='absolute_price_chg', floor=None, shrinkage='ledoit_wolf')
     risk_manager = VolTargetingRiskManager(
-        portfolio, strategy, vol, data_handler=data_handler,
+        portfolio, strategy, vol, universe_manager=universe_manager,
         instruments=INSTRUMENTS, annual_target_vol=1_000_000,
-        instrument_weight_mode='equal_weight', corr_lookback=60)
+        instrument_weight_mode='equal_weight')
     execution = BacktestExecution(events_queue, instruments=INSTRUMENTS)
     Backtester(events_queue, data_handler, strategy, portfolio,
-               risk_manager, execution).run()
+               risk_manager, execution, universe_manager,
+               correlation_manager).run()
     return portfolio
 
 
