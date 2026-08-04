@@ -31,16 +31,26 @@ import pytest
 
 from backtester import Backtester
 from config import uniform_registry
+from correlation import CorrelationManager
 from data import HistoricDataHandler
 from event import BarEvent
 from execution import BacktestExecution, CommissionModel, SlippageModel
 from portfolio import BacktestPortfolio, PortfolioMarginModel
 from riskmanager import VolTargetingRiskManager
 from strategy import Strategy
+from universe import UniverseManager
 from volatility import VolEstimator
 
 
 SYM = 'X'
+
+# Universe/correlation cadence mirroring the old inline RM defaults this
+# suite pinned (corr_lookback=32, corr_step_size=5, corr_timeframe='1d'):
+# the symbol goes live once 32 bars have streamed, and the single-symbol
+# universe earns a weight of 1.0 (the 'singleton' CorrelationEvent reason)
+# at the next 5-bar cadence boundary on or after that.
+_MIN_HISTORY_BARS = 32
+_CORR_STEP_SIZE = 5
 
 
 class ConstLongStrategy(Strategy):
@@ -94,15 +104,23 @@ def _run_engine(closes, *, capital: float, vol: StubVol,
     strategy = ConstLongStrategy(dh, [SYM])
     portfolio = BacktestPortfolio(events, dh, [SYM], instruments,
                                   initial_capital=capital)
+    universe_manager = UniverseManager(
+        strategy, dh, min_history_bars=_MIN_HISTORY_BARS,
+        history_timeframe='1d',
+    )
+    correlation_manager = CorrelationManager(
+        dh, universe_manager, lookback=_MIN_HISTORY_BARS,
+        step_size=_CORR_STEP_SIZE, timeframe='1d',
+    )
     rm = VolTargetingRiskManager(
-        portfolio, strategy, vol, data_handler=dh, instruments=instruments,
+        portfolio, strategy, vol, universe_manager, instruments=instruments,
         annual_target_vol=annual_target_vol,
         vol_target_mode='dollar_volatility',
         position_buffer=0.25, instrument_weight_mode='equal_weight',
-        corr_lookback=32, corr_step_size=5, corr_timeframe='1d',
     )
     execution = BacktestExecution(events, instruments)
-    Backtester(events, dh, strategy, portfolio, rm, execution).run()
+    Backtester(events, dh, strategy, portfolio, rm, execution,
+              universe_manager, correlation_manager).run()
     return portfolio, rm, idx
 
 

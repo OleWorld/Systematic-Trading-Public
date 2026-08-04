@@ -606,11 +606,13 @@ def test_integration_real_mini_backtest(tmp_path):
 
     from backtester import Backtester
     from config import BacktestConfig, uniform_registry
+    from correlation import CorrelationManager
     from data import HistoricDataHandler
     from execution import BacktestExecution
     from portfolio import BacktestPortfolio
     from riskmanager import SimpleRiskManager
     from strategy import EWMACStrategy
+    from universe import UniverseManager
 
     rng = np.random.default_rng(7)
     idx = pd.date_range('2026-01-01', periods=60, freq='D', tz='UTC')
@@ -649,13 +651,24 @@ def test_integration_real_mini_backtest(tmp_path):
         position_size=config.position_size, instruments=instruments,
     )
     execution = BacktestExecution(events_queue, instruments=instruments)
+    # SimpleRiskManager doesn't consume universe/correlation state; these
+    # two REQUIRED Backtester args are just structurally wired here.
+    # lookback=32 is the smallest CorrelationManager accepts, and
+    # min_history_bars must be >= it (the drift guard).
+    universe_manager = UniverseManager(strategy, data_handler,
+                                       min_history_bars=32,
+                                       history_timeframe='1d')
+    correlation_manager = CorrelationManager(data_handler, universe_manager,
+                                             lookback=32, step_size=0,
+                                             timeframe='1d')
     Backtester(events_queue, data_handler, strategy, portfolio,
-               risk_manager, execution).run()
+               risk_manager, execution, universe_manager,
+               correlation_manager).run()
 
     record = save_run(
         portfolio=portfolio, strategy=strategy, risk_manager=risk_manager,
         config=config, instruments=instruments, root=tmp_path,
-        label='mini',
+        label='mini', universe_manager=universe_manager,
     )
 
     # Counts reconcile with the live objects.
