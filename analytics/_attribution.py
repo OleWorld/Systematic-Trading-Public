@@ -37,9 +37,10 @@ deliberately not attributed.
 Timing assumptions
 ------------------
 The one-bar share lag matches the engine's fill timing (orders fill on
-the signal bar's close). Slippage on a fill lands at *t* or *t+1*
-depending on same-timestamp symbol processing order (a one-bar smear;
-totals are unaffected because a cumulative series is diffed).
+the signal bar's close). Fill effects are recorded under the fill's own
+timestamp (``BacktestPortfolio.update_fill`` re-syncs the equity row and
+per-symbol snapshot), so a fill's slippage lands at *t* regardless of
+same-timestamp symbol processing order.
 """
 
 from __future__ import annotations
