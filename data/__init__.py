@@ -26,7 +26,6 @@ from data._ohlcv import resample
 from data._timeframe import (
     get_period_start,
     parse_timeframe_to_seconds,
-    TIMEFRAME_FALLBACK_ORDER,
 )
 from data._tz import ensure_utc_index, ensure_utc_series, ensure_utc_timestamp
 
@@ -38,7 +37,6 @@ __all__ = [
     "resample",
     "get_period_start",
     "parse_timeframe_to_seconds",
-    "TIMEFRAME_FALLBACK_ORDER",
     "ensure_utc_index",
     "ensure_utc_series",
     "ensure_utc_timestamp",

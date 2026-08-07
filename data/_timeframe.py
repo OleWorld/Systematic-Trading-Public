@@ -2,10 +2,6 @@ import datetime
 from typing import Tuple
 
 
-# Preferred order for finding source data to resample from (most granular first)
-TIMEFRAME_FALLBACK_ORDER = ['1m', '5m', '15m', '30m', '1h', '4h', '1d']
-
-
 def _ms_to_utc(ms: float) -> datetime.datetime:
     """Convert millisecond timestamp to UTC datetime."""
     return datetime.datetime.fromtimestamp(ms / 1000.0, datetime.timezone.utc)
@@ -15,7 +11,7 @@ def _ms_to_utc(ms: float) -> datetime.datetime:
 # uppercase 'M' is months; 'Y' (yearly) has no lowercase counterpart.
 # The second-values for 'M' and 'Y' are approximations (30d, 365d) —
 # months and years have no fixed duration, so these are used ONLY for
-# ordering/comparison (fallback lookup, HTF-vs-base checks). Period
+# ordering/comparison (HTF-vs-base checks). Period
 # boundaries for monthly/yearly are computed in ``get_period_start``
 # from the timeframe string, not from seconds.
 _UNITS_SECONDS = {
@@ -96,7 +92,7 @@ def get_period_start(ts: datetime.datetime, timeframe: str) -> datetime.datetime
 
     Supported timeframes:
       * Sub-daily (e.g. ``'1m'``, ``'4h'``): aligned to midnight UTC each day
-        (matching ``_resample_ohlcv`` behaviour).
+        (matching ``resample`` behaviour).
       * Daily (``'1d'``): truncated to midnight UTC.
       * Weekly (``'1w'``): aligned to Monday 00:00 UTC of the ISO week
         containing ``ts`` (open-time convention).
