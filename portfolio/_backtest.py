@@ -175,9 +175,10 @@ class BacktestPortfolio(Portfolio):
     def update_bar(self, event: BarEvent) -> None:
         """
         Refresh per-symbol margin and account snapshots from the new bar,
-        append the lightweight per-event equity row, update the per-timestamp
-        per-symbol snapshot, then run a solvency check (which may cancel
-        pending orders and submit liquidation orders if account_balance < 0).
+        run the solvency check (which may cancel pending orders and submit
+        liquidation orders), THEN append the lightweight per-event equity
+        row and per-timestamp snapshot — so a margin-call bar's row
+        reflects post-enforcement state.
 
         OHLC fields are guaranteed non-NaN by the ``DataHandler`` gate;
         no defensive check is needed here.
@@ -197,16 +198,22 @@ class BacktestPortfolio(Portfolio):
         self._update_symbol_unrealized(event.symbol)
         self._refresh_balances()
 
+        # Solvency FIRST, then record: the margin-call cancel pass
+        # releases reserved margin (available_balance changes), so
+        # appending the row before enforcement left a margin-call bar's
+        # row one event stale. Positions cannot change inside enforcement
+        # (liquidations rest via fill_on_next_bar) and prices don't move,
+        # so maintenance_margin computed here stays valid for the row.
+        maintenance_margin = self._maintenance_margin()
+        self._enforce_solvency(event.timestamp,
+                               maintenance_margin=maintenance_margin)
+
         prior_balance = (
             self.equity_curve[-1]['account_balance']
             if self.equity_curve
             else self.initial_capital
         )
         simple_return, log_return = self._period_returns(prior_balance)
-
-        # Computed once per event, shared by the equity row and the
-        # solvency trigger below (no state mutates in between).
-        maintenance_margin = self._maintenance_margin()
 
         # Lightweight per-event row: account-level scalars only.
         self.equity_curve.append({
@@ -231,11 +238,6 @@ class BacktestPortfolio(Portfolio):
             'realized_pnl': dict(self.realized_pnl),
             'margin_requirements': dict(self.margin_requirements),
         }
-
-        # Caches are fresh (refreshed above) — skip the public wrapper's
-        # redundant full refresh and reuse the maintenance margin.
-        self._enforce_solvency(event.timestamp,
-                               maintenance_margin=maintenance_margin)
 
     # ── Order submission ──────────────────────
 

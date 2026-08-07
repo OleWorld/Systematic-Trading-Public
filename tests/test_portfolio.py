@@ -695,6 +695,27 @@ def test_fill_triggered_margin_call_state_lands_in_current_row(caplog):
     assert row['cash'] == pytest.approx(-50.0)
 
 
+def test_bar_triggered_margin_call_row_reflects_cancel_pass(caplog):
+    """F4 (bar path) repro: update_bar used to append the row BEFORE
+    _enforce_solvency, so a margin-call bar's row carried the PRE-cancel
+    reserved margin in available_balance. The row must match the
+    post-enforcement state."""
+    pf, _, _ = _new_portfolio(capital=200.0, leverage=10.0,
+                              maintenance_margin_rate=0.05,
+                              prices={'BTC': 100.0})
+    pf.update_fill(_fill(qty=10.0, fill_price=100.0))    # long 10 @ 100
+    order = pf.submit_order('BTC', 2.0, Direction.BUY, DEFAULT_TS,
+                            OrderType.MKT)               # reserves margin
+    assert order is not None
+    with caplog.at_level(logging.WARNING):
+        pf.update_bar(_bar(close=80.0))   # balance 0 < maintenance 40
+    assert any('MARGIN CALL' in r.message for r in caplog.records)
+    assert order.order_id not in pf.pending_orders       # cancel pass ran
+    row = pf.equity_curve[-1]
+    assert row['available_balance'] == pytest.approx(pf.available_balance)
+    assert row['account_balance'] == pytest.approx(pf.account_balance)
+
+
 def test_update_fill_appends_trade_log_row():
     pf, _, _ = _new_portfolio(capital=10_000.0)
     pf.update_fill(_fill(qty=2.0, direction=Direction.BUY, fill_price=100.0,
