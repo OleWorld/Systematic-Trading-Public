@@ -287,3 +287,42 @@ def test_margin_call_bar_reopen_scaled_no_phantom_churn():
     assert not (trades['timestamp'] > next_ts).any()
     assert pf.positions[SYM] == pytest.approx(scaled_reopen)
     assert pf.calculate_balance() == pytest.approx(20.0)
+
+
+def test_equity_curve_commission_matches_trade_log_per_timestamp():
+    """F5 repro: cumulative commission in the curve must match the trade
+    log AT each fill's own timestamp. Single-symbol run ⇒ every fill used
+    to surface one row late (except the last bar's, which finalize()
+    patched)."""
+    closes = [100.0] * 45
+    pf, _, _ = _run_engine(
+        closes, capital=1_000_000.0,
+        vol=StubVol(base=10.0, spiked=25.0, crash_bar=41),
+        commission=1.0,
+    )
+    trades = pf.get_trade_log()
+    assert len(trades) >= 2                    # entry + mid-run vol resize
+    eq = pf.get_equity_curve().groupby(level=0).last()
+    cum = trades.groupby('timestamp')['commission'].sum().cumsum()
+    for ts, expected in cum.items():
+        assert eq.loc[ts, 'total_commission'] == pytest.approx(expected), ts
+
+
+def test_deferred_liquidation_fill_lands_in_its_own_bar_row():
+    """F3 repro: a margin-call liquidation defers via fill_on_next_bar and
+    fills at the NEXT bar's open — yet its effects used to be recorded one
+    row later still. The row at each fill's own timestamp must carry the
+    cumulative commission and the post-fill position snapshot."""
+    closes = [100.0] * 40 + [51.0] * 5
+    pf, _, idx = _run_engine(closes, capital=510.0, vol=StubVol(base=10.0),
+                             commission=0.1)
+    trades = pf.get_trade_log()
+    liq_ts = idx[41]                           # liquidation fill bar (open)
+    assert (trades['timestamp'] == liq_ts).any(), trades
+    eq = pf.get_equity_curve().groupby(level=0).last()
+    for ts in trades['timestamp'].unique():
+        prior = trades[trades['timestamp'] <= ts]
+        assert eq.loc[ts, 'total_commission'] == pytest.approx(
+            prior['commission'].sum()), ts
+        assert eq.loc[ts, 'positions'][SYM] == pytest.approx(
+            prior['position_after'].iloc[-1]), ts

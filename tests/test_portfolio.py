@@ -15,6 +15,7 @@ also driving the exchange simulator.
 Run from the repo root:  pytest tests/test_portfolio.py -v
 """
 
+import logging
 import math
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -587,6 +588,111 @@ def test_total_commission_accumulates_across_fills():
     pf.update_fill(_fill(qty=1.0, direction=Direction.SELL, fill_price=110.0, commission=0.75))
     pf.update_fill(_fill(qty=2.0, direction=Direction.SELL, fill_price=105.0, commission=1.25))
     assert math.isclose(pf.total_commission, 2.5)
+
+
+# ──────────────────────────────────────────────
+# Fill-synchronous equity recording (2026-08 off-by-one audit)
+# ──────────────────────────────────────────────
+
+def test_update_fill_resyncs_same_timestamp_equity_row():
+    """F1 repro: the equity row for a bar is appended BEFORE that bar's
+    fill books (portfolio runs first in the engine's bar chain; fills
+    drain later from the queue). update_fill must re-sync the row so the
+    fill's commission/cash/balance land under the fill's own timestamp,
+    not the next bar's."""
+    pf, _, _ = _new_portfolio(prices={'BTC': 100.0})
+    pf.update_bar(_bar(close=100.0))                     # row @ T, pre-fill
+    pf.update_fill(_fill(qty=10.0, fill_price=100.0, commission=7.0))
+    row = pf.equity_curve[-1]
+    assert row['timestamp'] == DEFAULT_TS
+    assert row['total_commission'] == pytest.approx(7.0)
+    assert row['cash'] == pytest.approx(pf.cash)
+    assert row['account_balance'] == pytest.approx(pf.account_balance)
+    assert row['available_balance'] == pytest.approx(pf.available_balance)
+    assert row['position_margin'] == pytest.approx(pf._position_margin())
+
+
+def test_update_fill_resyncs_pnl_snapshot_for_last_symbol_at_timestamp():
+    """F2 repro: the per-timestamp snapshot is written at update_bar time,
+    so the LAST symbol's fill at a timestamp used to surface only in the
+    NEXT timestamp's snapshot. After the fix the snapshot at T carries
+    every fill at T, including the last symbol's."""
+    pf, _, _ = _new_portfolio(symbols=('A', 'B'),
+                              prices={'A': 100.0, 'B': 50.0})
+    pf.update_bar(_bar('A', close=100.0))
+    pf.update_fill(_fill(symbol='A', qty=2.0, fill_price=100.0))
+    pf.update_bar(_bar('B', close=50.0))
+    pf.update_fill(_fill(symbol='B', qty=4.0, fill_price=50.0))
+    eq = pf.get_equity_curve()
+    snap_positions = eq['positions'].iloc[-1]
+    assert snap_positions['A'] == pytest.approx(2.0)
+    assert snap_positions['B'] == pytest.approx(4.0)     # pre-fix: 0.0
+    snap_realized = eq['realized_pnl'].iloc[-1]
+    assert snap_realized['B'] == pytest.approx(0.0)      # open, no realize
+
+
+def test_update_fill_without_prior_bar_row_books_state_without_curve_row():
+    """Guard: direct update_fill calls (tests/research) with an empty
+    curve must book state normally and invent no phantom equity row."""
+    pf, _, _ = _new_portfolio(prices={'BTC': 100.0})
+    pf.update_fill(_fill(qty=1.0, fill_price=100.0))
+    assert pf.positions['BTC'] == pytest.approx(1.0)
+    assert pf.equity_curve == []
+
+
+def test_update_fill_with_newer_timestamp_leaves_older_row_untouched(caplog):
+    """Guard: a fill whose timestamp postdates the last row (possible only
+    via direct calls outside the engine flow, where fill ts == last row ts
+    structurally) must NOT rewrite a past-labeled row with future state —
+    and must WARN, because inside an engine run this mismatch would mean
+    the recording invariant broke."""
+    pf, _, _ = _new_portfolio(prices={'BTC': 100.0})
+    pf.update_bar(_bar(close=100.0))
+    before = dict(pf.equity_curve[-1])
+    later = DEFAULT_TS + timedelta(hours=1)
+    with caplog.at_level(logging.WARNING):
+        pf.update_fill(_fill(qty=1.0, fill_price=100.0, commission=3.0,
+                             ts=later))
+    assert pf.equity_curve[-1] == before
+    assert pf.total_commission == pytest.approx(3.0)     # state still booked
+    assert any('ROW-SYNC SKIPPED' in r.message for r in caplog.records)
+
+
+def test_finalize_is_noop_after_fill_synced_row():
+    """finalize() is demoted to an end-of-run safety net: after update_fill
+    has re-synced the row, finalize must change nothing (pre-fix it was
+    the ONLY reconciliation, so it changed the row — that asymmetry is
+    the bug)."""
+    pf, _, _ = _new_portfolio(prices={'BTC': 100.0})
+    pf.update_bar(_bar(close=100.0))
+    pf.update_fill(_fill(qty=10.0, fill_price=100.0, commission=7.0))
+    before = dict(pf.equity_curve[-1])
+    snap_before = {k: dict(v)
+                   for k, v in pf._pnl_snapshots[DEFAULT_TS].items()}
+    pf.finalize()
+    after = dict(pf.equity_curve[-1])
+    assert after.pop('timestamp') == before.pop('timestamp')
+    assert after.pop('symbol') == before.pop('symbol')
+    assert after == pytest.approx(before)
+    assert pf._pnl_snapshots[DEFAULT_TS] == snap_before
+
+
+def test_fill_triggered_margin_call_state_lands_in_current_row(caplog):
+    """F4 (fill path) repro: a fill that drives balance below the floor
+    fires the margin call inside update_fill; the row for the fill's bar
+    must show the post-enforcement state (previously nothing was recorded
+    until the next bar event)."""
+    pf, _, _ = _new_portfolio(capital=100.0, leverage=10.0,
+                              prices={'BTC': 100.0})
+    pf.update_fill(_fill(qty=10.0, fill_price=100.0))    # long 10 @ 100
+    pf.update_bar(_bar(close=92.0))                      # row @ T: bal 20
+    with caplog.at_level(logging.WARNING):
+        pf.update_fill(_fill(qty=10.0, fill_price=85.0,
+                             direction=Direction.SELL))  # realizes -150
+    assert any('MARGIN CALL' in r.message for r in caplog.records)
+    row = pf.equity_curve[-1]
+    assert row['account_balance'] == pytest.approx(-50.0)
+    assert row['cash'] == pytest.approx(-50.0)
 
 
 def test_update_fill_appends_trade_log_row():

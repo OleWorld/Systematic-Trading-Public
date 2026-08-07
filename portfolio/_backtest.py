@@ -361,6 +361,10 @@ class BacktestPortfolio(Portfolio):
         the order (releasing its reserved margin), but the simulated
         exchange's book / the events queue may still deliver the fill —
         booking it would resurrect an order the account no longer backs.
+
+        After applying the fill (and the solvency check), the last equity
+        row and its timestamp's snapshot are re-synced when they belong to
+        this fill's timestamp — see _sync_last_equity_row.
         """
         if (event.order_id is not None
                 and event.order_id in self._cancelled_order_ids):
@@ -419,6 +423,31 @@ class BacktestPortfolio(Portfolio):
         self._update_symbol_unrealized(symbol)
         self._refresh_balances()
         self._enforce_solvency(event.timestamp)
+
+        # Fill-synchronous recording: the equity row for this fill's bar
+        # was appended BEFORE the fill booked (portfolio.update_bar runs
+        # first in the engine's bar chain; fills drain later from the
+        # queue), so without a re-sync the fill's cash/commission/position
+        # effects would surface under the NEXT row's timestamp. The last
+        # row is structurally this fill's bar in every engine flow
+        # (same-bar close fills book before the next bar streams; deferred
+        # fills book right after their own symbol's bar chain) — the
+        # timestamp guard covers direct calls outside the engine flow,
+        # where rewriting a past-labeled row with future state would be
+        # wrong. Runs AFTER _enforce_solvency so a fill-triggered margin
+        # call's cancel pass is captured in the row too.
+        if (self.equity_curve
+                and self.equity_curve[-1]['timestamp'] == event.timestamp):
+            self._sync_last_equity_row()
+        elif self.equity_curve:
+            logger.warning(
+                "[ROW-SYNC SKIPPED] fill at %s but last equity row is at "
+                "%s — row left as-is. Unreachable in engine flows (the "
+                "portfolio appends its row before any fill for that bar "
+                "can exist): either a direct out-of-flow call, or the "
+                "recording invariant broke.",
+                event.timestamp, self.equity_curve[-1]['timestamp'],
+            )
 
     def _apply_fill_to_position(self, symbol: str, qty: float, direction: Direction,
                                 fill_price: float, fill_notional: float
@@ -806,22 +835,19 @@ class BacktestPortfolio(Portfolio):
             return simple_return, log_return
         return float('nan'), float('nan')
 
-    def finalize(self) -> None:
-        """Reconcile the final equity row with end-of-run portfolio state.
+    def _sync_last_equity_row(self) -> None:
+        """Overwrite the LAST equity row's scalars and its timestamp's
+        per-symbol snapshot from current account state (returns recomputed
+        against the same prior-row baseline via ``_period_returns``).
 
-        Fills for the last bar's orders book AFTER that bar's equity row
-        was appended (the engine drains Bar → Order → Fill), so without
-        this hook the curve's final row — and every stat derived from it —
-        permanently misses the run's last realized PnL, slippage, and
-        commission. Called once by ``Backtester.run()`` after the event
-        loop drains: refreshes the account snapshot, overwrites the LAST
-        equity row's scalars (returns recomputed against the same
-        prior-row baseline), and rewrites the final timestamp's per-symbol
-        snapshot. No-op when no bars were processed.
+        Shared by ``update_fill`` (fill-synchronous recording: the row for
+        a bar is appended before that bar's fills book, so each booked
+        fill re-syncs it) and ``finalize`` (end-of-run safety net).
+        Assumes FRESH caches — callers refresh incrementally or fully
+        first. No-op on an empty curve.
         """
         if not self.equity_curve:
             return
-        self._refresh_snapshot()
         last = self.equity_curve[-1]
         prior_balance = (
             self.equity_curve[-2]['account_balance']
@@ -845,6 +871,23 @@ class BacktestPortfolio(Portfolio):
             'realized_pnl': dict(self.realized_pnl),
             'margin_requirements': dict(self.margin_requirements),
         }
+
+    def finalize(self) -> None:
+        """Reconcile the final equity row with end-of-run portfolio state.
+
+        End-of-run SAFETY NET: ``update_fill`` re-syncs the last equity
+        row per fill (fill-synchronous recording), so in a normal engine
+        run this is a no-op. It remains to self-heal direct state
+        mutation (tests, research hooks) and any future fill path that
+        bypasses ``update_fill``. Called once by ``Backtester.run()``
+        after the event loop drains: full cache refresh, then rewrite the
+        LAST equity row + final-timestamp per-symbol snapshot. No-op when
+        no bars were processed.
+        """
+        if not self.equity_curve:
+            return
+        self._refresh_snapshot()
+        self._sync_last_equity_row()
 
     def _cancel_pending_non_liquidation(self) -> None:
         """Cancel every pending order that isn't a liquidation order, FIFO.
