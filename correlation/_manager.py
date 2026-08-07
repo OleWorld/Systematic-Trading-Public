@@ -60,7 +60,12 @@ class _UniverseManagerLike(Protocol):
 
     min_history_bars: int
     history_timeframe: str
-    symbol_list: List[str]
+
+    # Read-only property, not a mutable attribute: UniverseManager
+    # implements symbol_list as a @property, which cannot satisfy a plain
+    # (invariant, settable) protocol attribute under structural typing.
+    @property
+    def symbol_list(self) -> List[str]: ...
 
     def reassess_all(self) -> None: ...
 
