@@ -308,14 +308,16 @@ def test_equity_curve_commission_matches_trade_log_per_timestamp():
         assert eq.loc[ts, 'total_commission'] == pytest.approx(expected), ts
 
 
-def test_deferred_liquidation_fill_lands_in_its_own_bar_row():
+def test_deferred_liquidation_fill_lands_in_its_own_bar_row(caplog):
     """F3 repro: a margin-call liquidation defers via fill_on_next_bar and
     fills at the NEXT bar's open — yet its effects used to be recorded one
     row later still. The row at each fill's own timestamp must carry the
-    cumulative commission and the post-fill position snapshot."""
+    cumulative commission and the post-fill position snapshot. Also pins
+    the no-``[ROW-SYNC SKIPPED]``-in-engine-runs invariant."""
     closes = [100.0] * 40 + [51.0] * 5
-    pf, _, idx = _run_engine(closes, capital=510.0, vol=StubVol(base=10.0),
-                             commission=0.1)
+    with caplog.at_level(logging.WARNING):
+        pf, _, idx = _run_engine(closes, capital=510.0, vol=StubVol(base=10.0),
+                                 commission=0.1)
     trades = pf.get_trade_log()
     liq_ts = idx[41]                           # liquidation fill bar (open)
     assert (trades['timestamp'] == liq_ts).any(), trades
@@ -326,3 +328,9 @@ def test_deferred_liquidation_fill_lands_in_its_own_bar_row():
             prior['commission'].sum()), ts
         assert eq.loc[ts, 'positions'][SYM] == pytest.approx(
             prior['position_after'].iloc[-1]), ts
+
+    # The engine invariant behind update_fill's timestamp guard: fills are
+    # stamped with their fill bar's timestamp, so the [ROW-SYNC SKIPPED]
+    # mismatch branch must never fire in an engine-driven run — even on
+    # this run's richest path (margin call + deferred liquidation).
+    assert not any('ROW-SYNC SKIPPED' in r.message for r in caplog.records)

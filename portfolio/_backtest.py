@@ -824,8 +824,8 @@ class BacktestPortfolio(Portfolio):
         Both are NaN when the prior balance is non-positive; ``log_return``
         is additionally NaN when the current balance is non-positive.
         Shared by ``update_bar`` (prior = previous equity row) and
-        ``finalize`` (prior = second-to-last row) so the two stay
-        lock-stepped.
+        ``_sync_last_equity_row`` (prior = second-to-last row) so the two
+        stay lock-stepped.
         """
         if prior_balance > 0:
             simple_return = (self.account_balance - prior_balance) / prior_balance
