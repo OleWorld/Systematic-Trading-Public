@@ -658,23 +658,16 @@ def test_update_fill_with_newer_timestamp_leaves_older_row_untouched(caplog):
     assert any('ROW-SYNC SKIPPED' in r.message for r in caplog.records)
 
 
-def test_finalize_is_noop_after_fill_synced_row():
-    """finalize() is demoted to an end-of-run safety net: after update_fill
-    has re-synced the row, finalize must change nothing (pre-fix it was
-    the ONLY reconciliation, so it changed the row — that asymmetry is
-    the bug)."""
-    pf, _, _ = _new_portfolio(prices={'BTC': 100.0})
-    pf.update_bar(_bar(close=100.0))
-    pf.update_fill(_fill(qty=10.0, fill_price=100.0, commission=7.0))
-    before = dict(pf.equity_curve[-1])
-    snap_before = {k: dict(v)
-                   for k, v in pf._pnl_snapshots[DEFAULT_TS].items()}
-    pf.finalize()
-    after = dict(pf.equity_curve[-1])
-    assert after.pop('timestamp') == before.pop('timestamp')
-    assert after.pop('symbol') == before.pop('symbol')
-    assert after == pytest.approx(before)
-    assert pf._pnl_snapshots[DEFAULT_TS] == snap_before
+def test_finalize_hook_removed_update_fill_is_sole_reconciliation():
+    """Reintroduction guard: the end-of-run ``finalize()`` hook was REMOVED
+    (2026-08) after fill-synchronous recording made it a proven no-op —
+    verified bit-identical before/after on all three sample smoke runs
+    with finalize instrumented as an oracle. Recording correctness must
+    come from ``update_fill``'s re-sync, not an end-of-run patch; if a
+    ``finalize`` attribute reappears on the ABC or the backtest
+    portfolio, this fails and the re-sync contract needs re-auditing."""
+    assert not hasattr(Portfolio, 'finalize')
+    assert not hasattr(BacktestPortfolio, 'finalize')
 
 
 def test_fill_triggered_margin_call_state_lands_in_current_row(caplog):

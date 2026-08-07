@@ -95,12 +95,6 @@ class RecordingPortfolio:
     def update_fill(self, event: FillEvent) -> None:
         self._log.append(('portfolio.update_fill', event))
 
-    def finalize(self) -> None:
-        # Post-run hook the engine calls once after the event loop drains.
-        # No-op here (and deliberately NOT appended to the call log — the
-        # routing tests pin the per-event call sequence, not the epilogue).
-        return None
-
 
 class RecordingExecution:
     """Logs update_bar / execute_order. Optionally emits one FillEvent the

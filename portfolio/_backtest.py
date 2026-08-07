@@ -777,8 +777,8 @@ class BacktestPortfolio(Portfolio):
     def _refresh_snapshot(self) -> None:
         """Recompute unrealized PnL (full universe), account_balance, and
         available_balance — the self-healing full refresh. Used by the
-        public ``check_solvency``, the post-liquidation re-sync, and
-        ``finalize``; the per-event hot paths use the incremental
+        public ``check_solvency`` and the post-liquidation re-sync; the
+        per-event hot paths use the incremental
         ``_update_symbol_unrealized`` + ``_refresh_balances`` pair instead."""
         self._calculate_unrealized_pnl()
         self._refresh_balances()
@@ -842,11 +842,13 @@ class BacktestPortfolio(Portfolio):
         per-symbol snapshot from current account state (returns recomputed
         against the same prior-row baseline via ``_period_returns``).
 
-        Shared by ``update_fill`` (fill-synchronous recording: the row for
+        Called by ``update_fill`` (fill-synchronous recording: the row for
         a bar is appended before that bar's fills book, so each booked
-        fill re-syncs it) and ``finalize`` (end-of-run safety net).
-        Assumes FRESH caches — callers refresh incrementally or fully
-        first. No-op on an empty curve.
+        fill re-syncs it) — the sole recording reconciliation since the
+        end-of-run ``finalize`` hook was removed as a proven no-op
+        (2026-08, oracle-verified on the sample smoke runs). Assumes
+        FRESH caches — the caller refreshes incrementally first. No-op
+        on an empty curve.
         """
         if not self.equity_curve:
             return
@@ -873,23 +875,6 @@ class BacktestPortfolio(Portfolio):
             'realized_pnl': dict(self.realized_pnl),
             'margin_requirements': dict(self.margin_requirements),
         }
-
-    def finalize(self) -> None:
-        """Reconcile the final equity row with end-of-run portfolio state.
-
-        End-of-run SAFETY NET: ``update_fill`` re-syncs the last equity
-        row per fill (fill-synchronous recording), so in a normal engine
-        run this is a no-op. It remains to self-heal direct state
-        mutation (tests, research hooks) and any future fill path that
-        bypasses ``update_fill``. Called once by ``Backtester.run()``
-        after the event loop drains: full cache refresh, then rewrite the
-        LAST equity row + final-timestamp per-symbol snapshot. No-op when
-        no bars were processed.
-        """
-        if not self.equity_curve:
-            return
-        self._refresh_snapshot()
-        self._sync_last_equity_row()
 
     def _cancel_pending_non_liquidation(self) -> None:
         """Cancel every pending order that isn't a liquidation order, FIFO.

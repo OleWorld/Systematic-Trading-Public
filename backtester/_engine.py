@@ -122,11 +122,5 @@ class Backtester:
                 else:
                     raise TypeError(f"Unknown event type: {type(event).__name__}")
 
-        # Post-run safety net: update_fill re-syncs the equity row per
-        # fill, so this is normally a no-op — it self-heals any direct
-        # state mutation and guards future fill paths that bypass
-        # update_fill.
-        self.portfolio.finalize()
-
         clear_current_bar_timestamp()
         logger.info("Backtest complete.")

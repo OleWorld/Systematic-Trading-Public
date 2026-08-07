@@ -221,12 +221,14 @@ def test_deep_insolvency_rejects_same_bar_resize_reopen(caplog):
     assert any('ORDER REJECTED' in r.message for r in caplog.records)
 
 
-def test_finalize_reconciles_final_equity_row_with_end_state():
+def test_final_bar_fill_reconciles_final_equity_row():
     """Fills for the FINAL bar's orders book after that bar's equity row
-    was appended; ``Backtester.run()`` must finalize the portfolio so the
-    curve's last row (and the last timestamp's per-symbol snapshot)
-    matches end-of-run state — otherwise the run's last commission and
-    realized deltas silently vanish from every curve-derived stat."""
+    was appended; ``update_fill``'s re-sync must reconcile the curve's
+    last row (and the last timestamp's per-symbol snapshot) with
+    end-of-run state — otherwise the run's last commission and realized
+    deltas silently vanish from every curve-derived stat. (Formerly the
+    job of the engine's end-of-run ``finalize()`` hook, removed 2026-08
+    once the per-fill re-sync made it a proven no-op.)"""
     # Constant price; a vol spike on the very last completed bar shrinks
     # the target 10 → 4, forcing a SELL 6 resize that fills on the final
     # bar's close ($1/contract commission makes the miss money-visible).
@@ -292,8 +294,8 @@ def test_margin_call_bar_reopen_scaled_no_phantom_churn():
 def test_equity_curve_commission_matches_trade_log_per_timestamp():
     """F5 repro: cumulative commission in the curve must match the trade
     log AT each fill's own timestamp. Single-symbol run ⇒ every fill used
-    to surface one row late (except the last bar's, which finalize()
-    patched)."""
+    to surface one row late (except the last bar's, which the engine's
+    old end-of-run finalize() hook — since removed — used to patch)."""
     closes = [100.0] * 45
     pf, _, _ = _run_engine(
         closes, capital=1_000_000.0,
