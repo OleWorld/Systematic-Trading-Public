@@ -4,7 +4,7 @@ Unit tests for the ``Backtester`` event-loop engine.
 The engine is the orchestration heart of the system — it drains the
 events queue and routes each event to the right consumer — but it was
 previously exercised only by the
-``backtests/sample_backtest/backtest_ewmac_crypto.py`` smoke
+``backtests/sample_backtest/backtest_ewmac_sample.py`` smoke
 script, which pytest does not collect. A regression in the wiring (wrong
 processing order, a mis-routed event, a swallowed unknown event, a
 leaked bar-timestamp context) would pass the rest of the suite.
@@ -94,12 +94,6 @@ class RecordingPortfolio:
 
     def update_fill(self, event: FillEvent) -> None:
         self._log.append(('portfolio.update_fill', event))
-
-    def finalize(self) -> None:
-        # Post-run hook the engine calls once after the event loop drains.
-        # No-op here (and deliberately NOT appended to the call log — the
-        # routing tests pin the per-event call sequence, not the epilogue).
-        return None
 
 
 class RecordingExecution:

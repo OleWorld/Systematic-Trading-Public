@@ -25,9 +25,8 @@ import pytest
 
 from data._base import DataHandler
 from data._historic import HistoricDataHandler
-from data._ohlcv import _candles_to_dataframe, _resample_ohlcv, resample
+from data._ohlcv import _candles_to_dataframe, resample
 from data._timeframe import (
-    TIMEFRAME_FALLBACK_ORDER,
     get_period_start,
     _ms_to_utc,
     parse_timeframe_to_seconds,
@@ -191,16 +190,47 @@ def testget_period_start_rejects_unsupported_multiday():
         get_period_start(ts, '3d')
 
 
-def test_timeframe_fallback_order_is_finest_first():
-    # Sanity: each entry has strictly greater seconds than the previous.
-    secs = [parse_timeframe_to_seconds(tf) for tf in TIMEFRAME_FALLBACK_ORDER]
-    assert secs == sorted(secs)
-    assert len(set(secs)) == len(secs)
+def test_timeframe_fallback_order_removed():
+    """Reintroduction guard: ``TIMEFRAME_FALLBACK_ORDER`` was REMOVED
+    (2026-08). It stopped being consulted when the handler's auto-resample
+    fallback was retired and had no runtime consumer left — it survived
+    only as an exported constant plus this file's sanity test. If it
+    reappears, either wire a real consumer or delete it again."""
+    import data
+    import data._timeframe as timeframe_mod
+    assert not hasattr(timeframe_mod, 'TIMEFRAME_FALLBACK_ORDER')
+    assert not hasattr(data, 'TIMEFRAME_FALLBACK_ORDER')
+    assert 'TIMEFRAME_FALLBACK_ORDER' not in data.__all__
 
 
 # ──────────────────────────────────────────────
 # Section 2 — _ohlcv.py DataFrame helpers
 # ──────────────────────────────────────────────
+
+# Standard OHLCV agg + empty-bucket drop, applied to the public ``resample``.
+# This is what the removed private ``_resample_ohlcv`` wrapper did; the
+# resample tests below exercise the public surface through this local helper.
+_OHLCV_AGG = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last',
+              'Volume': 'sum'}
+
+
+def _resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    out = resample(df, timeframe, _OHLCV_AGG)
+    if out.empty:
+        return out
+    return out.dropna(subset=['Open'])
+
+
+def test_resample_ohlcv_private_wrapper_removed():
+    """Reintroduction guard: the private ``_resample_ohlcv`` wrapper (and its
+    ``_OHLCV_AGG`` dict) was REMOVED (2026-08) — it was test-only and
+    functionally a two-liner over the public ``resample``, which every
+    consumer (plotting, the ArcticDB loader) already calls directly with
+    its own agg dict. If it reappears, either wire a real consumer or
+    delete it again."""
+    import data._ohlcv as ohlcv_mod
+    assert not hasattr(ohlcv_mod, '_resample_ohlcv')
+    assert not hasattr(ohlcv_mod, '_OHLCV_AGG')
 
 def test_candles_to_dataframe_shape_and_index():
     candles = [

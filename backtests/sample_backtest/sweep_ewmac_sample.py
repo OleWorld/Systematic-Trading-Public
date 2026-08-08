@@ -36,7 +36,7 @@ from volatility import EWMAVolEstimator, bars_per_year
 
 # --- Data: 10 longest-history symbols from the bundled daily sample -------
 sample_csv = os.path.join(os.path.dirname(__file__), '..', 'sample_data',
-                          'crypto_1d.csv')
+                          'sample_1d.csv')
 _raw = pd.read_csv(sample_csv)
 _raw['timestamp'] = pd.to_datetime(_raw['timestamp'], utc=True)
 _grouped = {sym: g for sym, g in _raw.groupby('symbol')

@@ -142,12 +142,12 @@ enters the engine. Each DataFrame is indexed by a timezone-aware `DatetimeIndex`
 are converted to UTC) and exposes `Open`/`High`/`Low`/`Close`/`Volume` columns;
 sourcing, cleaning, and windowing the data is up to you. A small bundled sample of
 daily bars lives at
-[backtests/sample_data/crypto_1d.csv](backtests/sample_data/crypto_1d.csv):
+[backtests/sample_data/sample_1d.csv](backtests/sample_data/sample_1d.csv):
 
 ```python
 import pandas as pd
 
-raw = pd.read_csv('backtests/sample_data/crypto_1d.csv')
+raw = pd.read_csv('backtests/sample_data/sample_1d.csv')
 raw['timestamp'] = pd.to_datetime(raw['timestamp'], utc=True)
 data = {sym: g.set_index('timestamp')[['Open', 'High', 'Low', 'Close', 'Volume']]
         for sym, g in raw.groupby('symbol')}
@@ -184,7 +184,7 @@ sizing and are required by `Backtester` alongside the rest: `universe.UniverseMa
 price history) and `correlation.CorrelationManager` (estimates the instrument
 correlation matrix on a walk-forward cadence, used for instrument weights and
 the diversification multiplier). The full pattern lives in
-[backtests/sample_backtest/backtest_ewmac_crypto.py](backtests/sample_backtest/backtest_ewmac_crypto.py); the condensed shape is:
+[backtests/sample_backtest/backtest_ewmac_sample.py](backtests/sample_backtest/backtest_ewmac_sample.py); the condensed shape is:
 
 ```python
 import queue

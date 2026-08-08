@@ -68,22 +68,3 @@ def resample(df: pd.DataFrame, timeframe: str, agg: _AggSpec) -> pd.DataFrame:
         day_origin = pd.Timestamp(date, tz=group.index.tz)
         parts.append(group.resample(offset, origin=day_origin).agg(agg))
     return pd.concat(parts)
-
-
-_OHLCV_AGG: _AggSpec = {
-    'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum',
-}
-
-
-def _resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-    """Resample an OHLCV DataFrame to a higher timeframe.
-
-    Thin caller around ``resample`` with the standard OHLCV agg dict.
-    Empty buckets (no underlying base bars) are dropped via the ``Open``
-    column.
-    """
-    resampled = resample(df, timeframe, _OHLCV_AGG)
-    if resampled.empty:
-        return resampled
-    resampled.dropna(subset=['Open'], inplace=True)
-    return resampled

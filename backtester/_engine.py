@@ -43,7 +43,7 @@ class Backtester:
     of the inner event loop.
 
     Callers wire each module explicitly and pass them in. See
-    ``backtests/sample_backtest/backtest_ewmac_crypto.py`` for a worked
+    ``backtests/sample_backtest/backtest_ewmac_sample.py`` for a worked
     example.
     """
     def __init__(self, events_queue, data_handler, strategy, portfolio,
@@ -121,11 +121,6 @@ class Backtester:
 
                 else:
                     raise TypeError(f"Unknown event type: {type(event).__name__}")
-
-        # Post-run reconciliation: fills for the final bar's orders booked
-        # AFTER that bar's equity row was appended — let the portfolio
-        # re-snapshot its last row so the curve matches end-of-run state.
-        self.portfolio.finalize()
 
         clear_current_bar_timestamp()
         logger.info("Backtest complete.")
