@@ -43,7 +43,7 @@ class Backtester:
     of the inner event loop.
 
     Callers wire each module explicitly and pass them in. See
-    ``backtests/sample_backtest/backtest_ewmac_crypto.py`` for a worked
+    ``backtests/sample_backtest/backtest_ewmac_sample.py`` for a worked
     example.
     """
     def __init__(self, events_queue, data_handler, strategy, portfolio,
