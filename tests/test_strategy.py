@@ -87,6 +87,8 @@ def _build(forecast_fn=None, symbols=('BTC',)):
 def test_strategy_abc_cannot_be_instantiated():
     with pytest.raises(TypeError):
         Strategy(FakeDataHandler(), ['BTC'])  # type: ignore[abstract]
+    with pytest.raises(TypeError):
+        TimeSeriesStrategy(FakeDataHandler(), ['BTC'])  # type: ignore[abstract]
 
 
 def test_strategy_base_rejects_old_recipe_subclass():

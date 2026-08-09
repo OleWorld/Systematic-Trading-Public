@@ -81,7 +81,7 @@ class Strategy(ABC):
     """
 
     # Project-wide forecast convention. Treated as constants — do not override
-    # in subclasses; both ``Strategy.update_bar`` and
+    # in subclasses; both ``_commit_forecast_row`` and
     # ``VolTargetingRiskManager`` read them via the class.
     TARGET_AVG_ABS_FORECAST: float = 50.0
     FORECAST_CAP: float = 100.0
@@ -151,7 +151,10 @@ class Strategy(ABC):
 
         Templates call this once per committed result — the timeseries
         template once per bar event; a future cross-sectional template once
-        per symbol per aligned timestamp.
+        per symbol per aligned timestamp. ``base_row`` must contain a
+        ``'timestamp'`` key (and by convention the OHLCV fields), as it is
+        used to set the index when ``get_records`` constructs the output
+        DataFrame.
         """
         if extras is not None:
             extras = dict(extras)              # don't mutate caller's dict
@@ -184,7 +187,7 @@ class Strategy(ABC):
     def is_warmed_up(self, symbol: str) -> bool:
         """Return True once ``symbol`` has produced its first non-NaN forecast.
 
-        Measured, not estimated: the flag flips inside ``update_bar`` at
+        Measured, not estimated: the flag flips inside ``_commit_forecast_row`` at
         the exact moment the first real forecast is written to the cache,
         and never resets (monotone). The risk manager's universe liveness
         gate reads this to keep instrument weight away from symbols whose
