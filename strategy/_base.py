@@ -129,23 +129,39 @@ class Strategy(ABC):
         }
 
         extras = self.calculate_forecast(event)
+        self._commit_forecast_row(event.symbol, base_row, extras)
+
+    def _commit_forecast_row(self, symbol: str, base_row: Dict[str, Any],
+                             extras: Optional[Dict[str, Any]]) -> None:
+        """Merge ``extras`` into ``base_row``, clamp/cache the forecast, record.
+
+        The shared back half of every template's bar handling: if ``extras``
+        carries a ``'forecast'`` that is neither ``None`` nor NaN, clamp it
+        to ``±FORECAST_CAP``, write it to ``self.forecasts[symbol]``, and
+        flip the symbol's warmup flag; NaN forecasts (warmup) are recorded
+        as-is for diagnostics but leave the cached value untouched. The
+        merged row is then appended to the per-symbol record buffer.
+        ``extras=None`` records ``base_row`` (OHLCV-only) and changes no
+        cached state. Never mutates the caller's ``extras`` dict.
+
+        Templates call this once per committed result — the timeseries
+        template once per bar event; a future cross-sectional template once
+        per symbol per aligned timestamp.
+        """
         if extras is not None:
             extras = dict(extras)              # don't mutate caller's dict
             if 'forecast' in extras:
                 raw = extras['forecast']
-                # NaN forecasts (warmup) are recorded as-is for diagnostics
-                # but do NOT update the cached forecast — leave the prior
-                # cached value (default ``None`` — no forecast yet) untouched.
                 if raw is not None and not pd.isna(raw):
                     cap = Strategy.FORECAST_CAP
                     clamped = max(-cap, min(cap, float(raw)))
-                    self.forecasts[event.symbol] = clamped
+                    self.forecasts[symbol] = clamped
                     extras['forecast'] = clamped
                     # First real forecast ⇒ warmup is over for this symbol.
-                    self._warmed_up[event.symbol] = True
+                    self._warmed_up[symbol] = True
             base_row.update(extras)
 
-        self._record_row(event.symbol, base_row)
+        self._record_row(symbol, base_row)
 
     @abstractmethod
     def calculate_forecast(self, event: BarEvent) -> Optional[Dict[str, Any]]:
