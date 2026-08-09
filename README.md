@@ -53,19 +53,19 @@ per-symbol dict of `InstrumentConfig` instead. Your **strategy and risk-manager
 logic still size in contracts** — the point-value conversion and whole-lot
 rounding happen in the back-end.
 
-### 2. Strategy — Implement `calculate_forecast()`
+### 2. Strategy — Subclass `TimeSeriesStrategy`, implement `calculate_forecast()`
 
 ```python
-from strategy import Strategy
+from strategy import TimeSeriesStrategy
 from indicator import SMA
 
-class MyStrategy(Strategy):
+class MyStrategy(TimeSeriesStrategy):
     def __init__(self, data_handler, symbol_list, fast=10, slow=30):
         super().__init__(data_handler, symbol_list)
         self.fast = fast
         self.slow = slow
-        self._fast_sma = {s: SMA(length=fast) for s in symbol_list}
-        self._slow_sma = {s: SMA(length=slow) for s in symbol_list}
+        self._fast_sma = {s: SMA(window=fast) for s in symbol_list}
+        self._slow_sma = {s: SMA(window=slow) for s in symbol_list}
 
     def calculate_forecast(self, event):
         sym = event.symbol
@@ -80,9 +80,16 @@ class MyStrategy(Strategy):
         # Scale the raw crossover to the project ±100 forecast convention.
         # Cap at FORECAST_CAP; the base class also clamps before caching.
         raw = (fast - slow) / slow * 1000.0
-        forecast = max(-Strategy.FORECAST_CAP, min(Strategy.FORECAST_CAP, raw))
+        cap = TimeSeriesStrategy.FORECAST_CAP
+        forecast = max(-cap, min(cap, raw))
         return {'fast_sma': fast, 'slow_sma': slow, 'forecast': forecast}
 ```
+
+`TimeSeriesStrategy` is the per-event template for strategies that read one
+symbol's bars and forecast that symbol alone; the mode-agnostic `Strategy`
+base underneath owns the forecast cache, clamping, warmup tracking, and
+per-bar records (a future cross-sectional template will subclass it
+directly).
 
 **Available inside `calculate_forecast`:**
 
