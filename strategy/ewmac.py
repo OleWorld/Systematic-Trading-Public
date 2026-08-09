@@ -34,7 +34,7 @@ Combined forecast (default equal weights = 1/N each):
                                                    # ``1.0`` (no adjustment).
     final_forecast  = combined                     # also clamped to
                                                    # ±Strategy.FORECAST_CAP by
-                                                   # ``Strategy.update_bar`` as
+                                                   # ``TimeSeriesStrategy.update_bar`` as
                                                    # a safety net.
 
 Output: per-bar dict with the ``'forecast'`` key. The base class clamps
@@ -46,7 +46,7 @@ stable across forming ticks within a period and only changes at period
 boundaries.
 
 The ``±Strategy.FORECAST_CAP`` scale (vs Carver's ``±20``) is the
-project-wide forecast convention — see ``Strategy.update_bar``. The
+project-wide forecast convention — see ``TimeSeriesStrategy.update_bar``. The
 target-average-absolute-forecast magnitude lives on the same class as
 ``Strategy.TARGET_AVG_ABS_FORECAST`` (default ``50.0``); both
 ``VolTargetingRiskManager`` and this strategy read it from there.
@@ -61,6 +61,7 @@ import pandas as pd
 from event import BarEvent
 from indicator import EMA, SMA, Stdev
 from strategy._base import Strategy, _DataHandlerLike
+from strategy._timeseries import TimeSeriesStrategy
 
 __all__ = ['EWMACStrategy']
 
@@ -79,7 +80,7 @@ _DEFAULT_VARIATIONS: Dict[str, Dict[str, int]] = {
 _PARAM_KEYS = frozenset({'fast', 'slow'})
 
 
-class EWMACStrategy(Strategy):
+class EWMACStrategy(TimeSeriesStrategy):
     """EWMAC trend-follower with three look-back variations and a dynamic
     forecast scalar.
 
@@ -351,7 +352,7 @@ class EWMACStrategy(Strategy):
         # ── Combine per-variation forecasts. ────────────────────────────
         # If ANY variation isn't ready, the combined forecast is undefined.
         # We don't backfill missing variations from finite ones because the
-        # weights are calibrated against the full ensemble. ``Strategy.update_bar``
+        # weights are calibrated against the full ensemble. ``TimeSeriesStrategy.update_bar``
         # clamps the final value to ``±Strategy.FORECAST_CAP`` before storing
         # it in ``self.forecasts[symbol]``, so no clamp is applied here.
         if any(pd.isna(per_var_forecasts[l]) for l in self.variations):

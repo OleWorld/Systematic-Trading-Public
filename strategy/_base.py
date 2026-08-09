@@ -1,12 +1,16 @@
 """
-Strategy template for the event-driven trading system.
+Mode-agnostic strategy base for the event-driven trading system.
 
-Exposes the ``Strategy`` ABC: the backtester drives each bar through
-``update_bar()``, which handles symbol filtering, per-bar OHLCV recording,
-and delegates forecast computation to ``calculate_forecast()`` (subclass
-hook). Subclasses return a dict of fields to record alongside OHLCV. If
-the dict carries the ``'forecast'`` key, the value is clamped to
-``[-100, +100]`` and stored in ``self.forecasts[symbol]``.
+Exposes the ``Strategy`` ABC — the shared machinery every strategy
+template builds on: the per-symbol forecast cache (clamped to ±100 via
+``_commit_forecast_row``), the measured warmup flag, per-bar record
+keeping, and the project-wide forecast constants. ``update_bar()`` is
+abstract here: each *template* defines how engine bars become
+forecasts. The per-event timeseries template lives in
+``strategy._timeseries`` (``TimeSeriesStrategy`` — one symbol's bar in,
+that symbol's forecast out); a future cross-sectional template
+(cross-symbol alignment, batch signal generation) will be a sibling
+subclass honoring the same contract.
 
 The forecast dictionary is the strategy's only output. The risk manager
 reads ``strategy.get_forecast(symbol)`` on every completed bar to derive
@@ -52,19 +56,16 @@ class _DataHandlerLike(Protocol):
 
 class Strategy(ABC):
     """
-    Abstract base class for trading strategies.
+    Abstract, mode-agnostic base class for trading strategies.
 
-    The backtester calls ``update_bar()`` on each ``BarEvent``. ``update_bar``
-    handles symbol filtering, OHLCV recording, and delegates to
-    ``calculate_forecast()`` for the strategy-specific math.
-
-    Subclasses implement ``calculate_forecast()`` — pure forecast computation.
-    Use ``self.data_handler.get_latest_bars(symbol, n)`` for lookback data.
-    Return a dict of fields to record. If the dict contains the
-    ``'forecast'`` key, the value (after clamping to
-    ``[-FORECAST_CAP, +FORECAST_CAP]``) is written to
-    ``self.forecasts[symbol]`` and recorded in the per-bar log. Returning
-    ``None`` records OHLCV-only and leaves the cached forecast unchanged.
+    Owns the machinery every strategy template shares: the per-symbol
+    forecast cache, forecast clamping and warmup tracking (via
+    ``_commit_forecast_row``), per-bar record keeping, and the
+    project-wide forecast constants. ``update_bar()`` is abstract —
+    concrete strategies subclass a *template* that implements it:
+    ``TimeSeriesStrategy`` (``strategy._timeseries``) for per-event
+    single-symbol strategies today; a future cross-sectional template
+    will be its sibling.
 
     Project-wide forecast convention (class constants below):
         ``-FORECAST_CAP`` = max short conviction, ``0`` = flat,
@@ -114,22 +115,26 @@ class Strategy(ABC):
         # Per-symbol list of row dicts, populated by update_bar() on each bar.
         self._records: Dict[str, List[Dict]] = defaultdict(list)
 
+    @abstractmethod
     def update_bar(self, event: BarEvent) -> None:
-        """Process a BarEvent: filter symbol, run forecast logic, record row."""
-        if event.symbol not in self.symbol_list:
-            return
+        """Consume one engine-dispatched ``BarEvent`` (template hook).
 
-        base_row = {
-            'timestamp': event.timestamp,
-            'open': event.open,
-            'high': event.high,
-            'low': event.low,
-            'close': event.close,
-            'volume': event.volume,
-        }
+        Engine contract every template must honor:
 
-        extras = self.calculate_forecast(event)
-        self._commit_forecast_row(event.symbol, base_row, extras)
+        - called on EVERY bar event, forming and completed alike;
+        - must ignore events whose symbol is outside ``symbol_list``;
+        - must be idempotent under forming-bar re-runs (compute from
+          finalized values so re-processing the same forming period
+          cannot change cached state);
+        - commits results via ``_commit_forecast_row`` so clamping,
+          caching, warmup flags, and per-bar records stay uniform
+          across templates.
+
+        ``TimeSeriesStrategy`` implements the per-event timeseries
+        template; a future cross-sectional template will implement an
+        alignment-aware version.
+        """
+        raise NotImplementedError
 
     def _commit_forecast_row(self, symbol: str, base_row: Dict[str, Any],
                              extras: Optional[Dict[str, Any]]) -> None:
@@ -162,23 +167,6 @@ class Strategy(ABC):
             base_row.update(extras)
 
         self._record_row(symbol, base_row)
-
-    @abstractmethod
-    def calculate_forecast(self, event: BarEvent) -> Optional[Dict[str, Any]]:
-        """
-        Implement forecast computation.
-
-        Called by ``update_bar()`` for each ``BarEvent`` whose symbol is in
-        ``symbol_list``. Return a dict of strategy-specific fields to record
-        (indicators, intermediate values, and crucially ``'forecast'`` —
-        the signed conviction in ``[-FORECAST_CAP, +FORECAST_CAP]``).
-        Return ``None`` to record OHLCV only and leave the cached forecast
-        unchanged (e.g. during warmup before any forecast can be computed).
-
-        Do not include OHLCV keys (open, high, low, close, volume, timestamp)
-        in the return — the base class merges those in automatically.
-        """
-        raise NotImplementedError
 
     def get_forecast(self, symbol: str) -> Optional[float]:
         """Return the cached forecast for ``symbol``, or ``None`` if none yet.

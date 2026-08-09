@@ -18,7 +18,7 @@ import pytest
 
 from data._bar import Bar
 from event import BarEvent
-from strategy import Strategy
+from strategy import Strategy, TimeSeriesStrategy
 
 
 # ──────────────────────────────────────────────
@@ -40,7 +40,7 @@ class FakeDataHandler:
                 for ts, c in zip(tail.index, tail['Close'])]
 
 
-class DummyStrategy(Strategy):
+class DummyStrategy(TimeSeriesStrategy):
     """Concrete Strategy with a caller-supplied calculate_forecast body.
 
     Lets each test script exactly what calculate_forecast does without
@@ -87,6 +87,42 @@ def _build(forecast_fn=None, symbols=('BTC',)):
 def test_strategy_abc_cannot_be_instantiated():
     with pytest.raises(TypeError):
         Strategy(FakeDataHandler(), ['BTC'])  # type: ignore[abstract]
+
+
+def test_strategy_base_rejects_old_recipe_subclass():
+    """Subclassing Strategy directly with only calculate_forecast (the
+    pre-split recipe) fails loudly: update_bar is abstract on the base
+    and calculate_forecast no longer exists there."""
+    class OldRecipe(Strategy):
+        def calculate_forecast(self, event):
+            return {'forecast': 1.0}
+
+    with pytest.raises(TypeError):
+        OldRecipe(FakeDataHandler(), ['BTC'])
+
+
+def test_timeseries_subclass_with_only_calculate_forecast_works():
+    """The template contract: implementing calculate_forecast alone yields
+    a working strategy — clamping, caching, warmup, and records are all
+    inherited machinery."""
+    class Minimal(TimeSeriesStrategy):
+        def calculate_forecast(self, event):
+            return {'forecast': 10.0}
+
+    s = Minimal(FakeDataHandler(), ['BTC'])
+    s.update_bar(_bar())
+    assert s.get_forecast('BTC') == 10.0
+    assert s.is_warmed_up('BTC') is True
+    assert s.get_records('BTC').iloc[0]['forecast'] == 10.0
+
+
+def test_forecast_constants_live_on_strategy_base():
+    """Pins the orchestrator/RM import surface: constants are reachable via
+    the mode-agnostic base (and inherited by the template)."""
+    assert Strategy.FORECAST_CAP == 100.0
+    assert Strategy.TARGET_AVG_ABS_FORECAST == 50.0
+    assert TimeSeriesStrategy.FORECAST_CAP == 100.0
+    assert TimeSeriesStrategy.TARGET_AVG_ABS_FORECAST == 50.0
 
 
 # ──────────────────────────────────────────────

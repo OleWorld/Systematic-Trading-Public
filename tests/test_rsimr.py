@@ -270,7 +270,7 @@ def _vectorized_rsimr(
     diffs internally), so the RSI series runs on the full ``closes`` — there is
     no leading offset (unlike EWMAC, which needs a 2-bar price change). The
     per-variation cap mirrors the strategy code (applied before the weighted
-    combine); the final ``±FORECAST_CAP`` clamp mirrors ``Strategy.update_bar``.
+    combine); the final ``±FORECAST_CAP`` clamp mirrors ``TimeSeriesStrategy.update_bar``.
 
     ``variations`` is a ``{label: {'window': w}}`` dict and ``weights`` a
     ``{label: weight}`` dict, iterated by label (the same label-keyed shape the
