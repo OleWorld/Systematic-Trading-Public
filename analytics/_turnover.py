@@ -22,10 +22,14 @@ A whole-backtest window would dilute the average position and inflate
 the annualization span for late-listing symbols under the staggered-
 listing liveness gate. Symbols with no fills are excluded entirely.
 
-The final ``'Average'`` row carries only the cross-instrument mean of
-``Avg Holding [days]``: contract counts are not comparable across
-instruments, and a cross-instrument mean of turnover ratios was
-deliberately omitted as well.
+The final ``'Average'`` row carries the cross-instrument means of the
+two unitless columns — ``Round Trips / Year`` (each symbol's turnover
+is normalized by its own average position, so the ratios are
+comparable) and ``Avg Holding [days]`` — while
+``Avg Position [contracts]`` stays NaN: contract counts are not
+comparable across instruments. The two means are independent
+arithmetic means, so they are not reciprocals of each other
+(days-per-year / mean turnover ≠ mean holding, by Jensen).
 """
 
 from __future__ import annotations
@@ -94,11 +98,11 @@ def turnover_stats(
     pd.DataFrame
         One row per traded symbol (alphabetical) with the fixed columns
         ``'Avg Position [contracts]'``, ``'Round Trips / Year'``,
-        ``'Avg Holding [days]'``, plus a final ``'Average'`` row where
-        only the holding-period mean is populated (see the module
-        docstring). Data edge cases (either input empty, zero average
-        position) yield an empty fixed-schema frame or NaN cells —
-        never a raise.
+        ``'Avg Holding [days]'``, plus a final ``'Average'`` row
+        carrying the cross-instrument means of the two unitless columns
+        and NaN average position (see the module docstring). Data edge
+        cases (either input empty, zero average position) yield an
+        empty fixed-schema frame or NaN cells — never a raise.
 
     Raises
     ------
@@ -179,7 +183,9 @@ def turnover_stats(
 
     table = pd.DataFrame.from_dict(rows, orient='index',
                                    columns=list(_COLUMNS))
+    rts = table['Round Trips / Year']
+    mean_rt = float(rts.mean()) if rts.notna().any() else _NAN
     holds = table['Avg Holding [days]']
     mean_hold = float(holds.mean()) if holds.notna().any() else _NAN
-    table.loc['Average'] = (_NAN, _NAN, mean_hold)
+    table.loc['Average'] = (_NAN, mean_rt, mean_hold)
     return table
