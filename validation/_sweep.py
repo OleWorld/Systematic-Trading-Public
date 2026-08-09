@@ -199,27 +199,26 @@ class SweepResult:
     def table(self) -> pd.DataFrame:
         """One row per cell: param columns, then all ``backtest_stats``
         labels (lazy; cached on first access). With a resolved
-        ``stats_start``, each cell's stats are computed over the window
-        with the capital RESEEDED to the cell's true entering balance
-        (``window_pnl``) — the same convention as the inference modules
-        and ``periodic_stats`` — so no pre-window PnL folds into the
-        first kept bar and cells with different warmup speeds stay
-        comparable. A cell entering the window with a non-positive
-        balance (wiped out pre-start) falls back to full-history stats
-        with a WARNING."""
+        ``stats_start``, each cell's stats come from
+        ``backtest_stats(start=...)``, which re-baselines internally to
+        the cell's true entering balance (the ``window_pnl`` convention,
+        shared with the inference modules and ``periodic_stats``) — no
+        pre-window PnL folds into the first kept bar, so cells with
+        different warmup speeds stay comparable. A cell entering the
+        window with a non-positive balance (wiped out pre-start) falls
+        back to full-history stats with a WARNING (the fallback keeps
+        its % metrics populated; the re-baselined path would NaN
+        them)."""
         if self._table is None:
             start = self.stats_start_resolved
             rows = []
             for key, cell in self._cells.items():
-                capital = cell.initial_capital
                 cell_start = start
                 if start is not None:
                     _, baseline = window_pnl(
                         cell.equity, initial_capital=cell.initial_capital,
                         start=start)
-                    if math.isfinite(baseline) and baseline > 0:
-                        capital = baseline
-                    else:
+                    if not (math.isfinite(baseline) and baseline > 0):
                         logger.warning(
                             "table: cell %s enters the stats window with a "
                             "non-positive balance (%s) — falling back to "
@@ -228,7 +227,7 @@ class SweepResult:
                         cell_start = None
                 stats = backtest_stats(
                     cell.equity, cell.trades,
-                    initial_capital=capital,
+                    initial_capital=cell.initial_capital,
                     timeframe=self.timeframe,
                     days_convention=self.days_convention, start=cell_start)
                 rows.append({**cell.params, **stats.to_dict()})

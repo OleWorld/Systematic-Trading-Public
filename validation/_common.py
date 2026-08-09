@@ -53,25 +53,21 @@ def pnl_from_equity(
     equity_curve: pd.DataFrame,
     *,
     initial_capital: float,
-    start=None,
 ) -> pd.Series:
     """
-    Per-bar dollar PnL, derived exactly as ``analytics.backtest_stats``:
-    collapse -> optional ``start`` trim -> ``balance.diff()`` with the first
-    kept bar measured against ``initial_capital`` (pre-``start`` PnL folds
-    into the first kept bar — the documented ``backtest_stats`` semantics).
-    ``start`` must be tz-aware or a date-only string (UTC midnight); other
-    naive values raise ``ValueError``. A tz-aware ``start`` (e.g. the output
-    of ``first_fill``) passes through unchanged.
+    Full-history per-bar dollar PnL: collapse -> ``balance.diff()`` with the
+    first bar measured against ``initial_capital`` — the same derivation as
+    ``analytics.backtest_stats`` without ``start``. Window trimming (slice +
+    entering-balance reseed) lives in ``window_pnl``; ``backtest_stats``
+    applies the identical re-baseline internally when given ``start=``.
+    (The fold-in ``start=`` trim was removed 2026-08 with the
+    ``backtest_stats`` re-baseline unification.)
     Empty input yields an empty float Series; a non-empty curve without
     ``account_balance`` raises ``ValueError``; ``initial_capital <= 0`` raises.
     """
     if initial_capital <= 0:
         raise ValueError(f"initial_capital must be > 0, got {initial_capital}")
     eq = collapse_equity(equity_curve)
-    if start is not None and not eq.empty:
-        start_ts = ensure_utc_timestamp(start, 'start')
-        eq = eq.loc[eq.index >= start_ts]
     if eq.empty:
         return pd.Series(dtype=float)
     if 'account_balance' not in eq.columns:
@@ -91,13 +87,15 @@ def window_pnl(
 ):
     """Window view of the per-bar dollar PnL: the full-history series sliced
     to ``index >= start``, plus the TRUE balance entering the window
-    (``initial_capital`` + pre-start PnL). Unlike the ``backtest_stats``
-    fold-in trim (``pnl_from_equity(start=...)``), no pre-start PnL folds
-    into the first kept bar — a non-flat head would otherwise inject a
-    synthetic spike bar that distorts the window's moments. This is the
-    derivation for inference-grade statistics (bootstrap, PSR/DSR) and the
-    periodic regime table. ``start`` must be tz-aware or a date-only string
-    (UTC midnight); other naive values raise ``ValueError``.
+    (``initial_capital`` + pre-start PnL). No pre-start PnL folds into the
+    first kept bar — a non-flat head would otherwise inject a synthetic
+    spike bar that distorts the window's moments.
+    ``analytics.backtest_stats(start=...)`` applies this same
+    entering-balance re-baseline internally (2026-08 unification); this
+    helper is the series-level form for inference-grade statistics
+    (bootstrap, PSR/DSR) and the periodic regime table. ``start`` must be
+    tz-aware or a date-only string (UTC midnight); other naive values raise
+    ``ValueError``.
     Returns ``(pnl, entering_balance)``; ``start=None`` returns the full
     series with ``initial_capital`` as the baseline.
     """

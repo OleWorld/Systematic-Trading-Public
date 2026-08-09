@@ -91,14 +91,20 @@ def backtest_stats(
         UTC midnight); any other naive value raises ``ValueError``. A
         naive ``equity_curve`` index or ``trade_log`` timestamp column
         also raises. When given, the collapsed equity curve and the
-        trade log are restricted to ``timestamp >= start`` before any
-        statistic is computed — intended to drop the **flat warmup
-        head** (see the warmup-dilution note below), e.g.
-        ``start=trade_log['timestamp'].min()``. ``initial_capital``
-        stays the PnL/drawdown baseline, which is exact for a flat head
-        (balance still equals initial capital at the first fill);
-        trimming a NON-flat head shifts what the baseline means — the
-        pre-``start`` PnL silently folds into the first kept bar.
+        trade log are restricted to ``timestamp >= start``, and every
+        statistic re-baselines to the **entering balance** — the last
+        pre-``start`` ``account_balance`` (``initial_capital`` when no
+        row precedes ``start``) — so the table reads "as if you went
+        live at ``start`` with the balance the account actually held".
+        No pre-``start`` PnL folds into the first kept bar (the
+        ``validation`` suite's ``window_pnl`` convention, unified
+        2026-08). An entering balance ≤ 0 (account wiped out before
+        ``start``) yields NaN percentage/ratio metrics while the
+        dollar metrics stay populated. Typical use: drop the **flat
+        warmup head** (see the warmup-dilution note below) via
+        ``start=trade_log['timestamp'].min()`` — there the entering
+        balance equals ``initial_capital``, so the trim only removes
+        the zero-PnL bars.
 
     Returns
     -------
@@ -138,7 +144,8 @@ def backtest_stats(
     - Calmar = ``CAGR [%] / Max Drawdown [%]`` (both legs percentage —
       the standard pairing).
     - Drawdown episodes are contiguous runs below the running peak
-      (initial capital included in the peak). The unrecovered final
+      (seeded at the entering balance — ``initial_capital`` when
+      ``start`` is not given). The unrecovered final
       episode is **included** in the max/avg depth and duration as a
       lower bound on its true value. An episode underwater from the
       first bar measures its duration from the first equity timestamp.
@@ -185,9 +192,14 @@ def backtest_stats(
                                         "trade_log['timestamp']"))
 
     eq = _collapse_equity(equity_curve)
+    baseline = float(initial_capital)
     if start is not None:
         start = ensure_utc_timestamp(start, 'start')
         if not eq.empty:
+            bal_full = eq['account_balance'].astype(float)
+            head = bal_full[bal_full.index < start]
+            if len(head):
+                baseline = float(head.iloc[-1])
             eq = eq.loc[eq.index >= start]
         if not trade_log.empty:
             if 'timestamp' not in trade_log.columns:
@@ -207,21 +219,25 @@ def backtest_stats(
     end = eq.index[-1] if not empty else pd.NaT
     duration = end - start if not empty else pd.NaT
 
-    # --- Equity / PnL levels ---
+    # --- Equity / PnL levels (vs the entering-balance baseline) ---
     final = bal.iloc[-1] if not empty else _NAN
-    peak = max(bal.max(), initial_capital) if not empty else _NAN
-    net_pnl = final - initial_capital if not empty else _NAN
+    peak = max(bal.max(), baseline) if not empty else _NAN
+    net_pnl = final - baseline if not empty else _NAN
     commission = eq['total_commission'].iloc[-1] if not empty else _NAN
-    return_pct = 100.0 * net_pnl / initial_capital if not empty else _NAN
+    return_pct = (100.0 * net_pnl / baseline
+                  if not empty and baseline > 0 else _NAN)
 
-    # --- Per-bar dollar PnL and equity returns (vs the t0 baseline) ---
+    # --- Per-bar dollar PnL and equity returns (vs the baseline) ---
     # ``pnl``/``ret`` have one entry per equity row: the first measures
-    # the first bar against initial_capital, the rest are row-to-row.
+    # the first bar against the entering balance, the rest are row-to-row.
     if not empty:
         pnl = bal.diff()
-        pnl.iloc[0] = bal.iloc[0] - initial_capital
-        ret = bal.pct_change()
-        ret.iloc[0] = bal.iloc[0] / initial_capital - 1.0
+        pnl.iloc[0] = bal.iloc[0] - baseline
+        if baseline > 0:
+            ret = bal.pct_change()
+            ret.iloc[0] = bal.iloc[0] / baseline - 1.0
+        else:
+            ret = pd.Series(_NAN, index=bal.index)
         years = len(pnl) / bpy
     else:
         pnl = pd.Series(dtype=float)
@@ -229,8 +245,8 @@ def backtest_stats(
         years = 0.0
 
     cagr = _NAN
-    if years > 0 and final > 0:
-        cagr = 100.0 * ((final / initial_capital) ** (1.0 / years) - 1.0)
+    if years > 0 and final > 0 and baseline > 0:
+        cagr = 100.0 * ((final / baseline) ** (1.0 / years) - 1.0)
 
     # --- Volatility (daily + annualized, $ and %) ---
     pnl_std = pnl.std(ddof=1) if len(pnl) >= 2 else _NAN
@@ -250,11 +266,14 @@ def backtest_stats(
         if downside > 0:
             sortino = pnl.mean() / downside * math.sqrt(bpy)
 
-    # --- Drawdowns (running peak includes the initial-capital baseline) ---
+    # --- Drawdowns (running peak includes the entering-balance baseline) ---
     if not empty:
-        running_peak = np.maximum(bal.cummax(), initial_capital)
+        running_peak = np.maximum(bal.cummax(), baseline)
         dd_usd = running_peak - bal
-        dd_pct = 100.0 * dd_usd / running_peak
+        if baseline > 0:
+            dd_pct = 100.0 * dd_usd / running_peak
+        else:
+            dd_pct = pd.Series(_NAN, index=dd_usd.index)
         max_dd_usd = float(dd_usd.max())
         max_dd_pct = float(dd_pct.max())
         episodes = _drawdown_episodes(dd_usd, dd_pct)

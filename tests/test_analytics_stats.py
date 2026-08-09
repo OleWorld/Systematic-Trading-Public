@@ -9,6 +9,10 @@ Pin:
 - Per-closing-fill trade stats (fills with ``realized_pnl != 0``).
 - Edge cases return NaN/NaT/0 cleanly (empty inputs, constant balance,
   no closing trades, all-winning trade log) — never raise.
+- ``start=`` re-baselines to the entering balance (2026-08): no pre-start
+  PnL folds into the first kept bar, drawdown peaks seed at the entering
+  balance, a wiped-out head (entering ≤ 0) NaNs the %/ratio metrics, and
+  the result matches the ``window_pnl``/``window_stats`` convention.
 - Parameter validation raises (non-DataFrame, non-positive capital,
   unknown days_convention).
 
@@ -406,6 +410,75 @@ def test_start_with_timestampless_trade_log_rejected():
         backtest_stats(eq, bad_trades, initial_capital=100_000.0,
                        timeframe='1d', days_convention='calendar',
                        start=pd.Timestamp('2024-01-01', tz='UTC'))
+
+
+# ──────────────────────────────────────────────
+# start= re-baseline (2026-08)
+# ──────────────────────────────────────────────
+
+def test_start_rebaselines_to_entering_balance():
+    # Entering balance = last pre-start bar (130k), NOT initial capital.
+    # Old fold-in semantics would report Net PnL 31_000 and a 25k spike bar.
+    balances = [100_000.0, 130_000.0, 125_000.0, 128_000.0, 131_000.0]
+    stats = _stats(balances, start=pd.Timestamp('2024-01-03', tz='UTC'))
+    assert stats['Net PnL [$]'] == pytest.approx(1_000.0)
+    assert stats['Return [%]'] == pytest.approx(100.0 * 1_000.0 / 130_000.0)
+    # Window bar PnLs are [-5k, +3k, +3k] — no synthetic spike.
+    expected_vol = float(np.std([-5_000.0, 3_000.0, 3_000.0],
+                                ddof=1)) * 365.0 ** 0.5
+    assert stats['Volatility (Ann.) [$]'] == pytest.approx(expected_vol)
+
+
+def test_start_drawdown_peak_seeds_at_entering_balance():
+    # Pre-start peak (150k) is forgotten; the window dip below the 130k
+    # entering balance IS a drawdown (the old initial-capital seed of 100k
+    # would have reported zero drawdown).
+    balances = [100_000.0, 150_000.0, 130_000.0, 129_000.0, 132_000.0]
+    stats = _stats(balances, start=pd.Timestamp('2024-01-04', tz='UTC'))
+    assert stats['Max Drawdown [$]'] == pytest.approx(1_000.0)
+    assert stats['Max Drawdown [%]'] == pytest.approx(100.0 * 1_000.0 / 130_000.0)
+    assert stats['Equity Peak [$]'] == pytest.approx(132_000.0)
+
+
+def test_start_wiped_out_head_nans_percent_metrics_keeps_dollars():
+    # Entering balance -5k <= 0: dollar metrics computed, %/ratio metrics NaN.
+    balances = [100_000.0, -5_000.0, -4_000.0, -4_500.0]
+    stats = _stats(balances, start=pd.Timestamp('2024-01-03', tz='UTC'))
+    assert stats['Net PnL [$]'] == pytest.approx(500.0)
+    assert stats['Max Drawdown [$]'] == pytest.approx(500.0)
+    assert stats['Equity Final [$]'] == pytest.approx(-4_500.0)
+    assert stats['Equity Peak [$]'] == pytest.approx(-4_000.0)
+    for label in ('Return [%]', 'CAGR [%]', 'Volatility (Daily) [%]',
+                  'Volatility (Ann.) [%]', 'Max Drawdown [%]',
+                  'Avg Drawdown [%]', 'Calmar Ratio'):
+        assert pd.isna(stats[label]), label
+
+
+def test_start_rebaseline_matches_window_pnl_convention():
+    # F4 unification is now literal: backtest_stats(start=) equals the
+    # window_pnl -> window_stats derivation on the same curve.
+    from validation._common import window_pnl, window_stats
+    balances = [100_000.0, 104_000.0, 98_000.0, 103_000.0,
+                107_000.0, 105_000.0]
+    s = pd.Timestamp('2024-01-04', tz='UTC')
+    stats = _stats(balances, start=s)
+    pnl, baseline = window_pnl(_equity_curve(balances),
+                               initial_capital=100_000.0, start=s)
+    assert baseline == pytest.approx(98_000.0)
+    ws = window_stats(pnl, bars_per_year=365.0, baseline=baseline)
+    for label in ('Sharpe Ratio', 'Sortino Ratio', 'Net PnL [$]',
+                  'Volatility (Ann.) [$]', 'Max Drawdown [$]',
+                  'Max Drawdown [%]', 'Return [%]', 'CAGR [%]'):
+        assert float(stats[label]) == pytest.approx(ws[label],
+                                                    rel=1e-12), label
+
+
+def test_start_at_first_bar_equals_full_stats():
+    # No pre-start rows -> entering balance falls back to initial_capital.
+    balances = [100_000.0, 101_000.0, 99_500.0]
+    full = _stats(balances)
+    trimmed = _stats(balances, start=pd.Timestamp('2024-01-01', tz='UTC'))
+    assert full.equals(trimmed)
 
 
 # ──────────────────────────────────────────────

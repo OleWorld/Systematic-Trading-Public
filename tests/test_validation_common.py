@@ -1,5 +1,7 @@
 """Tests for validation._common — shared PnL/stats internals."""
 
+import inspect
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -29,10 +31,11 @@ def test_pnl_first_bar_measured_against_initial_capital():
     assert list(pnl) == [10.0, -5.0, 25.0]
 
 
-def test_pnl_start_trim_folds_prior_pnl_into_first_kept_bar():
-    eq = _equity([1010.0, 1005.0, 1030.0])
-    pnl = pnl_from_equity(eq, initial_capital=1000.0, start='2024-01-02')
-    assert list(pnl) == [5.0, 25.0]   # 1005 - 1000, then 1030 - 1005
+def test_pnl_from_equity_has_no_start_param():
+    """Fold-in start= removed 2026-08: backtest_stats re-baselines
+    internally and window trimming lives in window_pnl. Guard against
+    reintroduction."""
+    assert 'start' not in inspect.signature(pnl_from_equity).parameters
 
 
 def test_pnl_param_validation():
@@ -50,14 +53,15 @@ def test_pnl_empty_curve_gives_empty_series():
     assert pnl_from_equity(pd.DataFrame(), initial_capital=1000.0).empty
 
 
-def test_pnl_start_accepts_tz_aware_first_fill_output():
-    """first_fill() -> pnl_from_equity(start=...) is the documented warmup
+def test_window_pnl_accepts_tz_aware_first_fill_output():
+    """first_fill() -> window_pnl(start=...) is the documented warmup
     trim composition; its tz-aware timestamp must not raise."""
     eq = _equity([1010.0, 1005.0, 1030.0])
     log = pd.DataFrame({'timestamp': pd.to_datetime(['2024-01-02'], utc=True),
                         'realized_pnl': [1.0]})
-    pnl = pnl_from_equity(eq, initial_capital=1000.0, start=first_fill(log))
-    assert list(pnl) == [5.0, 25.0]
+    pnl, baseline = window_pnl(eq, initial_capital=1000.0,
+                               start=first_fill(log))
+    assert list(pnl) == [-5.0, 25.0] and baseline == 1010.0
 
 
 def test_window_stats_matches_backtest_stats_conventions():
@@ -127,13 +131,12 @@ def test_collapse_equity_naive_index_raises():
         collapse_equity(_naive_curve())
 
 
-def test_pnl_from_equity_naive_start_with_time_raises():
-    from validation._common import pnl_from_equity
+def test_window_pnl_naive_start_with_time_raises():
     idx = pd.to_datetime(['2024-01-01', '2024-01-02'], utc=True)
     eq = pd.DataFrame({'account_balance': [100.0, 110.0]}, index=idx)
     with pytest.raises(ValueError, match="start.*timezone-naive"):
-        pnl_from_equity(eq, initial_capital=100.0,
-                        start=pd.Timestamp('2024-01-02 05:00'))
+        window_pnl(eq, initial_capital=100.0,
+                   start=pd.Timestamp('2024-01-02 05:00'))
 
 
 def test_window_pnl_date_only_start_accepted():

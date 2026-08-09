@@ -242,9 +242,12 @@ def test_cell_store_survives_transient_rename_lock(tmp_path, monkeypatch):
 
 def test_table_reseeds_entering_balance_no_fold_in_spike():
     """Cell A earns +100/bar for 30 bars BEFORE the common first fill;
-    cell B is flat there. Under the old fold-in trim, A's first kept bar
-    carried a synthetic +3000 spike. Reseeded stats must equal a manual
-    backtest_stats call with initial_capital = capital + 3000."""
+    cell B is flat there. Under the pre-2026-08 fold-in trim, A's first
+    kept bar carried a synthetic +3000 spike. Reseeded stats must equal a
+    manual backtest_stats call with initial_capital = capital + 3000 —
+    and, since backtest_stats now re-baselines internally, the same call
+    with the RAW capital must agree too (the entering balance is read off
+    the curve, not the capital argument)."""
     def run_fn(cell):
         pnl = np.zeros(100)
         if cell == 1:
@@ -273,11 +276,17 @@ def test_table_reseeds_entering_balance_no_fold_in_spike():
     row = sweep.table[sweep.table['cell'] == 1].iloc[0]
     assert row['Sharpe Ratio'] == expected['Sharpe Ratio']
     assert row['Net PnL [$]'] == expected['Net PnL [$]']
-    # and it must DIFFER from the old fold-in numbers
-    folded = backtest_stats(
+    # capital-argument independence: the internal re-baseline reads the
+    # entering balance off the curve, so the raw capital agrees (the old
+    # fold-in produced a different, spike-distorted Sharpe here)
+    internal = backtest_stats(
         eq1, tr1, initial_capital=cap1,
         timeframe='1d', days_convention='calendar', start=start)
-    assert row['Sharpe Ratio'] != folded['Sharpe Ratio']
+    assert row['Sharpe Ratio'] == internal['Sharpe Ratio']
+    # and the window Net PnL excludes the +3000 pre-window head PnL that
+    # the fold-in would have counted
+    assert row['Net PnL [$]'] == pytest.approx(
+        float(row['Equity Final [$]']) - (cap1 + 3000.0))
 
 
 def test_table_stats_start_none_unchanged():
