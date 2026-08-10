@@ -433,11 +433,11 @@ from correlation import CorrelationManager
 from execution import BacktestExecution
 from portfolio import BacktestPortfolio
 from riskmanager import SimpleRiskManager
-from strategy import Strategy
+from strategy import TimeSeriesStrategy
 from universe import UniverseManager
 
 
-class _FundingToyStrategy(Strategy):
+class _FundingToyStrategy(TimeSeriesStrategy):
     """Toy alt consumer: forecast = -sign(latest funding rate) * 50.
 
     Returns ``None`` (no forecast — warmup) until the symbol has at

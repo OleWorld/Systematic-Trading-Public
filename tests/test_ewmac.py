@@ -256,7 +256,7 @@ def test_fdm_scales_combined_forecast():
 def test_fdm_clamps_at_cap_when_combined_exceeds_bound():
     """A large ``fdm`` (well above 1.0) on a steadily trending series can
     push the FDM-multiplied weighted sum past ``±Strategy.FORECAST_CAP``.
-    The safety-net clamp in ``Strategy.update_bar`` must keep the recorded
+    The safety-net clamp in ``TimeSeriesStrategy.update_bar`` must keep the recorded
     forecast inside the bound, and the fixture must actually exercise the
     clamp (at least one bar at the cap) so the test is not a trivial pass."""
     symbol = 'BTC'
@@ -335,7 +335,7 @@ def _vectorized_ewmac(
     EMAs are seeded on ``closes.iloc[1:]`` and Stdev runs on
     ``closes.diff().iloc[1:]``. The returned Series is reindexed onto
     ``closes`` with bar 0 left as NaN. The final ``±Strategy.FORECAST_CAP``
-    clamp mirrors ``Strategy.update_bar``'s base-class clamp; the dynamic
+    clamp mirrors ``TimeSeriesStrategy.update_bar``'s base-class clamp; the dynamic
     forecast scalar reads ``Strategy.TARGET_AVG_ABS_FORECAST`` (the
     project-wide target average absolute forecast).
 

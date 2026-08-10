@@ -41,8 +41,9 @@ Public surface:
 * ``turnover_stats(equity_curve, trade_log, *, timeframe,
   days_convention)`` — per-instrument Carver turnover table (avg
   |position| in contracts, round trips/year, avg holding days over the
-  first-fill→end active window) plus an ``'Average'`` row carrying only
-  the holding-period mean.
+  first-fill→end active window) plus an ``'Average'`` row carrying the
+  cross-instrument means of the unitless columns (round trips/year,
+  holding days; avg position stays NaN).
 """
 
 from analytics._attribution import PnLAttributionResult, pnl_attribution

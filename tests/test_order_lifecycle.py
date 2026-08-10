@@ -37,7 +37,7 @@ from event import BarEvent
 from execution import BacktestExecution, CommissionModel, SlippageModel
 from portfolio import BacktestPortfolio, PortfolioMarginModel
 from riskmanager import VolTargetingRiskManager
-from strategy import Strategy
+from strategy import TimeSeriesStrategy
 from universe import UniverseManager
 from volatility import VolEstimator
 
@@ -53,7 +53,7 @@ _MIN_HISTORY_BARS = 32
 _CORR_STEP_SIZE = 5
 
 
-class ConstLongStrategy(Strategy):
+class ConstLongStrategy(TimeSeriesStrategy):
     """Forecast +50 (long, half conviction) on every bar."""
 
     def calculate_forecast(self, event: BarEvent):

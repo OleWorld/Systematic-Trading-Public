@@ -367,13 +367,13 @@ def test_single_strategy_mode_uses_class_name_and_variations():
 def test_real_orchestrator_record_schema():
     from event import BarEvent
     from orchestrator import Orchestrator
-    from strategy import Strategy
+    from strategy import TimeSeriesStrategy
 
-    class _ConstLong(Strategy):
+    class _ConstLong(TimeSeriesStrategy):
         def calculate_forecast(self, event):
             return {'forecast': 20.0}
 
-    class _ConstShort(Strategy):
+    class _ConstShort(TimeSeriesStrategy):
         def calculate_forecast(self, event):
             return {'forecast': -10.0}
 

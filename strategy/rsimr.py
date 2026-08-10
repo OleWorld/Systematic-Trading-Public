@@ -40,7 +40,7 @@ cap, while the dynamic scalar drives the average absolute forecast toward
 oscillator, so — unlike EWMAC — there is **no** price-volatility normalization
 term; the dynamic scalar is the only scaling machinery.
 
-Output: per-bar dict with the ``'forecast'`` key. ``Strategy.update_bar``
+Output: per-bar dict with the ``'forecast'`` key. ``TimeSeriesStrategy.update_bar``
 clamps it to ``±Strategy.FORECAST_CAP`` and writes it to
 ``self.forecasts[symbol]``; the risk manager reads it on every completed bar to
 derive the target position. The forecast depends only on finalized values (via
@@ -62,6 +62,7 @@ import pandas as pd
 from event import BarEvent
 from indicator import RSI, SMA
 from strategy._base import Strategy, _DataHandlerLike
+from strategy._timeseries import TimeSeriesStrategy
 
 __all__ = ['RSIMRStrategy']
 
@@ -104,7 +105,7 @@ def _raw_from_rsi(rsi_value: float) -> float:
     return -math.atanh(dev)
 
 
-class RSIMRStrategy(Strategy):
+class RSIMRStrategy(TimeSeriesStrategy):
     """RSI mean-reverter with one or more RSI windows and a dynamic forecast scalar.
 
     Per-symbol state (per-variation indicators keyed by variation label):
@@ -310,7 +311,7 @@ class RSIMRStrategy(Strategy):
         # ── Combine per-variation forecasts. ────────────────────────────────
         # If ANY variation isn't ready, the combined forecast is undefined — we
         # don't backfill from finite variations because the weights are
-        # calibrated against the full ensemble. ``Strategy.update_bar`` clamps
+        # calibrated against the full ensemble. ``TimeSeriesStrategy.update_bar`` clamps
         # the final value to ``±Strategy.FORECAST_CAP`` before storing it, so no
         # clamp is applied here.
         if any(pd.isna(per_var_forecasts[l]) for l in self.variations):

@@ -5,8 +5,10 @@ Pin:
   under the calendar convention.
 - The active window starts at the first fill (pre-listing zeros dilute
   the average position otherwise).
-- Zero-fill symbols are excluded; the 'Average' row carries only the
-  holding-period mean; rows sort alphabetically with 'Average' last.
+- Zero-fill symbols are excluded; the 'Average' row carries the
+  cross-instrument means of the unitless columns (round trips/year,
+  holding days) and NaN avg position (contract counts are not
+  comparable); rows sort alphabetically with 'Average' last.
 - Multi-row-per-timestamp equity curves collapse to the last row.
 - Data edge cases yield NaN / empty frames — never raise.
 - Parameter validation raises (non-DataFrame, bad convention, missing
@@ -126,7 +128,7 @@ def test_business_convention_changes_annualization():
 # Table shape: ordering, Average row, exclusions
 # ──────────────────────────────────────────────
 
-def test_multi_symbol_average_row_holding_only():
+def test_multi_symbol_average_row_unitless_means():
     positions = [
         {'AAA': 0, 'BBB': 0},
         {'AAA': 0, 'BBB': 1},
@@ -138,12 +140,12 @@ def test_multi_symbol_average_row_holding_only():
     table = _stats(positions, [(2, 'AAA', 2), (1, 'BBB', 1)])
 
     assert list(table.index) == ['AAA', 'BBB', 'Average']
-    # AAA holds 8 days (golden above); BBB: window 5 bars, avg 1,
-    # rt = 0.5 * 365/5 = 36.5 → holding 10 days. Average = 9.
+    # AAA: rt 45.625, holds 8 days (golden above); BBB: window 5 bars,
+    # avg 1, rt = 0.5 * 365/5 = 36.5 → holding 10 days.
     assert table.loc['BBB', 'Avg Holding [days]'] == pytest.approx(10.0)
     avg = table.loc['Average']
     assert math.isnan(avg['Avg Position [contracts]'])
-    assert math.isnan(avg['Round Trips / Year'])
+    assert avg['Round Trips / Year'] == pytest.approx((45.625 + 36.5) / 2)
     assert avg['Avg Holding [days]'] == pytest.approx(9.0)
 
 
@@ -173,6 +175,7 @@ def test_zero_average_position_yields_nan_not_raise():
     assert row['Avg Position [contracts]'] == pytest.approx(0.0)
     assert math.isnan(row['Round Trips / Year'])
     assert math.isnan(row['Avg Holding [days]'])
+    assert math.isnan(table.loc['Average', 'Round Trips / Year'])
     assert math.isnan(table.loc['Average', 'Avg Holding [days]'])
 
 
