@@ -169,6 +169,24 @@ class Orchestrator:
         # Per-symbol list of diagnostic row dicts (see get_records).
         self._records: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
+    @property
+    def context_symbols(self) -> List[str]:
+        """Sorted union of children's ``context_symbols`` minus the union
+        of children's traded ``symbol_list``.
+
+        Cross-strategy overlap is legal by design: child A trading X while
+        child B reads X means X is traded at the composite level, so it
+        drops out of the composite context set. Children without a
+        ``context_symbols`` attribute (pre-context duck-typed sources)
+        declare nothing.
+        """
+        traded: set = set()
+        context: set = set()
+        for strat in self.strategies.values():
+            traded.update(strat.symbol_list)
+            context.update(getattr(strat, 'context_symbols', ()))
+        return sorted(context - traded)
+
     @staticmethod
     def _validate_weights(
         weights: Optional[Dict[str, float]], labels: List[str],

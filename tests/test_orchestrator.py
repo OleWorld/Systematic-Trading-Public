@@ -541,3 +541,46 @@ def test_get_budget_groups_reads_overwritten_weights_fresh():
     groups = orch.get_budget_groups()
     assert groups['a'][0] == 0.9
     assert groups['b'][0] == 0.1
+
+
+# ──────────────────────────────────────────────
+# context_symbols union property
+# ──────────────────────────────────────────────
+
+class _CtxChild:
+    """Minimal forecast-source double for the context-union tests: the
+    Orchestrator surface check needs symbol_list + callable get_forecast
+    + callable update_bar; context_symbols is optional by design."""
+
+    def __init__(self, symbols, context=None):
+        self.symbol_list = list(symbols)
+        if context is not None:
+            self.context_symbols = list(context)
+
+    def get_forecast(self, symbol):
+        return None
+
+    def update_bar(self, event):
+        pass
+
+
+def test_context_symbols_unions_children():
+    orch = Orchestrator({'a': _CtxChild(['X'], context=['C1', 'C2']),
+                         'b': _CtxChild(['Y'], context=['C2', 'C3'])})
+    assert orch.context_symbols == ['C1', 'C2', 'C3']
+
+
+def test_context_symbols_cross_strategy_overlap_is_traded():
+    """Child a READS C1 while child b TRADES C1 → C1 is traded at the
+    composite level and drops out of the composite context set."""
+    orch = Orchestrator({'a': _CtxChild(['X'], context=['C1']),
+                         'b': _CtxChild(['C1'])})
+    assert orch.context_symbols == []
+    assert orch.symbol_list == ['C1', 'X']
+
+
+def test_context_symbols_children_without_attribute():
+    """Pre-context duck-typed children (no context_symbols attr) are
+    treated as declaring nothing — the property must not raise."""
+    orch = Orchestrator({'a': _CtxChild(['X'])})
+    assert orch.context_symbols == []
