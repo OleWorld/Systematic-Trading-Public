@@ -121,11 +121,16 @@ class SimpleRiskManager(RiskManager):
         ``'at_target'`` check and the submit call. Records one
         diagnostic row per *completed* bar — including early-exit
         branches — into ``self._records[symbol]`` via ``_record_row``.
+        Bars for symbols outside ``strategy.symbol_list`` (context symbols)
+        are skipped before any state update.
         """
         if event.is_forming:
             return
 
         symbol = event.symbol
+        if symbol not in self._traded_symbols:
+            # Context symbol: streamed for strategies to read, never sized.
+            return
         forecast = self.strategy.get_forecast(symbol)
         current_qty = self.portfolio.positions.get(symbol, 0.0)
         # Signed sum of in-flight (pending) MKT orders — e.g. a same-bar

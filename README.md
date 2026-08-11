@@ -89,7 +89,12 @@ class MyStrategy(TimeSeriesStrategy):
 symbol's bars and forecast that symbol alone; the mode-agnostic `Strategy`
 base underneath owns the forecast cache, clamping, warmup tracking, and
 per-bar records (a future cross-sectional template will subclass it
-directly).
+directly). A strategy that needs another symbol's data without trading it
+(e.g. a spread's flat-price series) declares it via the `context_symbols`
+constructor param — the engine streams it, the risk manager and universe
+ignore it, and the `Backtester` verifies at construction that its data was
+supplied; register context symbols with the portfolio and its instruments
+registry (they stay economically inert).
 
 **Available inside `calculate_forecast`:**
 

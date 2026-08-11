@@ -45,10 +45,62 @@ class Backtester:
     Callers wire each module explicitly and pass them in. See
     ``backtests/sample_backtest/backtest_ewmac_sample.py`` for a worked
     example.
+
+    Construction validates symbol wiring: ``strategy.symbol_list`` plus
+    the strategy's declared ``context_symbols`` must exactly cover
+    ``data_handler.symbol_list`` (both directions raise ``ValueError``
+    naming the offending symbols). ``symbol_list`` is therefore a
+    required surface on the strategy and data-handler slots. When the
+    portfolio exposes ``symbol_list``, it must additionally cover every
+    data symbol (context symbols included — their entries stay
+    economically inert); duck-typed portfolio doubles without
+    ``symbol_list`` skip this extra check.
     """
     def __init__(self, events_queue, data_handler, strategy, portfolio,
                  risk_manager, execution_handler,
                  universe_manager, correlation_manager):
+        # Wiring check (context-symbols contract): the engine streams
+        # exactly the handler's symbols, so every one must be accounted
+        # for — traded by the strategy or declared read-only context —
+        # and every symbol the strategy needs must have data. Both
+        # directions fail loud HERE, at construction, not mid-run.
+        traded = set(strategy.symbol_list)
+        context = set(getattr(strategy, 'context_symbols', ())) - traded
+        handler = set(data_handler.symbol_list)
+        missing = sorted((traded | context) - handler)
+        if missing:
+            raise ValueError(
+                f"Symbols required by the strategy but absent from the "
+                f"data handler: {missing} — every traded or context "
+                f"symbol needs supplied data"
+            )
+        stray = sorted(handler - (traded | context))
+        if stray:
+            raise ValueError(
+                f"Data symbols neither traded nor declared as context: "
+                f"{stray} — declare them in a strategy's context_symbols "
+                f"or remove them from the data dict"
+            )
+
+        # BacktestPortfolio.update_bar indexes self.instruments[symbol] /
+        # self.positions[symbol] unconditionally for every streamed
+        # symbol, so the portfolio (traded AND context alike) must cover
+        # the full data handler symbol list — a miss otherwise fails as a
+        # bare mid-run KeyError. getattr-guarded so duck-typed portfolio
+        # doubles without a symbol_list (e.g. tests/test_backtester.py's
+        # RecordingPortfolio) keep working. ONE direction only — a
+        # portfolio wider than the data is inert, not an error.
+        pf_syms = getattr(portfolio, 'symbol_list', None)
+        if pf_syms is not None:
+            pf_missing = sorted(handler - set(pf_syms))
+            if pf_missing:
+                raise ValueError(
+                    f"Data symbols missing from the portfolio's symbol "
+                    f"list: {pf_missing} — the portfolio (and its "
+                    f"instruments registry) must cover traded and context "
+                    f"symbols alike"
+                )
+
         self.events = events_queue
         self.data_handler = data_handler
         self.strategy = strategy

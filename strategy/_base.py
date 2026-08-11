@@ -23,7 +23,7 @@ Concrete example strategies live in sibling modules (e.g. ``ewmac``).
 import logging
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 import pandas as pd
 from scipy.stats import norm
@@ -87,7 +87,8 @@ class Strategy(ABC):
     FORECAST_CAP: float = 100.0
 
     def __init__(self, data_handler: _DataHandlerLike,
-                 symbol_list: List[str]):
+                 symbol_list: List[str],
+                 context_symbols: Sequence[str] = ()):
         """
         Bind dependencies and initialise per-symbol state.
 
@@ -98,9 +99,31 @@ class Strategy(ABC):
         symbol_list
             Symbols this strategy acts on. Bars for other symbols are
             ignored by ``update_bar``.
+        context_symbols
+            Symbols this strategy READS from the data handler but never
+            trades (e.g. a flat-price series informing a timespread
+            forecast). They get no forecast/warmup slots and are invisible
+            to the risk manager and universe; the ``Backtester`` wiring
+            check requires them to be present in the data handler. Must
+            not overlap ``symbol_list`` (ValueError).
         """
+        if isinstance(context_symbols, str):
+            raise ValueError(
+                f"context_symbols must be a sequence of symbols, not a "
+                f"bare string: {context_symbols!r}"
+            )
+        overlap = set(symbol_list) & set(context_symbols)
+        if overlap:
+            raise ValueError(
+                f"context_symbols overlap symbol_list: {sorted(overlap)} — "
+                f"a symbol cannot be both traded and read-only context"
+            )
         self.data_handler = data_handler
         self.symbol_list = symbol_list
+        # Read-only data dependencies — declared here (where they are
+        # consumed) so the Backtester wiring check can verify they exist
+        # in the data dict at construction time.
+        self.context_symbols: List[str] = list(context_symbols)
         # Per-symbol cached forecast in [-100, +100]. Default None means
         # "no forecast cached yet" (warmup) — distinct from a genuine flat
         # forecast of 0.0. The risk manager reads this dict on every
