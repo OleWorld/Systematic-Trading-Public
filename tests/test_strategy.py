@@ -49,8 +49,10 @@ class DummyStrategy(TimeSeriesStrategy):
 
     def __init__(self, data_handler, symbol_list,
                  forecast_fn: Optional[Callable[['DummyStrategy', BarEvent],
-                                                Optional[Dict[str, Any]]]] = None):
-        super().__init__(data_handler, symbol_list)
+                                                Optional[Dict[str, Any]]]] = None,
+                 context_symbols=()):
+        super().__init__(data_handler, symbol_list,
+                         context_symbols=context_symbols)
         self._forecast_fn = forecast_fn
 
     def calculate_forecast(self, event: BarEvent) -> Optional[Dict[str, Any]]:
@@ -388,3 +390,44 @@ def test_is_warmed_up_is_per_symbol():
     s.update_bar(_bar(symbol='BTC'))
     assert s.is_warmed_up('BTC') is True
     assert s.is_warmed_up('ETH') is False
+
+
+# ──────────────────────────────────────────────
+# context_symbols declaration
+# ──────────────────────────────────────────────
+
+def test_context_symbols_default_empty_list():
+    """No declaration → empty list, not None (uniform iteration surface)."""
+    s = _build()
+    assert s.context_symbols == []
+
+
+def test_context_symbols_stored_but_not_forecast_keyed():
+    """Declared context symbols are recorded on the instance but do NOT
+    get forecast/warmup slots — they are read-only data, never sized."""
+    s = DummyStrategy(FakeDataHandler(), ['BTC'], context_symbols=['CTX'])
+    assert s.context_symbols == ['CTX']
+    assert 'CTX' not in s.forecasts
+    assert s.is_warmed_up('CTX') is False
+    assert s.get_forecast('CTX') is None
+
+
+def test_context_symbols_overlap_with_symbol_list_raises():
+    """A symbol cannot be both traded and read-only context for the same
+    strategy — almost certainly a wiring typo, so it fails loud."""
+    with pytest.raises(ValueError, match="context_symbols"):
+        DummyStrategy(FakeDataHandler(), ['BTC', 'ETH'],
+                      context_symbols=['ETH'])
+
+
+def test_update_bar_ignores_context_symbol_bars():
+    """The TimeSeriesStrategy symbol filter already excludes context bars —
+    pin it: a context bar leaves forecasts and records untouched."""
+    calls = []
+    s = DummyStrategy(FakeDataHandler(), ['BTC'],
+                      forecast_fn=lambda self, e: calls.append(e) or
+                      {'forecast': 10.0},
+                      context_symbols=['CTX'])
+    s.update_bar(_bar(symbol='CTX'))
+    assert calls == []
+    assert s.get_forecast('BTC') is None
