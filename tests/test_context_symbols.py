@@ -207,3 +207,93 @@ def test_wiring_duck_typed_strategy_without_context_attr_passes():
     working — getattr defaults the declaration to empty."""
     bt = _wire(['X'], SimpleNamespace(symbol_list=['X']))
     assert bt is not None
+
+
+# ──────────────────────────────────────────────
+# Engine-level end-to-end pin
+# ──────────────────────────────────────────────
+
+class ContextSignStrategy(TimeSeriesStrategy):
+    """Forecast for the TRADED symbol from the CONTEXT symbol's direction:
+    +50 if the context close rose, -50 if it fell (finalized pair — bars
+    [-2]/[-3], robust to intra-timestamp symbol ordering), None during
+    warmup. With a strictly falling context series the forecast is
+    provably context-driven: a strategy ignoring context data could not
+    deterministically emit -50."""
+
+    CTX = 'C'
+
+    def calculate_forecast(self, event: BarEvent):
+        bars = self.data_handler.get_latest_bars(self.CTX, n=3,
+                                                 timeframe='1d')
+        if len(bars) < 3:
+            return None
+        prev, last = bars[-3].close, bars[-2].close
+        if last == prev:
+            return None
+        return {'forecast': 50.0 if last > prev else -50.0}
+
+
+def _ohlcv(closes, idx):
+    return pd.DataFrame({'Open': closes, 'High': closes, 'Low': closes,
+                         'Close': closes, 'Volume': [1.0] * len(closes)},
+                        index=idx)
+
+
+def _run_context_engine(n_bars: int = 45):
+    """Real 8-component graph: traded 'X' (rising), context 'C' (strictly
+    falling). Mirrors tests/test_order_lifecycle.py::_run_engine — 32-bar
+    history gate, 5-bar correlation cadence, constant sigma via
+    _RecordingVol, zero costs."""
+    idx = pd.date_range('2024-01-01', periods=n_bars, freq='D', tz='UTC')
+    x_closes = [100.0 + 0.5 * i for i in range(n_bars)]
+    c_closes = [200.0 - 1.0 * i for i in range(n_bars)]
+    events = thread_queue.Queue()
+    instruments = uniform_registry(
+        ['C', 'X'], point_value=1.0, fractional=True,
+        slippage=SlippageModel('absolute', 0.0),
+        commission=CommissionModel('per_contract', 0.0),
+        margin=PortfolioMarginModel.from_leverage(
+            10.0, maintenance_margin_rate=0.05,
+        ),
+    )
+    dh = HistoricDataHandler(events, ['C', 'X'], '1d', {'1d': 100},
+                             data={'X': _ohlcv(x_closes, idx),
+                                   'C': _ohlcv(c_closes, idx)})
+    strategy = ContextSignStrategy(dh, ['X'], context_symbols=['C'])
+    portfolio = BacktestPortfolio(events, dh, ['C', 'X'], instruments,
+                                  initial_capital=1_000_000.0)
+    universe_manager = UniverseManager(strategy, dh, min_history_bars=32,
+                                       history_timeframe='1d')
+    correlation_manager = CorrelationManager(dh, universe_manager,
+                                             lookback=32, step_size=5,
+                                             timeframe='1d')
+    rm = VolTargetingRiskManager(
+        portfolio, strategy, _RecordingVol(), universe_manager,
+        instruments=instruments, annual_target_vol=100.0,
+        vol_target_mode='dollar_volatility', position_buffer=0.25,
+        instrument_weight_mode='equal_weight',
+    )
+    execution = BacktestExecution(events, instruments)
+    Backtester(events, dh, strategy, portfolio, rm, execution,
+               universe_manager, correlation_manager).run()
+    return portfolio, rm, strategy, universe_manager
+
+
+def test_context_symbol_streams_end_to_end():
+    """REGRESSION PIN: before the RM guard, this run died on 'C's first
+    completed bar with ValueError from UniverseManager.status(). Now the
+    context symbol drives the forecast and stays invisible to sizing."""
+    portfolio, rm, strategy, um = _run_context_engine()
+    # Forecast is context-driven: C falls every bar → -50.
+    assert strategy.get_forecast('X') == -50.0
+    # ...and sizing acted on it: short position in the traded symbol.
+    assert portfolio.positions.get('X', 0.0) < 0
+    # Context symbol is invisible to sizing and accounting:
+    assert portfolio.positions.get('C', 0.0) == 0.0
+    assert rm.get_records('C').empty
+    # ...and to the universe:
+    log = um.get_transition_log()
+    assert 'C' not in set(log['symbol'])
+    with pytest.raises(ValueError, match="not in"):
+        um.status('C')
