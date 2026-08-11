@@ -209,6 +209,37 @@ def test_wiring_duck_typed_strategy_without_context_attr_passes():
     assert bt is not None
 
 
+class _WiringPortfolio:
+    def __init__(self, symbols):
+        self.symbol_list = list(symbols)
+
+
+def test_wiring_portfolio_missing_context_symbol_raises():
+    """The portfolio must cover every streamed symbol — a context symbol
+    absent from its list previously died as a mid-run KeyError."""
+    with pytest.raises(ValueError, match=r"portfolio.*\['C'\]"):
+        Backtester(thread_queue.Queue(), _WiringHandler(['C', 'X']),
+                   _StubStrategy(['X'], context=['C']),
+                   _WiringPortfolio(['X']), object(), object(),
+                   object(), object())
+
+
+def test_wiring_portfolio_without_symbol_list_passes():
+    """Duck-typed portfolio doubles without symbol_list skip the check."""
+    bt = Backtester(thread_queue.Queue(), _WiringHandler(['C', 'X']),
+                    _StubStrategy(['X'], context=['C']),
+                    object(), object(), object(), object(), object())
+    assert bt is not None
+
+
+def test_wiring_portfolio_covering_all_passes():
+    bt = Backtester(thread_queue.Queue(), _WiringHandler(['C', 'X']),
+                    _StubStrategy(['X'], context=['C']),
+                    _WiringPortfolio(['C', 'X']), object(), object(),
+                    object(), object())
+    assert bt is not None
+
+
 # ──────────────────────────────────────────────
 # Engine-level end-to-end pin
 # ──────────────────────────────────────────────

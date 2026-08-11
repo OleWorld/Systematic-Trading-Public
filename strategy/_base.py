@@ -107,6 +107,11 @@ class Strategy(ABC):
             check requires them to be present in the data handler. Must
             not overlap ``symbol_list`` (ValueError).
         """
+        if isinstance(context_symbols, str):
+            raise ValueError(
+                f"context_symbols must be a sequence of symbols, not a "
+                f"bare string: {context_symbols!r}"
+            )
         overlap = set(symbol_list) & set(context_symbols)
         if overlap:
             raise ValueError(

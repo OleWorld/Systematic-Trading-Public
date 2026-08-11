@@ -420,6 +420,12 @@ def test_context_symbols_overlap_with_symbol_list_raises():
                       context_symbols=['ETH'])
 
 
+def test_context_symbols_bare_string_raises():
+    """A bare string would silently become per-character symbols."""
+    with pytest.raises(ValueError, match="bare string"):
+        DummyStrategy(FakeDataHandler(), ['BTC'], context_symbols='CTX')
+
+
 def test_update_bar_ignores_context_symbol_bars():
     """The TimeSeriesStrategy symbol filter already excludes context bars —
     pin it: a context bar leaves forecasts and records untouched."""
