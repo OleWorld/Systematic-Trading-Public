@@ -174,6 +174,10 @@ class RiskManager(ABC):
         """
         self.portfolio = portfolio
         self.strategy = strategy
+        # Traded-symbol guard set (static post-construction): bars for
+        # symbols outside the strategy's universe — context symbols — must
+        # be invisible to sizing (no records, no sigma, no orders).
+        self._traded_symbols = frozenset(strategy.symbol_list)
         # Per-symbol diagnostic buffer; subclasses populate via _record_row.
         self._records: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 

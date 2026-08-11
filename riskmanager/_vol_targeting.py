@@ -751,11 +751,18 @@ class VolTargetingRiskManager(RiskManager):
         one diagnostic row per *completed* bar — including every
         early-exit branch — into ``self._records[symbol]`` via
         ``_record_row``, which also emits a DEBUG log line.
+        Bars for symbols outside ``strategy.symbol_list`` (context symbols)
+        are skipped before any state update.
         """
         if event.is_forming:
             return
 
         symbol = event.symbol
+        if symbol not in self._traded_symbols:
+            # Context symbol: streamed for strategies to read, never
+            # sized. Skip BEFORE the vol-estimator update so context bars
+            # build no sigma state.
+            return
 
         # Update vol estimator first so sigma reflects this bar.
         self.vol_estimator.update(event)
