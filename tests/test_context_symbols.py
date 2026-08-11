@@ -162,3 +162,48 @@ def test_simple_rm_skips_context_bar():
     rm.update_bar(_bar('CTX'))
     assert rm.get_records('CTX').empty
     assert pf.submitted == []
+
+
+# ──────────────────────────────────────────────
+# Backtester wiring check
+# ──────────────────────────────────────────────
+
+class _WiringHandler:
+    def __init__(self, symbols):
+        self.symbol_list = list(symbols)
+
+
+def _wire(handler_syms, strategy):
+    """Backtester with placeholder consumers — only __init__ runs."""
+    return Backtester(thread_queue.Queue(), _WiringHandler(handler_syms),
+                      strategy, object(), object(), object(),
+                      object(), object())
+
+
+def test_wiring_missing_traded_symbol_raises():
+    with pytest.raises(ValueError, match=r"\['Y'\]"):
+        _wire(['X'], _StubStrategy(['X', 'Y']))
+
+
+def test_wiring_missing_context_dependency_raises():
+    """The payoff of strategy-declared context: a forgotten flat-price
+    series fails at construction, not as a forever-NaN forecast."""
+    with pytest.raises(ValueError, match=r"\['C'\]"):
+        _wire(['X'], _StubStrategy(['X'], context=['C']))
+
+
+def test_wiring_stray_data_symbol_raises():
+    with pytest.raises(ValueError, match=r"\['Z'\]"):
+        _wire(['X', 'Z'], _StubStrategy(['X']))
+
+
+def test_wiring_exact_coverage_with_context_passes():
+    bt = _wire(['C', 'X'], _StubStrategy(['X'], context=['C']))
+    assert bt is not None
+
+
+def test_wiring_duck_typed_strategy_without_context_attr_passes():
+    """Pre-context forecast sources (no context_symbols attribute) keep
+    working — getattr defaults the declaration to empty."""
+    bt = _wire(['X'], SimpleNamespace(symbol_list=['X']))
+    assert bt is not None

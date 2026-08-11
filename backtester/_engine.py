@@ -45,10 +45,39 @@ class Backtester:
     Callers wire each module explicitly and pass them in. See
     ``backtests/sample_backtest/backtest_ewmac_sample.py`` for a worked
     example.
+
+    Construction validates symbol wiring: ``strategy.symbol_list`` plus
+    the strategy's declared ``context_symbols`` must exactly cover
+    ``data_handler.symbol_list`` (both directions raise ``ValueError``
+    naming the offending symbols). ``symbol_list`` is therefore a
+    required surface on the strategy and data-handler slots.
     """
     def __init__(self, events_queue, data_handler, strategy, portfolio,
                  risk_manager, execution_handler,
                  universe_manager, correlation_manager):
+        # Wiring check (context-symbols contract): the engine streams
+        # exactly the handler's symbols, so every one must be accounted
+        # for — traded by the strategy or declared read-only context —
+        # and every symbol the strategy needs must have data. Both
+        # directions fail loud HERE, at construction, not mid-run.
+        traded = set(strategy.symbol_list)
+        context = set(getattr(strategy, 'context_symbols', ())) - traded
+        handler = set(data_handler.symbol_list)
+        missing = sorted((traded | context) - handler)
+        if missing:
+            raise ValueError(
+                f"Symbols required by the strategy but absent from the "
+                f"data handler: {missing} — every traded or context "
+                f"symbol needs supplied data"
+            )
+        stray = sorted(handler - (traded | context))
+        if stray:
+            raise ValueError(
+                f"Data symbols neither traded nor declared as context: "
+                f"{stray} — declare them in a strategy's context_symbols "
+                f"or remove them from the data dict"
+            )
+
         self.events = events_queue
         self.data_handler = data_handler
         self.strategy = strategy

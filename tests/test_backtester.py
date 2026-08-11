@@ -66,11 +66,13 @@ class RecordingDataHandler:
     """Emits a fixed list of items (one per ``update_bar``) onto the queue,
     then flips ``continue_backtest`` off — mirroring ``HistoricDataHandler``."""
 
-    def __init__(self, events_queue, items: List[Any]):
+    def __init__(self, events_queue, items: List[Any],
+                 symbol_list=('BTC', 'A')):
         self._queue = events_queue
         self._items = list(items)
         self._i = 0
         self.continue_backtest = True
+        self.symbol_list = list(symbol_list)
 
     def update_bar(self) -> None:
         if self._i < len(self._items):
@@ -117,8 +119,9 @@ class RecordingExecution:
 
 
 class RecordingStrategy:
-    def __init__(self, call_log: List[Any]):
+    def __init__(self, call_log: List[Any], symbol_list=('BTC', 'A')):
         self._log = call_log
+        self.symbol_list = list(symbol_list)
 
     def update_bar(self, event: BarEvent) -> None:
         self._log.append('strategy.update_bar')
